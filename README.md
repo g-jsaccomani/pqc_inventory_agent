@@ -17,7 +17,7 @@ Use the production metadata below directly in the **Gemini Enterprise > Apps > [
 | **Region** | `us-central1` (Automatic `global` endpoint routing for Gemini 3.1 Preview) |
 | **Vertex AI Agent Engine Resource Path** | `projects/110254026096/locations/us-central1/reasoningEngines/1224758646563405824` |
 | **Cloud Run ADK Web UI (Active)** | `https://pqc-inventory-agent-110254026096.us-central1.run.app/dev-ui/?app=pqc_agent` |
-| **Active Cloud Run Revision** | `pqc-inventory-agent-00010-9rb` (Serving 100% of traffic) |
+| **Active Cloud Run Revision** | `pqc-inventory-agent-00011-qvk` (Serving 100% of traffic) |
 | **Runtime Service Account** | `pqc-agent-runner@pqc-inventory-agent-cd06.iam.gserviceaccount.com` |
 
 ### Recommended Agent Description for Gemini Enterprise (Copy & Paste)
@@ -36,7 +36,7 @@ The diagram below illustrates the complete 4-tier architecture across **Executiv
 flowchart TB
     subgraph UX["1. Executive Experience & Orchestration Layer"]
         GE["Gemini Enterprise (Google Agentspace)<br/>Enterprise Conversational Interface"]
-        CR["Cloud Run ADK Web UI (/dev-ui)<br/>Revision: pqc-inventory-agent-00010-9rb"]
+        CR["Cloud Run ADK Web UI (/dev-ui)<br/>Revision: pqc-inventory-agent-00011-qvk"]
         CLI["Local CLI & Validation Harness (main.py)<br/>test / ask / deploy"]
     end
 
