@@ -105,6 +105,14 @@ def _translate_executive_verdict(app: Dict[str, Any]) -> str:
     raw_verdict = app.get("pqc_compatibility_verdict", "")
     mosca_status = app.get("mosca_status", "")
     purpose = app.get("purpose", "")
+    kms_key_str = str(app.get("kms_key", "")).lower()
+    is_jwt_or_token = any(tok in kms_key_str for tok in ("jwt", "token"))
+    jwt_note_suffix = (
+        " — **Technical Note:** Increase HTTP header buffer limits (to 16KB in API Gateways/Envoy) "
+        "because ML-DSA-65 signatures expand Base64URL JWT tokens by ~4.4KB."
+        if is_jwt_or_token
+        else ""
+    )
 
     if raw_verdict == "COMPATIBLE_PQC_NATIVE":
         return "✅ **Compliant — Native PQC** (No action required; operating on NIST FIPS 203/204/205)"
@@ -112,12 +120,12 @@ def _translate_executive_verdict(app: Dict[str, Any]) -> str:
         return "✅ **Compliant — Grover-Resilient CMEK** (AES-256 / HMAC provides 128-bit PQ security; zero code changes)"
     if mosca_status == "CRITICAL_MOSCA_BREACH_ACTIVE_HNDL" or purpose == "ASYMMETRIC_DECRYPT":
         return (
-            "🚨 **Critical — Active HNDL Exposure** (Migrate to `KEM_XWING` via Google Tink SDK & "
-            "refactor decryption flow to RFC 9180 HPKE encapsulation)"
+            "🚨 **Critical — Active HNDL Exposure** (Migrate to `KEM_XWING` on Cloud HSM `--protection-level=hsm` via Google Tink SDK & "
+            f"refactor decryption flow to RFC 9180 HPKE encapsulation){jwt_note_suffix}"
         )
     return (
-        "⚠️ **High — 2030 Deprecation Risk** (Migrate to `PQ_SIGN_ML_DSA_65`, update signing SDK "
-        "to raw/external-mu payload, and expand API Gateway header buffers to 32 KB)"
+        "⚠️ **High — 2030 Deprecation Risk** (Migrate to `PQ_SIGN_ML_DSA_65` on Cloud HSM `--protection-level=hsm`, update signing SDK "
+        f"to raw/external-mu payload, and expand API Gateway header buffers to 16KB–32KB){jwt_note_suffix}"
     )
 
 
@@ -199,8 +207,9 @@ def build_executive_markdown_report(project_id: str, location_id: str = "global"
         (
             f"- **Application & API Gateway Modernization Impact:** `{deadline_breaches}` digital signing key(s) breach the **NIST 2030 "
             "deprecation horizon (`4.5 years > 4.0 years`)**. Migrating these workloads to NIST FIPS 203 (`KEM_XWING`) and FIPS 204 "
-            "(`PQ_SIGN_ML_DSA_65`) is not a transparent key rotation: it requires adopting the **Google Tink SDK** for RFC 9180 HPKE "
-            "envelope encapsulation and expanding proxy HTTP header buffers to `32 KB` to accommodate 3,309-byte post-quantum signatures."
+            "(`PQ_SIGN_ML_DSA_65`) on **Cloud HSM (`--protection-level=hsm`)** is not a transparent key rotation: it requires adopting "
+            "the **Google Tink SDK** for RFC 9180 HPKE envelope encapsulation and expanding proxy HTTP header buffers (to `16KB–32KB` in "
+            "API Gateways/Envoy) because `ML-DSA-65` signatures expand Base64URL JWT tokens by `~4.4KB`."
         ),
         "",
         "---",
@@ -266,7 +275,7 @@ def build_executive_markdown_report(project_id: str, location_id: str = "global"
             "| :--- | :--- | :--- | :--- |",
             (
                 "| **Key Management & BYOK Root of Trust** | **Cloud HSM (FIPS 140-3 Level 3)** + **Cloud KMS PQC (`KEM_XWING`, `PQ_SIGN_ML_DSA_65`)** | "
-                "Replaces classical RSA/ECDSA keys and RSA-OAEP BYOK `ImportJobs` with `HPKE_KEM_XWING` hybrid encapsulation and FIPS 140-3 Level 3 hardware protection. | "
+                "Replaces classical RSA/ECDSA keys and RSA-OAEP BYOK `ImportJobs` with `HPKE_KEM_XWING` hybrid encapsulation and FIPS 140-3 Level 3 hardware protection (`--protection-level=hsm`). | "
                 "Eliminates Shor's Algorithm key recovery and secures BYOK key transport against quantum interception (NIST FIPS 203/204). |"
             ),
             (
@@ -299,13 +308,13 @@ def build_executive_markdown_report(project_id: str, location_id: str = "global"
                 "| **Phase 1: Immediate Containment & Guardrails** | **Days 1–30** | "
                 "Halt proliferation of new classical RSA/ECC keys, contain active HNDL network/data exposure, and provision parallel PQC keys. | "
                 "• Enforce GCP Organization Policy PQC custom constraints<br/>• Upgrade Load Balancer SSL Policies to TLS 1.3 (`X25519MLKEM768`)<br/>"
-                "• Wrap critical GCS/BigQuery assets in VPC-SC + PSC<br/>• Provision `KEM_XWING` & `PQ_SIGN_ML_DSA_65` keys in Cloud KMS |"
+                "• Wrap critical GCS/BigQuery assets in VPC-SC + PSC<br/>• Provision `KEM_XWING` & `PQ_SIGN_ML_DSA_65` keys in Cloud HSM (`--protection-level=hsm`) |"
             ),
             (
                 "| **Phase 2: Application & API Refactoring** | **Days 31–60** | "
                 "Refactor incompatible application SDKs, expand API Gateway header buffers, and transition BYOK key import pipelines. | "
                 "• Integrate Google Tink SDK for RFC 9180 HPKE envelope flows<br/>• Refactor signing services to raw `data` / 64B SHAKE256 `external_mu`<br/>"
-                "• Expand Envoy/NGINX HTTP header limits to `32 KB`<br/>• Migrate KMS `ImportJobs` to `HPKE_KEM_XWING` |"
+                "• Increase HTTP header buffer limits to `16KB–32KB` in API Gateways/Envoy<br/>• Migrate KMS `ImportJobs` to `HPKE_KEM_XWING` |"
             ),
             (
                 "| **Phase 3: Legacy Key Deprecation & Governance** | **Days 61–90** | "
@@ -324,12 +333,28 @@ def build_executive_markdown_report(project_id: str, location_id: str = "global"
     )
 
     for idx, pb in enumerate(playbooks, 1):
+        legacy_key_str = str(pb.get("legacy_key", ""))
+        is_jwt_or_token = any(tok in legacy_key_str.lower() for tok in ("jwt", "token"))
+        jwt_note = pb.get("technical_note_jwt_header_buffer") or (
+            "TECHNICAL NOTE (JWT/Token Header Buffer Expansion): Increase HTTP header buffer limits "
+            "(to 16KB in API Gateways/Envoy) because ML-DSA-65 signatures expand Base64URL JWT tokens by ~4.4KB."
+            if is_jwt_or_token
+            else None
+        )
+        pb_cmd = str(pb.get("gcloud_command", "")).replace("--protection-level=software", "--protection-level=hsm")
+
         lines.extend(
             [
                 f"#### 6.1.{idx}. Remediate `{pb['legacy_key']}` (`{pb['legacy_algorithm']}`) ➡️ `{pb['target_algorithm']}`",
                 f"- **Engineering Rationale:** {pb['rationale']}",
+            ]
+        )
+        if jwt_note:
+            lines.append(f"- **⚠️ {jwt_note}**")
+        lines.extend(
+            [
                 "```bash",
-                pb["gcloud_command"],
+                pb_cmd,
                 "",
                 "# Post-Cutover Legacy Version Deprecation:",
                 pb.get("post_migration_disable_legacy_command", ""),

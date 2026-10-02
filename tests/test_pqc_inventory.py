@@ -197,10 +197,17 @@ def test_discover_all_crypto_assets_and_migration_plan():
     assert len(plan["remediation_playbooks"]) == 3
     for playbook in plan["remediation_playbooks"]:
         assert "gcloud kms keys create" in playbook["gcloud_command"]
+        assert "--protection-level=hsm" in playbook["gcloud_command"]
+        assert "--protection-level=software" not in playbook["gcloud_command"]
         assert "gcloud kms keys create" in playbook["gcloud_cnsa_2_0_command"]
+        assert "--protection-level=hsm" in playbook["gcloud_cnsa_2_0_command"]
         assert "gcloud kms keys versions disable" in playbook["post_migration_disable_legacy_command"]
         assert len(playbook["affected_applications"]) >= 1
         assert playbook["pqc_application_compatibility"]["is_compatible_with_pqc_model"] is False
+        if "jwt" in playbook["legacy_key"].lower() or "token" in playbook["legacy_key"].lower():
+            assert "16KB in API Gateways/Envoy" in playbook["rationale"]
+            assert "~4.4KB" in playbook["rationale"]
+            assert playbook["technical_note_jwt_header_buffer"] is not None
 
 
 def test_local_harness_execution():
@@ -232,7 +239,7 @@ def test_build_executive_markdown_report():
     assert "HIGH_TOPOLOGY_MAPPED" not in report_md
     assert "COMPATIBLE_ZERO_REFACTORING_CMEK" not in report_md
 
-    # 3. Sections 2, 3, 4, 5, and 6 structure
+    # 3. Sections 2, 3, 4, 5, and 6 structure + --protection-level=hsm + 16KB JWT header buffer warning
     assert "## 2. Executive PQC Maturity Scorecard" in report_md
     assert "## 3. Application Risk & Mosca Theorem Matrix" in report_md
     assert "## 4. Recommended Google Cloud Target Architecture & Product BOM" in report_md
@@ -242,6 +249,10 @@ def test_build_executive_markdown_report():
     assert "KEM_XWING" in report_md
     assert "PQ_SIGN_ML_DSA_65" in report_md
     assert "gcloud kms keys create" in report_md
+    assert "--protection-level=hsm" in report_md
+    assert "--protection-level=software" not in report_md
+    assert "16KB in API Gateways/Envoy" in report_md
+    assert "~4.4KB" in report_md
 
     # 4. Verify no table in the report exceeds 5 columns
     for line in report_md.splitlines():

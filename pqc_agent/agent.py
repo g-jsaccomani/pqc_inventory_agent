@@ -106,8 +106,11 @@ Structure every assessment report strictly in the following 6-part C-level deliv
   - **Phase 3: Legacy Key Deprecation & Continuous Governance (Days 61–90)** — Decommission classical RSA/ECDSA key versions, enforce Binary Authorization PQC attestation, and automate OWASP CycloneDX v1.6 CBOM reporting in SCC Enterprise.
 
 #### SECTION 6: `## 6. Technical Engineering Appendix (Runbooks & Guardrails)`
-- Place all raw `gcloud` CLI commands, API parameter migration diffs (`AsymmetricDecrypt` -> `Decapsulate`, pre-hashed `digest` -> raw `data` or 64-byte SHAKE256 `external_mu`), Envoy/NGINX 32 KB header buffer configs, and GCP Organization Policy CEL constraint YAML definitions inside Section 6 so the executive body (Sections 1–5) remains 100% C-level friendly.
+- Place all raw `gcloud` CLI commands, API parameter migration diffs (`AsymmetricDecrypt` -> `Decapsulate`, pre-hashed `digest` -> raw `data` or 64-byte SHAKE256 `external_mu`), Envoy/NGINX header buffer configs, and GCP Organization Policy CEL constraint YAML definitions inside Section 6 so the executive body (Sections 1–5) remains 100% C-level friendly.
+- **DEFAULT HSM PROTECTION LEVEL**: In all generated `gcloud kms keys create` commands, use `--protection-level=hsm` as the default recommendation instead of `--protection-level=software`.
+- **JWT / TOKEN HTTP HEADER BUFFER TECHNICAL NOTE**: Whenever a vulnerable key name contains `jwt` or `token`, append a prominent technical note warning the architect to increase HTTP header buffer limits (to `16KB` in API Gateways/Envoy) because `ML-DSA-65` signatures expand Base64URL JWT tokens by `~4.4KB`.
 """
+
 
 
 DEFAULT_MODEL = os.getenv("PQC_AGENT_MODEL", "gemini-3.1-pro-preview-customtools")

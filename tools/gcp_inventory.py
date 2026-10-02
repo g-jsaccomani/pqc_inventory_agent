@@ -1703,6 +1703,14 @@ def generate_pqc_migration_plan(
         enabled_vers = vk.get("enabled_version_ids") or ["1"]
         first_ver = enabled_vers[0]
 
+        is_jwt_or_token_key = any(tok in old_name.lower() for tok in ("jwt", "token"))
+        jwt_header_note = (
+            "TECHNICAL NOTE (JWT/Token Header Buffer Expansion): Increase HTTP header buffer limits "
+            "(to 16KB in API Gateways/Envoy) because ML-DSA-65 signatures expand Base64URL JWT tokens by ~4.4KB."
+            if is_jwt_or_token_key
+            else ""
+        )
+
         if "DECRYPT" in purpose:
             new_name = f"{old_name}-pqc-xwing"
             cmd = (
@@ -1712,7 +1720,7 @@ def generate_pqc_migration_plan(
                 f"--keyring={kr} "
                 f"--purpose=key-encapsulation "
                 f"--default-algorithm=kem-xwing "
-                f"--protection-level=software"
+                f"--protection-level=hsm"
             )
             cnsa_cmd = (
                 f"gcloud kms keys create {old_name}-pqc-mlkem1024 "
@@ -1721,7 +1729,7 @@ def generate_pqc_migration_plan(
                 f"--keyring={kr} "
                 f"--purpose=key-encapsulation "
                 f"--default-algorithm=ml-kem-1024 "
-                f"--protection-level=software"
+                f"--protection-level=hsm"
             )
             disable_legacy_cmd = (
                 f"gcloud kms keys versions disable {first_ver} "
@@ -1729,7 +1737,8 @@ def generate_pqc_migration_plan(
             )
             rationale = (
                 "Immediate mitigation against 'Harvest Now, Decrypt Later' (HNDL) using hybrid KEM "
-                "X25519 + ML-KEM-768 (NIST FIPS 203 Category 3) or pure ML-KEM-1024 (NSA CNSA 2.0 Category 5). "
+                "X25519 + ML-KEM-768 (NIST FIPS 203 Category 3) or pure ML-KEM-1024 (NSA CNSA 2.0 Category 5) "
+                "backed by Cloud HSM (--protection-level=hsm). "
                 "Requires refactoring consuming applications from AsymmetricDecrypt to Decapsulate (HPKE / Envelope Encryption)."
             )
         else:
@@ -1741,7 +1750,7 @@ def generate_pqc_migration_plan(
                 f"--keyring={kr} "
                 f"--purpose=asymmetric-signing "
                 f"--default-algorithm=pq-sign-ml-dsa-65 "
-                f"--protection-level=software"
+                f"--protection-level=hsm"
             )
             cnsa_cmd = (
                 f"gcloud kms keys create {old_name}-pqc-mldsa87 "
@@ -1750,7 +1759,7 @@ def generate_pqc_migration_plan(
                 f"--keyring={kr} "
                 f"--purpose=asymmetric-signing "
                 f"--default-algorithm=pq-sign-ml-dsa-87 "
-                f"--protection-level=software"
+                f"--protection-level=hsm"
             )
             disable_legacy_cmd = (
                 f"gcloud kms keys versions disable {first_ver} "
@@ -1758,15 +1767,24 @@ def generate_pqc_migration_plan(
             )
             rationale = (
                 "Migration of classical digital signature (RSA/ECC) vulnerable to Shor's Algorithm "
-                "to ML-DSA-65 (NIST FIPS 204 Category 3) or ML-DSA-87 (NSA CNSA 2.0 Category 5). "
+                "to ML-DSA-65 (NIST FIPS 204 Category 3) or ML-DSA-87 (NSA CNSA 2.0 Category 5) "
+                "backed by Cloud HSM (--protection-level=hsm). "
                 "Note: Signature size increases to 3,309 bytes (ML-DSA-65) or 4,627 bytes (ML-DSA-87); "
                 "verify HTTP Header / MTU limits and refactor KMS signing calls from `digest` to `data`."
             )
+
+        if jwt_header_note:
+            rationale = f"{rationale} {jwt_header_note}"
+
+        eng_notes = list(vk.get("engineering_notes", []))
+        if jwt_header_note and jwt_header_note not in eng_notes:
+            eng_notes.append(jwt_header_note)
 
         remediation_commands.append(
             {
                 "project_id": key_proj,
                 "legacy_key": f"{key_proj}/{kr}/{old_name} ({loc})",
+                "legacy_key_name": old_name,
                 "legacy_algorithm": vk.get("algorithm", ""),
                 "priority": vk.get("priority", "HIGH"),
                 "mosca_risk_analysis": vk.get("mosca_risk_analysis", {}),
@@ -1777,7 +1795,8 @@ def generate_pqc_migration_plan(
                 "target_pqc_key": new_name,
                 "target_algorithm": vk.get("recommended_algorithm", ""),
                 "rationale": rationale,
-                "engineering_notes": vk.get("engineering_notes", []),
+                "technical_note_jwt_header_buffer": jwt_header_note or None,
+                "engineering_notes": eng_notes,
                 "gcloud_command": cmd,
                 "gcloud_cnsa_2_0_command": cnsa_cmd,
                 "post_migration_disable_legacy_command": disable_legacy_cmd,
@@ -1900,9 +1919,8 @@ def generate_pqc_migration_plan(
             "identified_assets": software_vuln_keys or [f"{vk.get('project_id', clean_id)}/{vk.get('key_ring')}/{vk.get('key_name')}" for vk in vulnerable_keys],
             "recommended_gcp_products": ["Cloud HSM (FIPS 140-3 Level 3)", "Cloud KMS Post-Quantum Cryptography (KEM_XWING / PQ_SIGN_ML_DSA_65)"],
             "architectural_recommendation": (
-                "Migrate software-backed production keys (RSA/ECC) to 'Cloud HSM' (protection-level=HSM) with algorithms "
-                "'KEM_XWING' or 'PQ_SIGN_ML_DSA_65' to eliminate transport risks and secure key materials within FIPS 140-3 Level 3 hardware "
-                "(Note: Use --protection-level=software where PQC algorithms are in software GA while backing envelope KEKs with Cloud HSM)."
+                "Migrate software-backed production keys (RSA/ECC) to 'Cloud HSM' (--protection-level=hsm) with algorithms "
+                "'KEM_XWING' or 'PQ_SIGN_ML_DSA_65' to eliminate transport risks and secure key materials within FIPS 140-3 Level 3 hardware."
             ),
         },
         {
