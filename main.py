@@ -47,46 +47,8 @@ GENERATION_CONFIG = {
     "max_output_tokens": 1048576,
 }
 
-# System Instructions including Multi-Layered Tool Invocation Protocol and strict Product Recommendation Matrix
-SYSTEM_INSTRUCTION = """
-You are the **Google Cloud Post-Quantum Cryptography (PQC) Inventory & Governance Agent**, operating natively
-at the **GCP Organization level (`organizations/31564119954` — `jsaccomani.altostrat.com`)**, as well as
-Folder (`folders/...`) and Project (`projects/...`) levels.
-
-**LANGUAGE & TERMINOLOGY REQUIREMENTS**:
-1. Always respond in **English** (using authoritative, executive-grade cybersecurity and cryptographic terminology), regardless of the language used in the user's prompt.
-2. **NEVER use the words "Audit", "Auditing", "Auditor", or "Auditoria"** in any report title, section heading, or narrative text. Instead, always use **"PQC Readiness Assessment"**, **"Cryptographic Inventory (CBOM)"**, **"Posture Verification"**, or **"Governance Review"**.
-
-Your mission is to perform rigorous, zero-blind-spot, **multi-layered Post-Quantum Cryptography readiness assessments** across **Data-at-Rest / KMS Keys**, **Data-in-Transit / Network SSL Policies**, and **Key Import / BYOK Transport (`ImportJobs`)**, alongside **4-Vector Live Application-to-Key Dependency Mapping**, **Mosca's Theorem (X + Y > Z) Risk Quantification**, **PQC Application Compatibility Evaluations**, **OWASP CycloneDX v1.6 CBOM Exports**, **Preventive GCP Organization Policy Guardrails**, and **Programmatic Google Cloud Security Product Recommendations**, strictly aligned with:
-- **NIST FIPS 203** (ML-KEM: `ML_KEM_768`, `ML_KEM_1024`) and **Google Cloud Hybrid KEM** (`KEM_XWING` = X25519 + ML-KEM-768)
-- **NIST FIPS 204** (ML-DSA: `PQ_SIGN_ML_DSA_44`, `PQ_SIGN_ML_DSA_65`, `PQ_SIGN_ML_DSA_87` and `_EXTERNAL_MU` variants)
-- **NIST FIPS 205** (SLH-DSA: `PQ_SIGN_SLH_DSA_SHA2_128S` and `PQ_SIGN_HASH_SLH_DSA_SHA2_128S_SHA256`)
-- **NIST IR 8547 & Dr. Michele Mosca's Theorem (X + Y > Z)** (2030 Classical Deprecation Horizon Z_2030 = 4.0 years and 2035 Disallowance / CRQC Horizon Z_2035 = 9.0 years)
-- **NSA CNSA 2.0** (Security Category 5 mandate: `ML_KEM_1024`, `PQ_SIGN_ML_DSA_87`, AES-256, SHA-384/512)
-- **NIST SP 800-57 & CIS GCP Benchmark 1.10** (Cryptoperiod management, automatic key rotation `<= 90 days`, and active vs. inactive/destroyed `CryptoKeyVersion` inspection)
-- **OWASP CycloneDX v1.6 CBOM** (`cryptographic-asset` + `application` components, ASN.1 OIDs, and `nistQuantumSecurityLevel`).
-
-### MULTI-LAYERED PQC ASSESSMENT WORKFLOW (HOW AND WHEN TO INVOKE EACH TOOL):
-To build a comprehensive, multi-layered post-quantum security assessment for the security architect, invoke and synthesize the following three scanning layers:
-1. **Layer 1 — KMS Cryptographic Keys & Application Compatibility Scan (`scan_organization_pqc_readiness`, `scan_pqc_readiness`, `generate_pqc_migration_plan`, `discover_all_crypto_assets`)**:
-   - **When to invoke**: Invoke first on every organization-wide or project-level PQC assessment request (defaulting automatically to `organizations/31564119954` without prompting for an ID).
-   - **Purpose**: Evaluates all Cloud KMS keys (`KEY_ENCAPSULATION`, `ASYMMETRIC_DECRYPT`, `ASYMMETRIC_SIGN`, `ENCRYPT_DECRYPT`, `MAC`), maps consuming applications via 4-Vector discovery, evaluates PQC model compatibility, and quantifies Mosca's Theorem (`X + Y > Z`) risk.
-2. **Layer 2 — Network Transport & SSL Policy SNDL Scan (`scan_ssl_policies`)**:
-   - **When to invoke**: Invoke alongside the KMS scan during comprehensive PQC assessments, or whenever the architect asks to evaluate network transport, Load Balancers, TLS posture, or Store Now, Decrypt Later (SNDL / HNDL) risks.
-   - **Purpose**: Inspects all active Google Cloud SSL Policies (`compute.googleapis.com/SslPolicy`) and HTTPS proxies to verify whether they enforce `TLS_1_3` and support hybrid post-quantum key shares (`X25519 + ML-KEM-768` / `X25519MLKEM768`). Flags policies that allow `TLS_1_0`, `TLS_1_1`, or `TLS_1_2` as **`VULNERABLE_TO_SNDL_ATTACKS`**.
-3. **Layer 3 — BYOK Key Import Transport Scan (`scan_import_jobs_pqc`)**:
-   - **When to invoke**: Invoke alongside the KMS and SSL Policy scans during comprehensive PQC assessments, or whenever the architect asks to inspect Bring Your Own Key (BYOK) workflows, key wrapping transport, or Cloud KMS `ImportJobs`.
-   - **Purpose**: Lists all active `ImportJobs` in Cloud KMS and inspects their wrapping methods. Flags jobs using classical RSA-OAEP (`RSA_OAEP_3072_*`, `RSA_OAEP_4096_*`) as **`VULNERABLE_KEY_IMPORT_TRANSPORT`** and classifies jobs using `HPKE_KEM_XWING_HKDF_SHA256_AES_256_GCM` as **`SECURE_PQC_BYOK`**.
-
-### MANDATORY PRODUCT RECOMMENDATION MATRIX:
-You MUST output a dedicated section in every executive summary titled **`Recommended Google Cloud Security Architecture & Product BOM`**.
-For every gap identified, you MUST programmatically generate the following recommendations:
-- **For all software-backed keys (RSA/ECC) used in production**: Recommend migrating to **`Cloud HSM`** (`protection-level=HSM`) with algorithms `KEM_XWING` or `PQ_SIGN_ML_DSA_65` to eliminate transport risks and secure key materials within FIPS 140-3 Level 3 hardware (noting `--protection-level=software` where Cloud KMS PQC algorithms are currently in software GA while backing symmetric/classical KEKs with Cloud HSM).
-- **For legacy application codebases using native decryption or signing**: Recommend the **`Google Tink SDK`** integrated with **`Cloud KMS`** to handle complex RFC 9180 HPKE flows and public key formatting changes without manual coding toil.
-- **To mitigate 'Harvest Now, Decrypt Later' (HNDL / SNDL) risks of data in transit or rest**: Recommend wrapping resources (**Cloud Storage**, **BigQuery**) with **`VPC Service Controls (VPC-SC)`** and **`Private Service Connect (PSC)`** to establish zero-trust perimeter boundaries.
-- **For unsecured internal or external API endpoints (including `VULNERABLE_TO_SNDL_ATTACKS` SSL policies)**: Recommend **`Google Cloud Global Load Balancing (L7)`** with TLS 1.3 modern policies (`X25519MLKEM768`) and **`Certificate Authority Service (CAS)`** to enforce secure hybrid transport.
-- **For CI/CD and artifact signing**: Recommend **`Binary Authorization`** backed by **Cloud HSM** keys.
-"""
+# System Instructions aligned with Google Cloud Consulting (PSO) Executive Deliverable Standards
+SYSTEM_INSTRUCTION = AGENT_SYSTEM_INSTRUCTION
 
 # Main ADK Agent instance
 agent = root_agent
@@ -128,10 +90,40 @@ def get_agent_engine_app():
     )
 
 
+def _translate_mosca_horizon(mosca_status: str, x_plus_y_years: Any) -> str:
+    """Translates internal Mosca status codes into clean C-level executive horizon labels."""
+    years_str = f"{x_plus_y_years} yrs" if x_plus_y_years is not None else "N/A"
+    if mosca_status == "CRITICAL_MOSCA_BREACH_ACTIVE_HNDL":
+        return f"**{years_str} > 9.0 yrs (2035 CRQC Horizon)** — Immediate Breach"
+    if mosca_status == "HIGH_MOSCA_BREACH_NIST_2030_DEADLINE":
+        return f"**{years_str} > 4.0 yrs (2030 NIST Horizon)** — Deprecation Breach"
+    return f"**{years_str} Within Safe Horizon** — Quantum-Resilient"
+
+
+def _translate_executive_verdict(app: Dict[str, Any]) -> str:
+    """Translates internal application compatibility verdicts into clean C-level labels and actions."""
+    raw_verdict = app.get("pqc_compatibility_verdict", "")
+    mosca_status = app.get("mosca_status", "")
+    purpose = app.get("purpose", "")
+
+    if raw_verdict == "COMPATIBLE_PQC_NATIVE":
+        return "✅ **Compliant — Native PQC** (No action required; operating on NIST FIPS 203/204/205)"
+    if raw_verdict == "COMPATIBLE_ZERO_REFACTORING_CMEK":
+        return "✅ **Compliant — Grover-Resilient CMEK** (AES-256 / HMAC provides 128-bit PQ security; zero code changes)"
+    if mosca_status == "CRITICAL_MOSCA_BREACH_ACTIVE_HNDL" or purpose == "ASYMMETRIC_DECRYPT":
+        return (
+            "🚨 **Critical — Active HNDL Exposure** (Migrate to `KEM_XWING` via Google Tink SDK & "
+            "refactor decryption flow to RFC 9180 HPKE encapsulation)"
+        )
+    return (
+        "⚠️ **High — 2030 Deprecation Risk** (Migrate to `PQ_SIGN_ML_DSA_65`, update signing SDK "
+        "to raw/external-mu payload, and expand API Gateway header buffers to 32 KB)"
+    )
+
+
 def build_executive_markdown_report(project_id: str, location_id: str = "global") -> str:
-    """Builds a structured Executive PQC Readiness Report in Markdown from the PQC tools."""
+    """Builds a C-level Google Cloud Consulting (PSO) Executive PQC Readiness Assessment Deliverable in Markdown."""
     plan = json.loads(generate_pqc_migration_plan(project_id=project_id, location_id=location_id))
-    cai = json.loads(discover_all_crypto_assets(project_id=project_id))
     ssl_report = json.loads(scan_ssl_policies(project_id=project_id))
     import_jobs_report = json.loads(scan_import_jobs_pqc(project_id=project_id, location_id=location_id))
 
@@ -139,149 +131,263 @@ def build_executive_markdown_report(project_id: str, location_id: str = "global"
         return f"### ❌ PQC Assessment Error\n\n`{plan['error']}`"
 
     summary = plan.get("cbom_summary", {})
-    vuln_keys = plan.get("priority_vulnerable_keys", [])
     app_matrix = plan.get("application_compatibility_matrix", [])
     playbooks = plan.get("remediation_playbooks", [])
-    product_bom = plan.get("recommended_google_cloud_security_architecture_and_product_bom", [])
-    cai_assets = cai.get("assets", [])
     ssl_policies = ssl_report.get("ssl_policies", [])
     import_jobs = import_jobs_report.get("import_jobs", [])
 
+    weighted_maturity = summary.get("weighted_pqc_maturity_score_pct", 0.0)
+    asymmetric_score = summary.get("asymmetric_pqc_migration_score_pct", 0.0)
+    app_compat_score = summary.get("application_pqc_compatibility_score_pct", 100.0)
+    grover_score = summary.get("symmetric_grover_resilience_score_pct", 100.0)
+    rotation_score = summary.get("symmetric_rotation_hygiene_score_pct", 100.0)
+    ssl_ready_score = ssl_report.get("ssl_pqc_readiness_score_pct", 0.0)
+    byok_ready_score = import_jobs_report.get("byok_pqc_readiness_score_pct", 0.0)
+
+    active_keys = summary.get("active_kms_keys_count", 0)
+    inactive_keys = summary.get("inactive_or_destroyed_keys_count", 0)
+    vuln_keys_count = summary.get("vulnerable_classical_rsa_ecc_count", 0)
+    hndl_breaches = summary.get("mosca_immediate_hndl_breach_keys_count", 0)
+    deadline_breaches = summary.get("mosca_migration_deadline_risk_keys_count", 0)
+    total_apps = summary.get("total_consuming_applications_mapped", 0)
+    compat_apps = summary.get("pqc_compatible_applications_count", 0)
+    incompat_apps = summary.get("pqc_incompatible_applications_requiring_refactoring_count", 0)
+    sndl_policies = ssl_report.get("vulnerable_to_sndl_attacks_count", 0)
+    vuln_byok = import_jobs_report.get("vulnerable_key_import_transport_count", 0)
+
+    overall_rating = (
+        f"ACTION REQUIRED — Weighted Maturity: {weighted_maturity}%"
+        if (vuln_keys_count > 0 or sndl_policies > 0 or vuln_byok > 0)
+        else f"OPTIMAL — Weighted Maturity: {weighted_maturity}%"
+    )
 
     lines = [
-        f"# 🛡️ Executive PQC Readiness & Application Compatibility Report — Scope `{project_id}`",
+        "# GOOGLE CLOUD CONSULTING",
+        "## Post-Quantum Cryptography (PQC) Executive Readiness Assessment",
         "",
-        "## 1. CBOM & Application Compatibility Summary",
-        f"- **Algorithmic PQC Readiness Score:** `{summary.get('pqc_readiness_score_pct', 0)}%`",
-        f"- **Weighted PQC Maturity Score:** `{summary.get('weighted_pqc_maturity_score_pct', 0)}%`",
-        f"- **Asymmetric PQC Migration Score (Shor Resistance):** `{summary.get('asymmetric_pqc_migration_score_pct', 'N/A')}%`",
-        f"- **Application PQC Compatibility Score:** `{summary.get('application_pqc_compatibility_score_pct', 100.0)}%` (`{summary.get('pqc_compatible_applications_count', 0)}` compatible / `{summary.get('pqc_incompatible_applications_requiring_refactoring_count', 0)}` requiring refactoring out of `{summary.get('total_consuming_applications_mapped', 0)}` mapped applications)",
-        f"- **Total Cloud KMS Keys Scanned:** `{summary.get('total_kms_keys_scanned', 0)}` (Active: `{summary.get('active_kms_keys_count', 0)}`, Inactive: `{summary.get('inactive_or_destroyed_keys_count', 0)}`)",
-        f"- **Vulnerable Classical Keys (RSA/ECC - Shor's Algorithm):** `{summary.get('vulnerable_classical_rsa_ecc_count', 0)}` 🚨",
-        f"- **Mosca's Theorem (X + Y > Z) Breaches:** `{summary.get('mosca_immediate_hndl_breach_keys_count', 0)}` Active HNDL Breaches (X+Y > Z_2035) / `{summary.get('mosca_migration_deadline_risk_keys_count', 0)}` NIST 2030 Deadline Breaches (X+Y > Z_2030)",
-        f"- **Approved PQC Keys (NIST FIPS 203/204/205):** `{summary.get('approved_pqc_count', 0)}` ✅",
-        f"- **Secure Symmetric Keys (AES-256 / SHA-256+ Grover-Resilient):** `{summary.get('secure_symmetric_count', 0)}` 🔒",
+        "| Engagement Attribute | Assessment Value |",
+        "| :--- | :--- |",
+        f"| **Target Organization / Project** | `{project_id}` (Location Scope: `{location_id}`) |",
+        "| **Reference Frameworks** | Google Cloud Security Foundations, NIST FIPS 203/204/205, NIST IR 8547, NSA CNSA 2.0 |",
+        f"| **Overall Posture Rating** | **{overall_rating}** |",
+        (
+            f"| **Executive Risk Summary** | `{vuln_keys_count}` classical asymmetric keys (`{hndl_breaches}` active HNDL exposure, "
+            f"`{deadline_breaches}` 2030 deprecation risk), `{incompat_apps}` of `{total_apps}` applications requiring SDK/gateway "
+            f"refactoring, `{sndl_policies}` SSL policies exposed to SNDL, and `{vuln_byok}` legacy BYOK import workflows identified. |"
+        ),
         "",
-        "## 2. Application-to-Key Inventory & PQC Model Compatibility Matrix",
-        "| Project | Application / Workload | Workload Type | KMS Key | Current -> Target Algorithm | Mosca Status (X+Y yrs) | PQC Model Compatible? | Compatibility Verdict & API Impact |",
-        "| :--- | :--- | :--- | :--- | :--- | :--- | :---: | :--- |",
+        "---",
+        "",
+        "## 1. Executive Summary (BLUF)",
+        (
+            f"**Bottom Line Up Front:** Across `{project_id}`, Google Cloud Consulting assessed **{active_keys} active Cloud KMS keys** "
+            f"(excluding `{inactive_keys}` decommissioned/destroy-scheduled keys), **{total_apps} consuming enterprise applications**, "
+            f"**{len(ssl_policies)} network SSL/TLS policies**, and **{len(import_jobs)} Bring Your Own Key (BYOK) import workflows**. "
+            f"While **{compat_apps} of {total_apps} workloads ({app_compat_score}%)** are already quantum-resilient—either operating on "
+            "NIST-standardized Post-Quantum Cryptography (`KEM_XWING`, `PQ_SIGN_ML_DSA_65`) or leveraging 256-bit symmetric Customer-Managed "
+            "Encryption Keys (CMEK) resilient to Grover's Algorithm with zero code changes required—critical cryptographic modernization is "
+            f"required across **{incompat_apps} classical RSA/ECDSA application workloads** prior to the NIST IR 8547 deprecation milestones."
+        ),
+        "",
+        (
+            f"- **Immediate Confidentiality Risk (Harvest Now, Decrypt Later — HNDL):** `{hndl_breaches}` asymmetric decryption key(s) "
+            "exceed Dr. Michele Mosca's 2035 Cryptographically Relevant Quantum Computer (CRQC) horizon (`10.0-year data confidentiality "
+            "shelf-life + 2.0-year engineering migration = 12.0 years > 9.0-year horizon`). Adversaries capturing encrypted payloads or "
+            f"pre-TLS 1.3 traffic across `{sndl_policies}` legacy SSL policy endpoint(s) today can retroactively decrypt sensitive records "
+            "once quantum hardware matures."
+        ),
+        (
+            f"- **Application & API Gateway Modernization Impact:** `{deadline_breaches}` digital signing key(s) breach the **NIST 2030 "
+            "deprecation horizon (`4.5 years > 4.0 years`)**. Migrating these workloads to NIST FIPS 203 (`KEM_XWING`) and FIPS 204 "
+            "(`PQ_SIGN_ML_DSA_65`) is not a transparent key rotation: it requires adopting the **Google Tink SDK** for RFC 9180 HPKE "
+            "envelope encapsulation and expanding proxy HTTP header buffers to `32 KB` to accommodate 3,309-byte post-quantum signatures."
+        ),
+        "",
+        "---",
+        "",
+        "## 2. Executive PQC Maturity Scorecard",
+        "| Posture KPI | Current Score | Target Benchmark | Executive Assessment |",
+        "| :--- | :---: | :---: | :--- |",
+        (
+            f"| **Weighted PQC Maturity Index** | **{weighted_maturity}%** | `100.0%` | "
+            f"{'Action Required — Classical RSA/ECDSA keys lower composite readiness' if weighted_maturity < 95 else 'Optimal — Enterprise PQC target achieved'} |"
+        ),
+        (
+            f"| **Asymmetric PQC Migration (Shor Resistance)** | **{asymmetric_score}%** | `100.0%` | "
+            f"`{summary.get('approved_pqc_count', 0)}` PQC-native vs. `{vuln_keys_count}` classical RSA/ECC keys requiring migration |"
+        ),
+        (
+            f"| **Application PQC Model Compatibility** | **{app_compat_score}%** | `100.0%` | "
+            f"`{compat_apps}` workloads compatible today; `{incompat_apps}` require SDK & API Gateway refactoring |"
+        ),
+        (
+            f"| **Data-at-Rest Grover Resilience (AES-256)** | **{grover_score}%** | `100.0%` | "
+            f"`{summary.get('secure_symmetric_count', 0)}` symmetric CMEK/MAC keys provide 128-bit post-quantum security |"
+        ),
+        (
+            f"| **Cryptoperiod & Rotation Hygiene (<= 90d)** | **{rotation_score}%** | `100.0%` | "
+            f"{'Compliant with NIST SP 800-57 & CIS GCP 1.10' if rotation_score == 100 else 'Remediation Required — Enforce <= 90-day rotation on symmetric keys'} |"
+        ),
+        (
+            f"| **Network TLS 1.3 Hybrid PQC Readiness** | **{ssl_ready_score}%** | `100.0%` | "
+            f"`{ssl_report.get('quantum_ready_hybrid_tls13_count', 0)}` compliant TLS 1.3 (`X25519MLKEM768`) vs. `{sndl_policies}` exposed to SNDL |"
+        ),
+        (
+            f"| **BYOK Key Import Transport Security** | **{byok_ready_score}%** | `100.0%` | "
+            f"`{import_jobs_report.get('secure_pqc_byok_count', 0)}` PQC HPKE X-Wing vs. `{vuln_byok}` classical RSA-OAEP import job(s) |"
+        ),
+        "",
+        "---",
+        "",
+        "## 3. Application Risk & Mosca Theorem Matrix",
+        "*(Comprehensive Application-to-Key Inventory & PQC Model Compatibility Matrix)*",
+        "",
+        "| Consuming Application / Workload | Bound KMS Key | Algorithm (Current -> Target) | Mosca Horizon (X+Y vs Z) | Risk Verdict & Required Action |",
+        "| :--- | :--- | :--- | :--- | :--- |",
     ]
 
     for app in app_matrix:
-        compat_badge = "✅ YES" if app.get("is_compatible_with_pqc_model") else "🚨 NO (Refactor Required)"
-        lines.append(
-            f"| `{app.get('project_id')}` | **{app.get('application_name')}** | `{app.get('workload_type')}` | "
-            f"`{app.get('kms_key')}` | `{app.get('current_algorithm')}` ➡️ `{app.get('target_pqc_algorithm')}` | "
-            f"`{app.get('mosca_status')}` (`{app.get('x_plus_y_total_years')}y`) | "
-            f"{compat_badge} | `{app.get('pqc_compatibility_verdict')}` — {app.get('api_migration_required')} |"
-        )
+        app_label = f"**{app.get('application_name')}** (`{app.get('project_id')}` — {app.get('workload_type')})"
+        key_label = f"`{app.get('kms_key')}`"
+        algo_label = f"`{app.get('current_algorithm')}` ➡️ `{app.get('target_pqc_algorithm')}`"
+        mosca_label = _translate_mosca_horizon(app.get("mosca_status", ""), app.get("x_plus_y_total_years"))
+        verdict_label = _translate_executive_verdict(app)
+        lines.append(f"| {app_label} | {key_label} | {algo_label} | {mosca_label} | {verdict_label} |")
 
     lines.extend(
         [
             "",
-            "## 3. Priority Vulnerable Keys (`VULNERABLE_CLASSICAL_RSA_ECC`)",
-            "| Priority | KeyRing / Key | Location | Purpose | Current Algorithm | Threat Vector | Target NIST Standard |",
-            "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
-        ]
-    )
-
-    for vk in vuln_keys:
-        lines.append(
-            f"| **{vk.get('priority')}** | `{vk.get('key_ring')}/{vk.get('key_name')}` | "
-            f"`{vk.get('location')}` | `{vk.get('purpose')}` | `{vk.get('algorithm')}` | "
-            f"`{vk.get('threat_vector')}` | **{vk.get('recommended_algorithm')}** ({vk.get('nist_standard_target')}) |"
-        )
-
-    lines.extend(
-        [
+            "---",
             "",
-            "## 4. Cloud Asset Inventory Cryptographic & PKI Assets",
-            "| Asset Type | Name | Location | Algorithm / Profile | Quantum Status |",
-            "| :--- | :--- | :--- | :--- | :--- |",
-        ]
-    )
-    for asset in cai_assets:
-        lines.append(
-            f"| `{asset.get('asset_type')}` | `{asset.get('display_name')}` | `{asset.get('location')}` | "
-            f"`{asset.get('algorithm_details', asset.get('state', 'N/A'))}` | **{asset.get('quantum_status', 'INSPECT')}** |"
-        )
-
-    lines.extend(
-        [
+            "## 4. Recommended Google Cloud Target Architecture & Product BOM",
+            "*(Recommended Google Cloud Security Architecture & Product BOM)*",
             "",
-            "## 5. PQC Migration Plan & Remediation Playbooks (`gcloud kms`)",
+            "| Risk Domain | Google Cloud Solution | Architectural Role in Environment | Business & Compliance Value |",
+            "| :--- | :--- | :--- | :--- |",
+            (
+                "| **Key Management & BYOK Root of Trust** | **Cloud HSM (FIPS 140-3 Level 3)** + **Cloud KMS PQC (`KEM_XWING`, `PQ_SIGN_ML_DSA_65`)** | "
+                "Replaces classical RSA/ECDSA keys and RSA-OAEP BYOK `ImportJobs` with `HPKE_KEM_XWING` hybrid encapsulation and FIPS 140-3 Level 3 hardware protection. | "
+                "Eliminates Shor's Algorithm key recovery and secures BYOK key transport against quantum interception (NIST FIPS 203/204). |"
+            ),
+            (
+                "| **Application Crypto & Envelope Abstraction** | **Google Tink SDK + Cloud KMS** | "
+                "Abstracts RFC 9180 HPKE (`Decapsulate` + `HKDF-SHA256` + `AES-256-GCM`) and PQC public key formatting across Python, Go, and Java microservices. | "
+                "Accelerates developer migration prior to the 2030 NIST deadline while preventing cryptographic implementation defects. |"
+            ),
+            (
+                "| **Zero-Trust Data Perimeter (HNDL Containment)** | **VPC Service Controls (VPC-SC) + Private Service Connect (PSC)** | "
+                "Establishes identity- and network-aware zero-trust service perimeters around **Cloud Storage** and **BigQuery** data stores. | "
+                "Prevents bulk ciphertext exfiltration ('Harvest Now, Decrypt Later') even before legacy application refactoring completes. |"
+            ),
+            (
+                "| **Quantum-Safe Network Ingress & Managed PKI** | **Google Cloud Global Load Balancing (L7 TLS 1.3) + Certificate Authority Service (CAS)** | "
+                "Enforces restricted TLS 1.3 SSL policies with hybrid post-quantum key exchange (`X25519MLKEM768`) and automated enterprise X.509 lifecycle management. | "
+                "Neutralizes passive network SNDL eavesdropping across external and internal API gateways immediately. |"
+            ),
+            (
+                "| **Supply Chain Attestation & Posture Governance** | **Binary Authorization + Security Command Center (SCC) Enterprise** | "
+                "Enforces container image attestation backed by Cloud HSM / `PQ_SIGN_ML_DSA_65` and continuous Organization Policy drift monitoring. | "
+                "Guarantees end-to-end software supply chain integrity and continuous board-level compliance visibility (NSA CNSA 2.0). |"
+            ),
+            "",
+            "---",
+            "",
+            "## 5. Phased Executive Transition Roadmap (30-60-90 Day Plan)",
+            "| Transition Phase | Target Horizon | Executive Objectives & Scope | Key Deliverables & Success Criteria |",
+            "| :--- | :---: | :--- | :--- |",
+            (
+                "| **Phase 1: Immediate Containment & Guardrails** | **Days 1–30** | "
+                "Halt proliferation of new classical RSA/ECC keys, contain active HNDL network/data exposure, and provision parallel PQC keys. | "
+                "• Enforce GCP Organization Policy PQC custom constraints<br/>• Upgrade Load Balancer SSL Policies to TLS 1.3 (`X25519MLKEM768`)<br/>"
+                "• Wrap critical GCS/BigQuery assets in VPC-SC + PSC<br/>• Provision `KEM_XWING` & `PQ_SIGN_ML_DSA_65` keys in Cloud KMS |"
+            ),
+            (
+                "| **Phase 2: Application & API Refactoring** | **Days 31–60** | "
+                "Refactor incompatible application SDKs, expand API Gateway header buffers, and transition BYOK key import pipelines. | "
+                "• Integrate Google Tink SDK for RFC 9180 HPKE envelope flows<br/>• Refactor signing services to raw `data` / 64B SHAKE256 `external_mu`<br/>"
+                "• Expand Envoy/NGINX HTTP header limits to `32 KB`<br/>• Migrate KMS `ImportJobs` to `HPKE_KEM_XWING` |"
+            ),
+            (
+                "| **Phase 3: Legacy Key Deprecation & Governance** | **Days 61–90** | "
+                "Decommission legacy RSA/ECDSA key versions, enforce PQC container attestation, and institutionalize CBOM governance. | "
+                "• Disable & schedule destruction of legacy RSA/ECC key versions<br/>• Enforce Binary Authorization PQC attestation on GKE/Cloud Run<br/>"
+                "• Automate OWASP CycloneDX v1.6 CBOM exports into SCC Enterprise |"
+            ),
+            "",
+            "---",
+            "",
+            "## 6. Technical Engineering Appendix (Runbooks & Guardrails)",
+            "*(For Security Engineering, Cloud Platform, and DevSecOps Teams — Contains CLI Runbooks, API Parameter Diffs, and Policy Constraints)*",
+            "",
+            "### 6.1. Cloud KMS PQC Key Provisioning & Legacy Deprecation Runbooks (`gcloud kms`)",
         ]
     )
+
     for idx, pb in enumerate(playbooks, 1):
         lines.extend(
             [
-                f"### 5.{idx}. Migrate `{pb['legacy_key']}` (`{pb['legacy_algorithm']}`) ➡️ `{pb['target_algorithm']}`",
-                f"- **Priority:** `{pb['priority']}`",
-                f"- **Mosca Risk Status:** `{pb.get('mosca_risk_analysis', {}).get('mosca_status')}` ({pb.get('mosca_risk_analysis', {}).get('urgency_explanation')})",
-                f"- **Technical Rationale:** {pb['rationale']}",
+                f"#### 6.1.{idx}. Remediate `{pb['legacy_key']}` (`{pb['legacy_algorithm']}`) ➡️ `{pb['target_algorithm']}`",
+                f"- **Engineering Rationale:** {pb['rationale']}",
                 "```bash",
                 pb["gcloud_command"],
+                "",
+                "# Post-Cutover Legacy Version Deprecation:",
+                pb.get("post_migration_disable_legacy_command", ""),
                 "```",
                 "",
             ]
+        )
+
+    lines.extend(
+        [
+            "### 6.2. Application SDK & API Parameter Migration Reference",
+            "| Refactoring Pattern | Legacy Classical API Contract | Target Post-Quantum API Contract | Infrastructure & Proxy Requirement |",
+            "| :--- | :--- | :--- | :--- |",
+            (
+                "| **Confidentiality (RSA-OAEP ➡️ X-Wing KEM)** | `AsymmetricDecrypt(ciphertext)` (`purpose=ASYMMETRIC_DECRYPT`) | "
+                "`Decapsulate(ciphertext)` ➡️ 32B `shared_secret` + `HKDF-SHA256` + `AES-256-GCM` (`purpose=KEY_ENCAPSULATION`) | "
+                "Ciphertext increases from `256 B` to `1,120 B`; adopt **Google Tink SDK** HPKE primitive. |"
+            ),
+            (
+                "| **Digital Signatures (RSA/ECDSA ➡️ ML-DSA-65)** | `AsymmetricSign(digest={'sha256': ...})` (Pre-hashed external digest) | "
+                "`AsymmetricSign(data=raw_bytes)` or `PQ_SIGN_ML_DSA_65_EXTERNAL_MU` (64B `SHAKE256` external mu) | "
+                "Signature expands from `64 B–256 B` to `3,309 B`; set `max_request_headers_kb: 32` in Envoy/Istio and `large_client_header_buffers 4 32k;` in NGINX. |"
+            ),
+            "",
+            "### 6.3. Network TLS 1.3 (`X25519MLKEM768`) & Cloud KMS BYOK (`ImportJobs`) Posture",
+            "| Resource Type | Identifier (`Project / Name`) | Current Configuration | Technical Status | Remediation Command / Action |",
+            "| :--- | :--- | :--- | :--- | :--- |",
+        ]
+    )
+
+    for sp in ssl_policies:
+        lines.append(
+            f"| **SSL Policy** | `{sp.get('project_id')}/{sp.get('policy_name')}` | "
+            f"`{sp.get('min_tls_version')}` (`{sp.get('profile')}`) | `{sp.get('pqc_status')}` | "
+            f"`{sp.get('gcloud_remediation_command') or 'Compliant (TLS 1.3 + X25519MLKEM768 Active)'}` |"
+        )
+
+    for ij in import_jobs:
+        lines.append(
+            f"| **KMS ImportJob** | `{ij.get('key_ring')}/{ij.get('import_job_name')}` | "
+            f"`{ij.get('import_method')}` (`{ij.get('protection_level')}`) | `{ij.get('pqc_status')}` | "
+            f"`{ij.get('gcloud_remediation_command') or 'Compliant (HPKE_KEM_XWING Active)'}` |"
         )
 
     guardrails = plan.get("preventive_org_policy_guardrails", {})
     if guardrails:
         lines.extend(
             [
-                "## 6. Preventive GCP Organization Policy Guardrails",
+                "",
+                "### 6.4. Preventive GCP Organization Policy CEL Guardrails",
                 "```yaml",
                 guardrails.get("custom_constraint_quantum_safe_algorithms_yaml", ""),
                 "```",
-                "",
             ]
         )
 
-    lines.extend(
-        [
-            "## 7. Network SSL Policies & BYOK ImportJobs PQC Posture",
-            "### 7.1. Google Cloud SSL Policies (TLS 1.3 & Hybrid PQC `X25519 + ML-KEM-768`)",
-            "| Policy Name | Min TLS Version | Profile | Hybrid PQC Key Share? | PQC Status |",
-            "| :--- | :--- | :--- | :---: | :--- |",
-        ]
-    )
-    for sp in ssl_policies:
-        lines.append(
-            f"| `{sp.get('policy_name')}` | `{sp.get('min_tls_version')}` | `{sp.get('profile')}` | "
-            f"{'✅ YES' if sp.get('supports_hybrid_pqc_key_share_x25519_mlkem768') else '🚨 NO'} | **{sp.get('pqc_status')}** |"
-        )
-
-    lines.extend(
-        [
-            "",
-            "### 7.2. Cloud KMS Key Import Jobs (`ImportJobs` — BYOK Wrapping)",
-            "| KeyRing / ImportJob | Location | State | Import Wrapping Method | Protection Level | PQC Status |",
-            "| :--- | :--- | :--- | :--- | :--- | :--- |",
-        ]
-    )
-    for ij in import_jobs:
-        lines.append(
-            f"| `{ij.get('key_ring')}/{ij.get('import_job_name')}` | `{ij.get('location')}` | `{ij.get('state')}` | "
-            f"`{ij.get('import_method')}` | `{ij.get('protection_level')}` | **{ij.get('pqc_status')}** |"
-        )
-
-    lines.extend(
-        [
-            "",
-            "## 8. Recommended Google Cloud Security Architecture & Product BOM",
-            "| Identified Gap Category | Affected Assets / Workloads | Recommended Google Cloud Products | Architectural & Engineering Recommendation |",
-            "| :--- | :--- | :--- | :--- |",
-        ]
-    )
-    for item in product_bom:
-        assets_str = ", ".join(f"`{a}`" for a in item.get("identified_assets", [])[:4])
-        prods_str = ", ".join(f"**{p}**" for p in item.get("recommended_gcp_products", []))
-        lines.append(
-            f"| **{item.get('gap_category')}** | {assets_str} | {prods_str} | {item.get('architectural_recommendation')} |"
-        )
-
     return "\n".join(lines)
+
 
 
 async def run_adk_agent_turn(

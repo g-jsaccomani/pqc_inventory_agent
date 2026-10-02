@@ -212,13 +212,44 @@ def test_local_harness_execution():
 
 
 def test_build_executive_markdown_report():
-    """Validates Executive PQC Report generation in English Markdown."""
+    """Validates Google Cloud Consulting (PSO) Executive PQC Deliverable layout in Markdown."""
     report_md = build_executive_markdown_report("meu-projeto-gcp")
-    assert "Executive PQC Readiness & Application Compatibility Report" in report_md
-    assert "Application-to-Key Inventory & PQC Model Compatibility Matrix" in report_md
+
+    # 1. Official Google Cloud Consulting Header & Metadata Table
+    assert report_md.startswith("# GOOGLE CLOUD CONSULTING\n## Post-Quantum Cryptography (PQC) Executive Readiness Assessment")
+    assert "| **Target Organization / Project** |" in report_md
+    assert "| **Reference Frameworks** |" in report_md
+    assert "| **Overall Posture Rating** |" in report_md
+    assert "| **Executive Risk Summary** |" in report_md
+
+    # 2. BLUF & Clean Executive Labels (No raw variable/enum names leaked)
+    assert "## 1. Executive Summary (BLUF)" in report_md
+    assert "Critical — Active HNDL Exposure" in report_md
+    assert "High — 2030 Deprecation Risk" in report_md
+    assert "Compliant — Native PQC" in report_md
+    assert "Compliant — Grover-Resilient CMEK" in report_md
+    assert "mosca_immediate_hndl_breach_keys_count" not in report_md
+    assert "HIGH_TOPOLOGY_MAPPED" not in report_md
+    assert "COMPATIBLE_ZERO_REFACTORING_CMEK" not in report_md
+
+    # 3. Sections 2, 3, 4, 5, and 6 structure
+    assert "## 2. Executive PQC Maturity Scorecard" in report_md
+    assert "## 3. Application Risk & Mosca Theorem Matrix" in report_md
+    assert "## 4. Recommended Google Cloud Target Architecture & Product BOM" in report_md
+    assert "Binary Authorization + Security Command Center (SCC) Enterprise" in report_md
+    assert "## 5. Phased Executive Transition Roadmap (30-60-90 Day Plan)" in report_md
+    assert "## 6. Technical Engineering Appendix (Runbooks & Guardrails)" in report_md
     assert "KEM_XWING" in report_md
     assert "PQ_SIGN_ML_DSA_65" in report_md
     assert "gcloud kms keys create" in report_md
+
+    # 4. Verify no table in the report exceeds 5 columns
+    for line in report_md.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("|") and stripped.endswith("|"):
+            cols = [c.strip() for c in stripped.strip("|").split("|")]
+            assert len(cols) <= 5, f"Table row exceeds 5 columns ({len(cols)}): {line}"
+
 
 
 def test_classify_cai_crypto_asset():
