@@ -1,0 +1,22 @@
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Python byte-compiled / caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
+
+# Environment & credentials
+.env
+*.json
+!**/mock_*.json
+
+# OS files
+.DS_Store

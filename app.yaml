@@ -1,0 +1,53 @@
+name: pqc-inventory-agent
+display_name: "PQC Enterprise Inventory & Application Compatibility Agent"
+version: "3.1.0"
+description: >
+  Expert AI Agent for Post-Quantum Cryptography (PQC) Readiness Assessment, 4-Vector Live
+  Application-to-Key Dependency Mapping, PQC Application Compatibility Evaluation, Mosca's
+  Theorem (X+Y>Z) Risk Quantification, OWASP CycloneDX v1.6 CBOM Export, SDK/Gateway Code
+  Refactoring, Preventive GCP Organization Policy Guardrails, and Recommended Google Cloud
+  Security Architecture & Product BOM across Google Cloud Organizations
+  (organizations/31564119954) and Projects, aligned with NIST FIPS 203 (ML-KEM / KEM_XWING),
+  FIPS 204 (ML-DSA), FIPS 205 (SLH-DSA), NIST IR 8547, NIST SP 800-57, and NSA CNSA 2.0.
+
+runtime:
+  framework: google-adk
+  target_platform: vertex_ai_agent_engine
+  reasoning_engine_resource: "projects/110254026096/locations/us-central1/reasoningEngines/1224758646563405824"
+  cloud_run_url: "https://pqc-inventory-agent-110254026096.us-central1.run.app/dev-ui/?app=pqc_agent"
+  python_version: "3.12"
+  entrypoint: "main:agent"
+  adk_agent_module: "pqc_agent.agent:root_agent"
+
+model:
+  name: "gemini-3.1-pro-preview-customtools"
+  fallback: "gemini-2.5-pro"
+  temperature: 0.1
+  generation_config:
+    thinking_level: "MEDIUM"
+    max_output_tokens: 1048576
+
+tools:
+  - scan_organization_pqc_readiness
+  - generate_pqc_migration_plan
+  - scan_pqc_readiness
+  - discover_all_crypto_assets
+  - generate_application_pqc_refactoring_guide
+  - export_cyclonedx_cbom
+
+security:
+  required_iam_roles:
+    - "roles/resourcemanager.organizationViewer"
+    - "roles/cloudkms.viewer"
+    - "roles/cloudasset.viewer"
+    - "roles/aiplatform.user"
+  auth_mode: "oauth2_user_context_or_adc"
+
+environment:
+  GOOGLE_GENAI_USE_VERTEXAI: "TRUE"
+  GOOGLE_CLOUD_PROJECT: "pqc-inventory-agent-cd06"
+  GOOGLE_CLOUD_LOCATION: "global"
+  GCP_ORGANIZATION_ID: "31564119954"
+  GCP_ORGANIZATION_NAME: "jsaccomani.altostrat.com"
+  PQC_SIMULATION_MODE: "AUTO"
+  PQC_AGENT_MODEL: "gemini-3.1-pro-preview-customtools"

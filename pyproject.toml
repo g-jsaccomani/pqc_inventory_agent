@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pqc-inventory-agent"
+version = "1.0.0"
+description = "Post-Quantum Cryptography (PQC) Compliance & Inventory Agent built with Google ADK and Vertex AI Agent Engine"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "google-adk>=1.0.0",
+    "google-genai>=1.0.0",
+    "google-cloud-aiplatform[adk,agent_engines]>=1.75.0",
+    "google-cloud-asset>=3.26.0",
+    "google-cloud-kms>=2.24.0",
+    "google-auth>=2.30.0",
+    "pydantic>=2.8.0",
+    "pyyaml>=6.0.1",
+    "python-dotenv>=1.0.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=5.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
