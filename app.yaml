@@ -31,6 +31,9 @@ tools:
   - scan_organization_pqc_readiness
   - generate_pqc_migration_plan
   - scan_pqc_readiness
+  - scan_ssl_policies
+  - scan_import_jobs_pqc
+  - run_quantum_cryptanalysis_simulation
   - discover_all_crypto_assets
   - generate_application_pqc_refactoring_guide
   - export_cyclonedx_cbom

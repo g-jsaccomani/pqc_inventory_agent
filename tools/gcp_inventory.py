@@ -15,6 +15,7 @@ import datetime
 import json
 import logging
 import os
+import time
 import uuid
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -27,6 +28,16 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_ORGANIZATION_ID = os.getenv("GCP_ORGANIZATION_ID", "31564119954")
 DEFAULT_ORGANIZATION_NAME = os.getenv("GCP_ORGANIZATION_NAME", "jsaccomani.altostrat.com")
+
+# Thread-safe in-memory TTL cache to prevent redundant KMS/CAI API calls across multi-tool turns
+_SCAN_CACHE: Dict[str, Tuple[float, str]] = {}
+_CACHE_TTL_SECONDS = float(os.getenv("PQC_SCAN_CACHE_TTL_SECONDS", "120"))
+
+
+def _compact_json(payload: Any) -> str:
+    """Serializes tool output into compact JSON without whitespace bloat to minimize LLM input token consumption."""
+    return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+
 
 # Local harness test/simulation project identifiers
 SIMULATION_PROJECT_IDS = {
@@ -1196,11 +1207,18 @@ def scan_pqc_readiness(
     """
     sim_mode = os.getenv("PQC_SIMULATION_MODE", "AUTO").upper()
     mode, scope_uri, clean_id = _resolve_scope(project_id)
+    cache_key = f"kms:{sim_mode}:{scope_uri}:{(location_id or 'all').lower()}"
+    now_ts = time.monotonic()
+    cached = _SCAN_CACHE.get(cache_key)
+    if cached and (now_ts - cached[0]) < _CACHE_TTL_SECONDS:
+        return cached[1]
 
     if sim_mode == "TRUE" or clean_id.lower() in SIMULATION_PROJECT_IDS:
         raw_keys = get_simulated_kms_raw_keys(clean_id, location_id)
         report = [classify_crypto_key(project_id=clean_id, **k) for k in raw_keys]
-        return json.dumps(report, indent=2, ensure_ascii=False)
+        out_json = _compact_json(report)
+        _SCAN_CACHE[cache_key] = (now_ts, out_json)
+        return out_json
 
     report: List[Dict[str, Any]] = []
     try:
@@ -1259,7 +1277,7 @@ def scan_pqc_readiness(
             for item in report:
                 item["data_source"] = f"SIMULATION_FALLBACK ({type(exc).__name__})"
         else:
-            return json.dumps(
+            return _compact_json(
                 {
                     "error": f"Failed to query Cloud KMS in scope '{scope_uri}': {str(exc)}",
                     "required_roles": [
@@ -1267,12 +1285,12 @@ def scan_pqc_readiness(
                         "roles/cloudkms.viewer",
                         "roles/cloudasset.viewer",
                     ],
-                },
-                indent=2,
-                ensure_ascii=False,
+                }
             )
 
-    return json.dumps(report, indent=2, ensure_ascii=False)
+    out_json = _compact_json(report)
+    _SCAN_CACHE[cache_key] = (now_ts, out_json)
+    return out_json
 
 
 def _classify_cai_crypto_asset(
@@ -1372,18 +1390,23 @@ def discover_all_crypto_assets(
     """Scans Cloud Asset Inventory across a GCP Organization (default), Folder, or Project for cryptographic, TLS & PKI assets."""
     sim_mode = os.getenv("PQC_SIMULATION_MODE", "AUTO").upper()
     mode, scope_uri, clean_id = _resolve_scope(project_id)
+    cache_key = f"cai:{sim_mode}:{scope_uri}"
+    now_ts = time.monotonic()
+    cached = _SCAN_CACHE.get(cache_key)
+    if cached and (now_ts - cached[0]) < _CACHE_TTL_SECONDS:
+        return cached[1]
 
     if sim_mode == "TRUE" or clean_id.lower() in SIMULATION_PROJECT_IDS:
-        return json.dumps(
+        out_json = _compact_json(
             {
                 "scope": scope_uri,
                 "scope_mode": mode,
                 "data_source": "SIMULATED_CLOUD_ASSET_INVENTORY",
                 "assets": get_simulated_cai_assets(scope_uri),
-            },
-            indent=2,
-            ensure_ascii=False,
+            }
         )
+        _SCAN_CACHE[cache_key] = (now_ts, out_json)
+        return out_json
 
     target_asset_types = [
         "cloudkms.googleapis.com/KeyRing",
@@ -1449,18 +1472,18 @@ def discover_all_crypto_assets(
             )
 
         if not discovered_assets and sim_mode == "AUTO":
-            return json.dumps(
+            out_json = _compact_json(
                 {
                     "scope": scope_uri,
                     "scope_mode": mode,
                     "data_source": "SIMULATION_FALLBACK_NO_LIVE_CAI_ASSETS",
                     "assets": get_simulated_cai_assets(scope_uri),
-                },
-                indent=2,
-                ensure_ascii=False,
+                }
             )
+            _SCAN_CACHE[cache_key] = (now_ts, out_json)
+            return out_json
 
-        return json.dumps(
+        out_json = _compact_json(
             {
                 "scope": scope_uri,
                 "scope_mode": mode,
@@ -1468,31 +1491,29 @@ def discover_all_crypto_assets(
                 "data_source": "LIVE_CLOUD_ASSET_INVENTORY",
                 "total_assets": len(discovered_assets),
                 "assets": discovered_assets,
-            },
-            indent=2,
-            ensure_ascii=False,
+            }
         )
+        _SCAN_CACHE[cache_key] = (now_ts, out_json)
+        return out_json
     except Exception as exc:
         if sim_mode == "AUTO":
-            return json.dumps(
+            out_json = _compact_json(
                 {
                     "scope": scope_uri,
                     "scope_mode": mode,
                     "data_source": f"SIMULATION_FALLBACK ({type(exc).__name__})",
                     "assets": get_simulated_cai_assets(scope_uri),
-                },
-                indent=2,
-                ensure_ascii=False,
+                }
             )
-        return json.dumps(
+            _SCAN_CACHE[cache_key] = (now_ts, out_json)
+            return out_json
+        return _compact_json(
             {
                 "scope": scope_uri,
                 "scope_mode": mode,
                 "error": f"Failed to query Cloud Asset Inventory in '{scope_uri}': {str(exc)}",
                 "required_roles": ["roles/cloudasset.viewer", "roles/resourcemanager.organizationViewer"],
-            },
-            indent=2,
-            ensure_ascii=False,
+            }
         )
 
 
@@ -1961,6 +1982,24 @@ def generate_pqc_migration_plan(
         },
     ]
 
+    def _slim_key_ref(k: Dict[str, Any]) -> Dict[str, Any]:
+        """Projects a key dict into a token-efficient summary, avoiding repetition of nested arrays already in playbooks/matrix."""
+        return {
+            "project_id": k.get("project_id", clean_id),
+            "location": k.get("location", "global"),
+            "key_ring": k.get("key_ring"),
+            "key_name": k.get("key_name"),
+            "purpose": k.get("purpose"),
+            "algorithm": k.get("algorithm"),
+            "protection_level": k.get("protection_level"),
+            "quantum_status": k.get("quantum_status"),
+            "priority": k.get("priority"),
+            "recommended_algorithm": k.get("recommended_algorithm"),
+            "hygiene_status": k.get("hygiene_status"),
+            "primary_state": k.get("primary_state"),
+            "is_active": k.get("is_active", True),
+        }
+
     plan = {
         "scope": scope_uri,
         "scope_mode": mode,
@@ -1970,9 +2009,9 @@ def generate_pqc_migration_plan(
         "cbom_summary": cbom_summary,
         "projects_breakdown": projects_breakdown,
         "application_compatibility_matrix": application_compatibility_matrix,
-        "priority_vulnerable_keys": vulnerable_keys,
-        "symmetric_hygiene_findings": unrotated_sym_keys,
-        "inactive_or_destroyed_keys": inactive_keys,
+        "priority_vulnerable_keys": [_slim_key_ref(vk) for vk in vulnerable_keys],
+        "symmetric_hygiene_findings": [_slim_key_ref(sk) for sk in unrotated_sym_keys],
+        "inactive_or_destroyed_keys": [_slim_key_ref(ik) for ik in inactive_keys],
         "remediation_playbooks": remediation_commands,
         "symmetric_rotation_playbooks": rotation_playbooks,
         "preventive_org_policy_guardrails": preventive_org_policy_guardrails,
@@ -1988,7 +2027,7 @@ def generate_pqc_migration_plan(
         ],
     }
 
-    return json.dumps(plan, indent=2, ensure_ascii=False)
+    return _compact_json(plan)
 
 
 def scan_organization_pqc_readiness(
@@ -2020,7 +2059,7 @@ def scan_organization_pqc_readiness(
         "total_assets": cai_assets.get("total_assets", len(cai_assets.get("assets", []))),
         "data_source": cai_assets.get("data_source", "LIVE_CLOUD_ASSET_INVENTORY"),
     }
-    return json.dumps(migration_plan, indent=2, ensure_ascii=False)
+    return _compact_json(migration_plan)
 
 
 def _get_cyclonedx_crypto_properties(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -2308,7 +2347,7 @@ def export_cyclonedx_cbom(
         "components": components,
         "dependencies": dependencies,
     }
-    return json.dumps(cyclonedx_bom, indent=2, ensure_ascii=False)
+    return _compact_json(cyclonedx_bom)
 
 
 def generate_application_pqc_refactoring_guide(
@@ -2333,7 +2372,7 @@ def generate_application_pqc_refactoring_guide(
     kms_items = json.loads(raw_kms_json)
 
     if isinstance(kms_items, dict) and "error" in kms_items:
-        return json.dumps(kms_items, indent=2, ensure_ascii=False)
+        return _compact_json(kms_items)
 
     flt = (application_or_key_filter or "all").strip().lower()
     refactoring_blueprints: List[Dict[str, Any]] = []
@@ -2518,14 +2557,12 @@ def generate_application_pqc_refactoring_guide(
                 }
             )
 
-    return json.dumps(
+    return _compact_json(
         {
             "scope": project_id,
             "filter_applied": application_or_key_filter,
             "total_incompatible_keys_requiring_refactoring": len(refactoring_blueprints),
             "refactoring_blueprints": refactoring_blueprints,
-        },
-        indent=2,
-        ensure_ascii=False,
+        }
     )
 

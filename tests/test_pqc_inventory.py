@@ -495,9 +495,108 @@ def test_pqc_detectors_ssl_policies_and_import_jobs():
     tool_names = [getattr(t, "__name__", str(t)) for t in root_agent.tools]
     assert "scan_ssl_policies" in tool_names
     assert "scan_import_jobs_pqc" in tool_names
+    assert "run_quantum_cryptanalysis_simulation" in tool_names
     assert "scan_ssl_policies" in main.SYSTEM_INSTRUCTION
     assert "scan_import_jobs_pqc" in main.SYSTEM_INSTRUCTION
+    assert "run_quantum_cryptanalysis_simulation" in main.SYSTEM_INSTRUCTION
     assert "{" not in main.SYSTEM_INSTRUCTION
     assert "}" not in main.SYSTEM_INSTRUCTION
+
+
+def test_quantum_cryptanalysis_simulation_engine():
+    """Validates Phase 1 Quantum Physics & Cryptanalysis Simulation Engine (Gidney-Ekerå, Roetteler, Core-SVP & Monte Carlo Q-VaR)."""
+    from tools.quantum_engine import (
+        map_algorithm_to_quantum_profile,
+        run_quantum_cryptanalysis_simulation,
+    )
+
+    # 1. Verify Quantum Circuit Resource Estimates & Fall Order (ECDSA P-256 < ECDSA P-384 < RSA-2048 < RSA-3072 < RSA-4096)
+    p256 = map_algorithm_to_quantum_profile("EC_SIGN_P256_SHA256")
+    p384 = map_algorithm_to_quantum_profile("EC_SIGN_P384_SHA384")
+    rsa2048 = map_algorithm_to_quantum_profile("RSA_DECRYPT_OAEP_2048_SHA256")
+    rsa3072 = map_algorithm_to_quantum_profile("RSA_SIGN_PSS_3072_SHA256")
+    rsa4096 = map_algorithm_to_quantum_profile("RSA_SIGN_PSS_4096_SHA256")
+
+    assert p256["logical_qubits"] == 2330
+    assert p256["physical_qubits_superconducting_1e3"] == 13400000
+    assert p384["logical_qubits"] == 3484
+    assert rsa2048["logical_qubits"] == 4098
+    assert rsa2048["physical_qubits_superconducting_1e3"] == 20000000
+    assert rsa3072["logical_qubits"] == 6146
+    assert rsa4096["logical_qubits"] == 8194
+
+    # Prove mathematically that ECDSA P-256 and P-384 require fewer logical qubits than RSA-2048 and fall first
+    assert p256["logical_qubits"] < p384["logical_qubits"] < rsa2048["logical_qubits"] < rsa3072["logical_qubits"] < rsa4096["logical_qubits"]
+    assert p256["fall_order_rank"] == 1
+    assert p384["fall_order_rank"] == 2
+    assert rsa2048["fall_order_rank"] == 3
+
+    # 2. Verify Core-SVP Lattice Hardness for PQC algorithms and Grover resilience for AES-256
+    xwing = map_algorithm_to_quantum_profile("KEM_XWING")
+    mlkem1024 = map_algorithm_to_quantum_profile("ML_KEM_1024")
+    mldsa65 = map_algorithm_to_quantum_profile("PQ_SIGN_ML_DSA_65")
+    mldsa87 = map_algorithm_to_quantum_profile("PQ_SIGN_ML_DSA_87")
+    aes256 = map_algorithm_to_quantum_profile("GOOGLE_SYMMETRIC_ENCRYPTION")
+
+    assert xwing["core_svp_quantum_bits"] == 167
+    assert mlkem1024["core_svp_quantum_bits"] == 226
+    assert mldsa65["core_svp_quantum_bits"] == 174
+    assert mldsa87["core_svp_quantum_bits"] == 232
+    assert aes256["quantum_security_bits"] == 128
+
+    # 3. Verify full simulation tool execution & 10,000-iteration Monte Carlo curve
+    raw_sim = run_quantum_cryptanalysis_simulation("meu-projeto-gcp", "global")
+    sim = json.loads(raw_sim)
+    assert sim["quantum_engine_version"].startswith("1.0.0")
+    insights = sim["executive_quantum_physics_insights"]
+    assert insights["total_active_keys_analyzed"] == 8
+    assert insights["shor_vulnerable_keys_count"] == 3
+    assert insights["ecdsa_p256_ed25519_keys_falling_first_count"] == 1
+    assert insights["rsa_2048_keys_falling_third_count"] == 1
+    assert insights["rsa_3072_4096_keys_count"] == 1
+
+    # Verify Priority Fall Order Ranking places ECDSA P-256 at index 0 (before RSA-2048 and RSA-4096)
+    ranking = sim["priority_shor_fall_order_ranking"]
+    assert len(ranking) == 3
+    assert ranking[0]["current_algorithm"] == "EC_SIGN_P256_SHA256"
+    assert ranking[0]["logical_qubits_to_break"] == 2330
+    assert ranking[1]["current_algorithm"] == "RSA_DECRYPT_OAEP_2048_SHA256"
+    assert ranking[1]["logical_qubits_to_break"] == 4098
+    assert ranking[2]["current_algorithm"] == "RSA_SIGN_PSS_4096_SHA256"
+    assert ranking[2]["logical_qubits_to_break"] == 8194
+
+    # Verify 10,000-iteration Monte Carlo CRQC & Q-VaR 95% properties
+    mc = sim["monte_carlo_crqc_and_qvar_simulation"]
+    assert mc["monte_carlo_iterations"] == 10000
+    assert mc["quantum_value_at_risk_qvar_95_unmitigated_usd_millions"] > 10.0
+    assert mc["quantum_value_at_risk_qvar_95_post_gcp_bom_remediation_usd_millions"] < mc["quantum_value_at_risk_qvar_95_unmitigated_usd_millions"]
+    curve = mc["annual_crqc_probability_curve_2026_2035"]
+    assert len(curve) == 10
+    for row in curve:
+        assert row["ecdsa_p256_breach_prob_pct"] >= row["ecdsa_p384_breach_prob_pct"]
+        assert row["ecdsa_p384_breach_prob_pct"] >= row["rsa_2048_breach_prob_pct"]
+        assert row["rsa_2048_breach_prob_pct"] >= row["rsa_4096_breach_prob_pct"]
+
+
+def test_performance_ttl_cache_and_compact_json_token_optimization():
+    """Validates in-memory TTL cache hit performance (<15ms) and compact JSON token optimization."""
+    import time
+    from tools.gcp_inventory import _SCAN_CACHE, generate_pqc_migration_plan, scan_pqc_readiness
+    from tools.quantum_engine import run_quantum_cryptanalysis_simulation
+
+    # Warm cache and verify compact JSON (no multi-line indentation bloat)
+    raw_kms = scan_pqc_readiness("meu-projeto-gcp", "global")
+    assert "\n  " not in raw_kms
+    assert len(_SCAN_CACHE) >= 1
+
+    t0 = time.perf_counter()
+    raw_plan = generate_pqc_migration_plan("meu-projeto-gcp", "global")
+    raw_qsim = run_quantum_cryptanalysis_simulation("meu-projeto-gcp", "global")
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+    assert "\n  " not in raw_plan
+    assert "\n  " not in raw_qsim
+    # Both generate_pqc_migration_plan + 10,000-iteration Monte Carlo quantum simulation should complete fast
+    assert elapsed_ms < 150.0, f"Expected fast cached execution (<150ms), took {elapsed_ms:.2f}ms"
 
 

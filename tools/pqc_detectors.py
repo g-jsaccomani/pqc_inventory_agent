@@ -17,6 +17,7 @@ Provides specialized PQC posture detection tools for:
 import concurrent.futures
 import json
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 from google.api_core import exceptions as gcp_exceptions
@@ -26,6 +27,9 @@ from tools.gcp_inventory import (
     DEFAULT_ORGANIZATION_ID,
     DEFAULT_ORGANIZATION_NAME,
     SIMULATION_PROJECT_IDS,
+    _CACHE_TTL_SECONDS,
+    _SCAN_CACHE,
+    _compact_json,
     _resolve_scope,
 )
 
@@ -286,12 +290,17 @@ def scan_ssl_policies(project_id: str = f"organizations/{DEFAULT_ORGANIZATION_ID
         and remediation commands.
     """
     mode, scope_uri, clean_id = _resolve_scope(project_id)
+    cache_key = f"ssl:{scope_uri}"
+    now_ts = time.monotonic()
+    cached = _SCAN_CACHE.get(cache_key)
+    if cached and (now_ts - cached[0]) < _CACHE_TTL_SECONDS:
+        return cached[1]
 
     if clean_id in SIMULATION_PROJECT_IDS:
         sim_policies = _get_simulated_ssl_policies(clean_id)
         vuln_count = sum(1 for p in sim_policies if p["pqc_status"] == "VULNERABLE_TO_SNDL_ATTACKS")
         ready_count = sum(1 for p in sim_policies if p["pqc_status"] == "QUANTUM_READY_HYBRID_TLS_1_3")
-        return json.dumps(
+        out_json = _compact_json(
             {
                 "scope": scope_uri,
                 "scope_mode": mode,
@@ -304,10 +313,10 @@ def scan_ssl_policies(project_id: str = f"organizations/{DEFAULT_ORGANIZATION_ID
                     "Deploy Google Cloud Global Load Balancing (L7) with TLS 1.3 modern/restricted policies "
                     "(X25519 + ML-KEM-768 hybrid PQC key exchange) and Certificate Authority Service (CAS)."
                 ),
-            },
-            indent=2,
-            ensure_ascii=False,
+            }
         )
+        _SCAN_CACHE[cache_key] = (now_ts, out_json)
+        return out_json
 
     evaluated_policies: List[Dict[str, Any]] = []
     seen_resources = set()
@@ -423,7 +432,7 @@ def scan_ssl_policies(project_id: str = f"organizations/{DEFAULT_ORGANIZATION_ID
                 "with a TLS 1.3 SSL Policy (X25519 + ML-KEM-768) and Certificate Authority Service (CAS)."
             )
 
-        return json.dumps(
+        out_json = _compact_json(
             {
                 "scope": scope_uri,
                 "scope_mode": mode,
@@ -440,19 +449,17 @@ def scan_ssl_policies(project_id: str = f"organizations/{DEFAULT_ORGANIZATION_ID
                     "(enabling hybrid post-quantum key shares X25519 + ML-KEM-768 / X25519MLKEM768) and "
                     "Certificate Authority Service (CAS) to enforce quantum-safe transport."
                 ),
-            },
-            indent=2,
-            ensure_ascii=False,
+            }
         )
+        _SCAN_CACHE[cache_key] = (now_ts, out_json)
+        return out_json
     except gcp_exceptions.GoogleAPICallError as exc:
         logger.warning("GCP API error in scan_ssl_policies on '%s': %s", scope_uri, exc)
-        return json.dumps(
+        return _compact_json(
             {
                 "error": f"Failed to scan SSL Policies in scope '{scope_uri}': {exc.message}",
                 "scope": scope_uri,
-            },
-            indent=2,
-            ensure_ascii=False,
+            }
         )
 
 
@@ -543,6 +550,11 @@ def scan_import_jobs_pqc(
         and remediation commands.
     """
     mode, scope_uri, clean_id = _resolve_scope(project_id)
+    cache_key = f"ij:{scope_uri}:{(location_id or 'global').lower()}"
+    now_ts = time.monotonic()
+    cached = _SCAN_CACHE.get(cache_key)
+    if cached and (now_ts - cached[0]) < _CACHE_TTL_SECONDS:
+        return cached[1]
 
     if clean_id in SIMULATION_PROJECT_IDS:
         sim_jobs = _get_simulated_import_jobs(clean_id)
@@ -554,7 +566,7 @@ def scan_import_jobs_pqc(
         secure_count = sum(
             1 for j in sim_jobs if j["is_active"] and j["pqc_status"] == "SECURE_PQC_BYOK"
         )
-        return json.dumps(
+        out_json = _compact_json(
             {
                 "scope": scope_uri,
                 "scope_mode": mode,
@@ -569,10 +581,10 @@ def scan_import_jobs_pqc(
                     "Migrate BYOK workflows to Cloud HSM (FIPS 140-3 Level 3) using "
                     "HPKE_KEM_XWING_HKDF_SHA256_AES_256_GCM import jobs to eliminate key transport risks."
                 ),
-            },
-            indent=2,
-            ensure_ascii=False,
+            }
         )
+        _SCAN_CACHE[cache_key] = (now_ts, out_json)
+        return out_json
 
     try:
         kms_client = kms_v1.KeyManagementServiceClient()
@@ -650,7 +662,7 @@ def scan_import_jobs_pqc(
         vuln_count = sum(1 for j in active_jobs if j["pqc_status"] == "VULNERABLE_KEY_IMPORT_TRANSPORT")
         secure_count = sum(1 for j in active_jobs if j["pqc_status"] == "SECURE_PQC_BYOK")
 
-        return json.dumps(
+        out_json = _compact_json(
             {
                 "scope": scope_uri,
                 "scope_mode": mode,
@@ -666,17 +678,15 @@ def scan_import_jobs_pqc(
                     "For all BYOK workflows, mandate Cloud HSM (protection-level=HSM) with "
                     "HPKE_KEM_XWING_HKDF_SHA256_AES_256_GCM ImportJobs to protect key material during import transport."
                 ),
-            },
-            indent=2,
-            ensure_ascii=False,
+            }
         )
+        _SCAN_CACHE[cache_key] = (now_ts, out_json)
+        return out_json
     except gcp_exceptions.GoogleAPICallError as exc:
         logger.warning("GCP API error in scan_import_jobs_pqc on '%s': %s", scope_uri, exc)
-        return json.dumps(
+        return _compact_json(
             {
                 "error": f"Failed to scan Cloud KMS ImportJobs in scope '{scope_uri}': {exc.message}",
                 "scope": scope_uri,
-            },
-            indent=2,
-            ensure_ascii=False,
+            }
         )

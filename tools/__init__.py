@@ -14,6 +14,10 @@ from tools.pqc_detectors import (
     scan_import_jobs_pqc,
     scan_ssl_policies,
 )
+from tools.quantum_engine import (
+    map_algorithm_to_quantum_profile,
+    run_quantum_cryptanalysis_simulation,
+)
 
 __all__ = [
     "classify_crypto_key",
@@ -25,5 +29,7 @@ __all__ = [
     "export_cyclonedx_cbom",
     "scan_ssl_policies",
     "scan_import_jobs_pqc",
+    "map_algorithm_to_quantum_profile",
+    "run_quantum_cryptanalysis_simulation",
 ]
 

@@ -37,6 +37,9 @@ from tools.pqc_detectors import (
     scan_import_jobs_pqc,
     scan_ssl_policies,
 )
+from tools.quantum_engine import (
+    run_quantum_cryptanalysis_simulation,
+)
 
 load_dotenv()
 
@@ -66,6 +69,7 @@ def get_langchain_reasoning_engine_agent():
             scan_pqc_readiness,
             scan_ssl_policies,
             scan_import_jobs_pqc,
+            run_quantum_cryptanalysis_simulation,
             discover_all_crypto_assets,
             generate_pqc_migration_plan,
             generate_application_pqc_refactoring_guide,
@@ -474,6 +478,9 @@ def run_local_harness(input_payload: str, invoke_llm: bool = False) -> Dict[str,
     ssl_policies_report = json.loads(scan_ssl_policies(project_id=project_id))
     import_jobs_report = json.loads(scan_import_jobs_pqc(project_id=project_id, location_id=location_id))
     migration_plan = json.loads(generate_pqc_migration_plan(project_id=project_id, location_id=location_id))
+    quantum_simulation = json.loads(
+        run_quantum_cryptanalysis_simulation(project_id=project_id, location_id=location_id)
+    )
 
     result: Dict[str, Any] = {
         "harness_status": "SUCCESS",
@@ -484,6 +491,7 @@ def run_local_harness(input_payload: str, invoke_llm: bool = False) -> Dict[str,
         "ssl_policies": ssl_policies_report,
         "import_jobs": import_jobs_report,
         "cloud_asset_inventory": cai_report,
+        "quantum_cryptanalysis_simulation": quantum_simulation,
         "remediation_playbooks": migration_plan.get("remediation_playbooks", []),
         "recommended_google_cloud_security_architecture_and_product_bom": migration_plan.get(
             "recommended_google_cloud_security_architecture_and_product_bom", []
