@@ -13,7 +13,7 @@ description: >
 runtime:
   framework: google-adk
   target_platform: vertex_ai_agent_engine
-  reasoning_engine_resource: "projects/110254026096/locations/us-central1/reasoningEngines/1224758646563405824"
+  reasoning_engine_resource: "projects/110254026096/locations/us-central1/reasoningEngines/519268830350934016"
   cloud_run_url: "https://pqc-inventory-agent-110254026096.us-central1.run.app/dev-ui/?app=pqc_agent"
   python_version: "3.12"
   entrypoint: "main:agent"
@@ -37,6 +37,8 @@ tools:
   - discover_all_crypto_assets
   - generate_application_pqc_refactoring_guide
   - export_cyclonedx_cbom
+  - export_pqc_assessment_reports
+
 
 security:
   required_iam_roles:

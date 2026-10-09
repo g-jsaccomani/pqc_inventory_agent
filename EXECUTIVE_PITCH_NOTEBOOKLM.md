@@ -45,7 +45,7 @@ Built on **Gemini 3.1 (`gemini-3.1-pro-preview-customtools`)**, **Google Agent D
   - **Google Agent Development Kit (ADK)** (`google-adk`) with custom Python tools (`tools/gcp_inventory.py`).
   - **Dual Deployment:**
     - **Cloud Run Web UI & SSE API:** `https://pqc-inventory-agent-110254026096.us-central1.run.app/dev-ui/?app=pqc_agent`
-    - **Vertex AI Agent Engine (Reasoning Engine) for Gemini Enterprise:** `projects/110254026096/locations/us-central1/reasoningEngines/1224758646563405824`
+    - **Vertex AI Agent Engine (Reasoning Engine) for Gemini Enterprise:** `projects/110254026096/locations/us-central1/reasoningEngines/519268830350934016`
 - **5 Specialized Agentic Tools:**
   1. `scan_gcp_crypto_inventory`: High-speed parallel KMS + Cloud Asset Inventory scanner across all active projects in a GCP Organization.
   2. `assess_pqc_readiness`: Evaluates assets against Shor's and Grover's algorithms, computes the **PQC Readiness Score (`0–100%`)**, and runs **Mosca's Theorem ($X + Y > Z$)** HNDL breach timeline math.
@@ -137,4 +137,25 @@ O agente conta agora com o motor determinístico [`tools/quantum_engine.py`](fil
 
 ### Prompt Pronto para o Gemini Enterprise (Relatório 6 — Inteligência & Física Quântica)
 > *"Atue como Principal Quantum Security Scientist do Google Cloud. Execute a ferramenta `run_quantum_cryptanalysis_simulation` na organização `organizations/31564119954` e gere o **Relatório 6: Inteligência & Criptoanálise Quântica Preditiva (Qubits Lógicos/Físicos, Core-SVP & Monte Carlo Q-VaR)**. Apresente: (1) A prova matemática (Gidney-Ekerå vs. Roetteler) de por que as chaves ECDSA P-256 e P-384 da organização cairão ANTES das chaves RSA-2048; (2) A tabela de Estimativa de Recursos de Circuitos Quânticos (Qubits Lógicos, Portas Toffoli, Distância de Código de Superfície d, Qubits Físicos Supercondutores e Horas de Decriptação) para as chaves vulneráveis; (3) A prova de imunidade Core-SVP para KEM_XWING e ML-DSA-65; e (4) A curva de Monte Carlo (10.000 iterações, 2026-2035) com o Quantum Value-at-Risk (Q-VaR 95%) antes e depois do Google Cloud Product BOM."*
+
+---
+
+## 9. Etapa 2 — Guia Consultivo Passo a Passo, Validação Determinística & Exportação Executiva/Técnica (`export_pqc_assessment_reports`)
+
+O agente opera com **validação determinística de escopo e métricas** e geração automatizada de **entregáveis separados para a Diretoria (Executivo) e para a Engenharia (Técnico)**:
+
+1. **Redirecionamento Automático de Tenant Runtime & Selo de Autenticidade (`data_validation_manifest`):**
+   - Intercepta automaticamente IDs efêmeros de execução do Vertex AI Agent Engine (`project-cb232322-...`, `*-tp`) e redireciona para a Organização real do cliente (`organizations/31564119954` — `jsaccomani.altostrat.com`), garantindo leitura de telemetria real (`LIVE_GCP_TELEMETRY_VERIFIED`) e bloqueando cálculos manuais incorretos no LLM via `validated_executive_scorecard`.
+2. **Guia Consultivo de Execução Passo a Passo no Ambiente do Cliente:**
+   - **5 Workstreams Operacionais por Camada** (`customer_environment_execution_guide`): Governança Preventiva (Dia 0–15) $\rightarrow$ Rede TLS 1.3 `X25519MLKEM768` & Buffers HTTP `32KB` (Dia 15–30) $\rightarrow$ Migração HNDL `KEM_XWING` + `HPKE` (Dia 30–60) $\rightarrow$ Migração de Assinaturas `PQ_SIGN_ML_DSA_65` (Dia 45–75) $\rightarrow$ Modernização BYOK & Descomissionamento Seguro (Dia 75–90).
+   - **Runbooks de 5 Passos por Chave (`consultative_execution_guide`)**: Avaliação do estado atual, impacto arquitetural, pré-requisitos de banco/gateway, criação em Cloud HSM (`--protection-level=hsm`), binding IAM (`gcloud kms keys add-iam-policy-binding`), refatoração de código em modo *dual-read/dual-verify* e comando de validação pós-mudança.
+3. **Pacote de Exportação em 4 Entregáveis (`export_pqc_assessment_reports` & `python main.py export`):**
+   - **`01_PQC_Executive_Board_Report` (`.md` e `.html` pronto para PDF)**: Exclusivo para CISO, CIO, CFO e Board.
+   - **`02_PQC_Technical_Engineering_Playbook` (`.md` e `.html` pronto para PDF)**: Guia mão na massa para Arquitetos, SRE, DevSecOps e Desenvolvedores.
+   - **`03_PQC_CycloneDX_v1.6_CBOM.json`**: Inventário oficial OWASP CycloneDX v1.6.
+   - **`04_PQC_Consolidated_Full_Assessment` (`.md` e `.html` pronto para PDF)**: Relatório Master unificado, com upload automático para o **Cloud Storage (`gs://...`)**.
+
+### Prompt Pronto para o Gemini Enterprise (Exportação Executiva + Técnica)
+> *"Execute a ferramenta `export_pqc_assessment_reports` para a organização `organizations/31564119954`. Exporte o pacote completo separando o **Relatório Executivo para o Board/CISO** e o **Playbook Técnico Passo a Passo de Engenharia**, faça o upload para o Cloud Storage e me apresente os links de download junto com o resumo executivo e técnico validado."*
+
 

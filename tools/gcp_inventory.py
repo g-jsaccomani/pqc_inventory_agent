@@ -15,6 +15,7 @@ import datetime
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -322,8 +323,30 @@ KNOWN_WORKLOAD_BINDINGS: Dict[str, List[Dict[str, str]]] = {
 }
 
 
+def _is_internal_runtime_tenant_project(proj_id: str) -> bool:
+    """Detects internal Google-managed Vertex AI Agent Engine / Reasoning Engine runtime tenant projects.
+
+    Examples: `project-cb232322-97f9-4f78-97f`, `*-tp` (tenant project suffix).
+    When an LLM running inside Vertex AI Agent Engine inspects its own runtime environment metadata and passes
+    the internal tenant project ID into tools, redirecting to the customer's GCP Organization prevents
+    permission failures and simulated fallback contamination.
+    """
+    clean = (proj_id or "").strip().lower()
+    if not clean or clean in SIMULATION_PROJECT_IDS:
+        return False
+    if clean.endswith("-tp") or clean in (
+        "vertex-ai-tenant",
+        "agent-engine-tenant",
+        "reasoning-engine-tenant",
+    ):
+        return True
+    if re.match(r"^project-[0-9a-f]{6,}-[0-9a-f]{4}-", clean):
+        return True
+    return False
+
+
 def _resolve_scope(target: Optional[str] = None) -> Tuple[str, str, str]:
-    """Resolves the target input into (mode, scope_uri, clean_id)."""
+    """Resolves the target input into (mode, scope_uri, clean_id), redirecting internal runtime tenant projects to ORG."""
     raw = (target or "").strip()
     lower = raw.lower()
 
@@ -344,9 +367,54 @@ def _resolve_scope(target: Optional[str] = None) -> Tuple[str, str, str]:
 
     if lower.startswith("projects/"):
         proj_id = raw.split("/", 1)[1].strip()
+        if _is_internal_runtime_tenant_project(proj_id):
+            org_id = DEFAULT_ORGANIZATION_ID
+            logger.info(
+                "Redirecting internal runtime tenant project '%s' to customer Organization 'organizations/%s'.",
+                proj_id,
+                org_id,
+            )
+            return ("ORG", f"organizations/{org_id}", org_id)
         return ("PROJECT", f"projects/{proj_id}", proj_id)
 
+    if _is_internal_runtime_tenant_project(raw):
+        org_id = DEFAULT_ORGANIZATION_ID
+        logger.info(
+            "Redirecting internal runtime tenant project '%s' to customer Organization 'organizations/%s'.",
+            raw,
+            org_id,
+        )
+        return ("ORG", f"organizations/{org_id}", org_id)
+
     return ("PROJECT", f"projects/{raw}", raw)
+
+
+def _describe_scope_resolution(
+    requested_target: Optional[str],
+    data_source_authenticity: str = "LIVE_GCP_TELEMETRY_VERIFIED",
+) -> Dict[str, Any]:
+    """Builds a deterministic data & scope validation manifest to prevent LLM scope or metric hallucinations."""
+    raw = (requested_target or "").strip()
+    candidate_proj = raw.split("/", 1)[1].strip() if raw.lower().startswith("projects/") else raw
+    was_redirected = _is_internal_runtime_tenant_project(candidate_proj)
+    mode, scope_uri, clean_id = _resolve_scope(requested_target)
+    manifest: Dict[str, Any] = {
+        "requested_scope_input": raw or f"organizations/{DEFAULT_ORGANIZATION_ID}",
+        "resolved_scope_uri": scope_uri,
+        "resolved_scope_mode": mode,
+        "resolved_clean_id": clean_id,
+        "organization_domain": DEFAULT_ORGANIZATION_NAME if mode == "ORG" else None,
+        "tenant_project_auto_redirected": was_redirected,
+        "data_source_authenticity": data_source_authenticity,
+        "metrics_validation_status": "DETERMINISTIC_BACKEND_VALIDATED_DO_NOT_RECALCULATE",
+    }
+    if was_redirected:
+        manifest["redirection_explanation"] = (
+            f"Internal Vertex AI Agent Engine runtime tenant project '{candidate_proj}' was automatically "
+            f"redirected to customer Organization '{scope_uri}' ({DEFAULT_ORGANIZATION_NAME}) to guarantee "
+            "evaluation of real customer GCP assets rather than an empty runtime container."
+        )
+    return manifest
 
 
 # Cache of live workloads discovered via Cloud Asset Inventory per scope
@@ -1216,6 +1284,8 @@ def scan_pqc_readiness(
     if sim_mode == "TRUE" or clean_id.lower() in SIMULATION_PROJECT_IDS:
         raw_keys = get_simulated_kms_raw_keys(clean_id, location_id)
         report = [classify_crypto_key(project_id=clean_id, **k) for k in raw_keys]
+        for item in report:
+            item["data_source"] = "SIMULATED_BENCHMARK_DATASET"
         out_json = _compact_json(report)
         _SCAN_CACHE[cache_key] = (now_ts, out_json)
         return out_json
@@ -1263,6 +1333,8 @@ def scan_pqc_readiness(
                     k.get("key_name", ""),
                 )
             )
+            for item in report:
+                item["data_source"] = "LIVE_GCP_TELEMETRY_VERIFIED"
 
         if not report and sim_mode == "AUTO":
             raw_keys = get_simulated_kms_raw_keys(clean_id, location_id)
@@ -1623,13 +1695,19 @@ def generate_pqc_migration_plan(
     project_id: str = f"organizations/{DEFAULT_ORGANIZATION_ID}",
     location_id: str = "all",
 ) -> str:
-    """Generates a consolidated CBOM, Application PQC Compatibility Matrix, and Executive PQC Migration Plan."""
+    """Generates a consolidated CBOM, Application PQC Compatibility Matrix, and Consultative Step-by-Step PQC Execution Guide."""
     mode, scope_uri, clean_id = _resolve_scope(project_id)
     raw_kms_json = scan_pqc_readiness(project_id=project_id, location_id=location_id)
     kms_items = json.loads(raw_kms_json)
 
     if isinstance(kms_items, dict) and "error" in kms_items:
         return json.dumps(kms_items, indent=2, ensure_ascii=False)
+
+    is_simulated = any("SIMULAT" in str(k.get("data_source", "")).upper() for k in kms_items)
+    data_source_authenticity = (
+        "SIMULATED_BENCHMARK_DATASET" if is_simulated else "LIVE_GCP_TELEMETRY_VERIFIED"
+    )
+    data_validation_manifest = _describe_scope_resolution(project_id, data_source_authenticity)
 
     cbom_summary = _compute_metrics_for_keys(kms_items)
 
@@ -1667,6 +1745,29 @@ def generate_pqc_migration_plan(
         )
 
     cbom_summary["total_projects_scanned"] = len(projects_breakdown)
+    cbom_summary["data_source_authenticity"] = data_source_authenticity
+
+    validated_executive_scorecard = {
+        "validation_status": "BACKEND_DETERMINISTIC_SCORE_DO_NOT_RECOMPUTE",
+        "data_source_authenticity": data_source_authenticity,
+        "resolved_scope_uri": scope_uri,
+        "weighted_pqc_maturity_score_pct": cbom_summary["weighted_pqc_maturity_score_pct"],
+        "asymmetric_pqc_migration_score_pct": cbom_summary["asymmetric_pqc_migration_score_pct"],
+        "symmetric_grover_resilience_score_pct": cbom_summary["symmetric_grover_resilience_score_pct"],
+        "symmetric_rotation_hygiene_score_pct": cbom_summary["symmetric_rotation_hygiene_score_pct"],
+        "application_pqc_compatibility_score_pct": cbom_summary["application_pqc_compatibility_score_pct"],
+        "overall_algorithmic_quantum_safe_score_pct": cbom_summary["pqc_readiness_score_pct"],
+        "active_kms_keys_count": cbom_summary["active_kms_keys_count"],
+        "approved_pqc_keys_count": cbom_summary["approved_pqc_count"],
+        "vulnerable_classical_asymmetric_keys_count": cbom_summary["vulnerable_classical_rsa_ecc_count"],
+        "secure_symmetric_keys_count": cbom_summary["secure_symmetric_count"],
+        "symmetric_keys_missing_rotation_count": cbom_summary["symmetric_keys_missing_rotation_count"],
+        "score_formula_validation_note": (
+            "Weighted PQC Maturity = 60% * Asymmetric_PQC_Migration_Score + 25% * Symmetric_Grover_Resilience_Score "
+            "+ 15% * Symmetric_Rotation_Hygiene_Score. Asymmetric PQC Migration Score divides Approved_PQC_Keys by "
+            "Total_Active_Asymmetric_Keys (NOT Total_Keys)."
+        ),
+    }
 
     # Build the complete Application-to-Key PQC Compatibility Matrix across all active keys
     application_compatibility_matrix: List[Dict[str, Any]] = []
@@ -1724,10 +1825,17 @@ def generate_pqc_migration_plan(
         enabled_vers = vk.get("enabled_version_ids") or ["1"]
         first_ver = enabled_vers[0]
 
-        is_jwt_or_token_key = any(tok in old_name.lower() for tok in ("jwt", "token"))
+        consuming_apps = vk.get("consuming_applications", [])
+        app_names = [a.get("application_name", "") for a in consuming_apps if a.get("application_name")]
+        service_accounts = [a.get("service_account", "") for a in consuming_apps if a.get("service_account")]
+        primary_sa = service_accounts[0] if service_accounts else f"default-compute@{key_proj}.iam.gserviceaccount.com"
+
+        is_jwt_or_token_key = any(tok in old_name.lower() for tok in ("jwt", "token")) or any(
+            "jwt" in str(a.get("crypto_usage_pattern", "")).lower() for a in consuming_apps
+        )
         jwt_header_note = (
             "TECHNICAL NOTE (JWT/Token Header Buffer Expansion): Increase HTTP header buffer limits "
-            "(to 16KB in API Gateways/Envoy) because ML-DSA-65 signatures expand Base64URL JWT tokens by ~4.4KB."
+            "(to 16KB in API Gateways/Envoy, or 32KB max_request_headers_kb) because ML-DSA-65 signatures expand Base64URL JWT tokens by ~4.4KB."
             if is_jwt_or_token_key
             else ""
         )
@@ -1752,9 +1860,20 @@ def generate_pqc_migration_plan(
                 f"--default-algorithm=ml-kem-1024 "
                 f"--protection-level=hsm"
             )
+            iam_binding_cmd = (
+                f"gcloud kms keys add-iam-policy-binding {new_name} "
+                f"--keyring={kr} --location={loc} --project={key_proj} "
+                f"--member='serviceAccount:{primary_sa}' "
+                f"--role='roles/cloudkms.cryptoKeyDecapsulator'"
+            )
             disable_legacy_cmd = (
                 f"gcloud kms keys versions disable {first_ver} "
                 f"--key={old_name} --keyring={kr} --location={loc} --project={key_proj}"
+            )
+            validation_cmd = (
+                f"gcloud kms keys describe {new_name} --keyring={kr} --location={loc} --project={key_proj} "
+                f"--format='yaml(name,purpose,versionTemplate,primary)' && "
+                f"gcloud kms keys versions list --key={old_name} --keyring={kr} --location={loc} --project={key_proj}"
             )
             rationale = (
                 "Immediate mitigation against 'Harvest Now, Decrypt Later' (HNDL) using hybrid KEM "
@@ -1762,6 +1881,13 @@ def generate_pqc_migration_plan(
                 "backed by Cloud HSM (--protection-level=hsm). "
                 "Requires refactoring consuming applications from AsymmetricDecrypt to Decapsulate (HPKE / Envelope Encryption)."
             )
+            step_by_step_plan = [
+                f"Step 1 (Pre-Flight & Database Schema Preparation): Verify regional Cloud HSM quota in '{loc}' for project '{key_proj}' and expand wrapped DEK columns in consuming storage/databases from 256 bytes (RSA-2048) to >= 1,568 bytes (VARBINARY(2048)) to accommodate KEM_XWING (1,120 B) or ML_KEM_1024 (1,568 B) ciphertexts.",
+                f"Step 2 (Provision PQC KEM Key in Cloud HSM): Execute `{cmd}` (or `{cnsa_cmd}` for pure CNSA 2.0 Category 5).",
+                f"Step 3 (Grant Least-Privilege IAM Decapsulation Role): Execute `{iam_binding_cmd}` so workload `{', '.join(app_names) or old_name}` can invoke `kms.Decapsulate`.",
+                f"Step 4 (Refactor Consuming Application to RFC 9180 HPKE / Envelope Encryption): Update `{', '.join(app_names) or 'consuming service'}` from `kms_client.asymmetric_decrypt()` to `kms_client.decapsulate()` + `HKDF-SHA256` (32-byte shared_secret -> 256-bit DEK) + `AES-256-GCM` in dual-read mode until existing RSA-OAEP ciphertexts are re-wrapped.",
+                f"Step 5 (Decommission Legacy RSA Key Version & Validate): Execute `{disable_legacy_cmd}` and verify posture via `{validation_cmd}`.",
+            ]
         else:
             new_name = f"{old_name}-pqc-mldsa65"
             cmd = (
@@ -1782,9 +1908,20 @@ def generate_pqc_migration_plan(
                 f"--default-algorithm=pq-sign-ml-dsa-87 "
                 f"--protection-level=hsm"
             )
+            iam_binding_cmd = (
+                f"gcloud kms keys add-iam-policy-binding {new_name} "
+                f"--keyring={kr} --location={loc} --project={key_proj} "
+                f"--member='serviceAccount:{primary_sa}' "
+                f"--role='roles/cloudkms.signerVerifier'"
+            )
             disable_legacy_cmd = (
                 f"gcloud kms keys versions disable {first_ver} "
                 f"--key={old_name} --keyring={kr} --location={loc} --project={key_proj}"
+            )
+            validation_cmd = (
+                f"gcloud kms keys describe {new_name} --keyring={kr} --location={loc} --project={key_proj} "
+                f"--format='yaml(name,purpose,versionTemplate,primary)' && "
+                f"gcloud kms keys versions list --key={old_name} --keyring={kr} --location={loc} --project={key_proj}"
             )
             rationale = (
                 "Migration of classical digital signature (RSA/ECC) vulnerable to Shor's Algorithm "
@@ -1793,6 +1930,13 @@ def generate_pqc_migration_plan(
                 "Note: Signature size increases to 3,309 bytes (ML-DSA-65) or 4,627 bytes (ML-DSA-87); "
                 "verify HTTP Header / MTU limits and refactor KMS signing calls from `digest` to `data`."
             )
+            step_by_step_plan = [
+                f"Step 1 (Pre-Flight & Gateway Header Buffer Expansion): Before switching signing keys for `{', '.join(app_names) or old_name}`, increase HTTP header buffer limits (`max_request_headers_kb: 32` in Envoy/Istio, `large_client_header_buffers 4 32k` in NGINX/Apigee) to prevent HTTP 431 errors when signatures expand from 64–256 bytes to 3,309 bytes (~4.4 KB Base64URL).",
+                f"Step 2 (Provision PQC Signing Key in Cloud HSM): Execute `{cmd}` (or `{cnsa_cmd}` for CNSA 2.0 Category 5).",
+                f"Step 3 (Grant Least-Privilege IAM Signer/Verifier Role): Execute `{iam_binding_cmd}` for service account `{primary_sa}`.",
+                f"Step 4 (Refactor KMS Signing API Contract & Verifier SDKs): Update `{', '.join(app_names) or 'consuming service'}` from `kms_client.asymmetric_sign(digest={{'sha256': ...}})` to `kms_client.asymmetric_sign(data=raw_message_bytes)` (or 64-byte SHAKE256 `mu` with `_EXTERNAL_MU`) and distribute the new 1,952-byte ML-DSA-65 public key to downstream verifiers.",
+                f"Step 5 (Decommission Legacy Signing Key Version & Validate): Once all active tokens/artifacts issued by `{old_name}` expire, execute `{disable_legacy_cmd}` and validate with `{validation_cmd}`.",
+            ]
 
         if jwt_header_note:
             rationale = f"{rationale} {jwt_header_note}"
@@ -1807,11 +1951,11 @@ def generate_pqc_migration_plan(
                 "legacy_key": f"{key_proj}/{kr}/{old_name} ({loc})",
                 "legacy_key_name": old_name,
                 "legacy_algorithm": vk.get("algorithm", ""),
+                "legacy_protection_level": vk.get("protection_level", "SOFTWARE"),
                 "priority": vk.get("priority", "HIGH"),
                 "mosca_risk_analysis": vk.get("mosca_risk_analysis", {}),
-                "affected_applications": [
-                    a.get("application_name") for a in vk.get("consuming_applications", [])
-                ],
+                "affected_applications": app_names,
+                "affected_service_accounts": service_accounts or [primary_sa],
                 "pqc_application_compatibility": vk.get("pqc_application_compatibility", {}),
                 "target_pqc_key": new_name,
                 "target_algorithm": vk.get("recommended_algorithm", ""),
@@ -1820,7 +1964,22 @@ def generate_pqc_migration_plan(
                 "engineering_notes": eng_notes,
                 "gcloud_command": cmd,
                 "gcloud_cnsa_2_0_command": cnsa_cmd,
+                "iam_binding_command": iam_binding_cmd,
                 "post_migration_disable_legacy_command": disable_legacy_cmd,
+                "post_change_validation_command": validation_cmd,
+                "consultative_execution_guide": {
+                    "current_state_evaluation": (
+                        f"Key '{key_proj}/{kr}/{old_name}' ({loc}) currently uses classical algorithm '{vk.get('algorithm')}' "
+                        f"with protection_level='{vk.get('protection_level')}' and is consumed by {len(app_names) or 1} workload(s): "
+                        f"{', '.join(app_names) if app_names else 'Cloud KMS consumer'}. "
+                        f"Mosca status: {vk.get('mosca_risk_analysis', {}).get('mosca_status')} "
+                        f"(X+Y = {vk.get('mosca_risk_analysis', {}).get('x_plus_y_total_years')} years)."
+                    ),
+                    "architectural_impact_assessment": vk.get("pqc_application_compatibility", {}).get(
+                        "protocol_and_payload_impact", ""
+                    ),
+                    "step_by_step_execution_plan": step_by_step_plan,
+                },
             }
         )
 
@@ -1831,7 +1990,7 @@ def generate_pqc_migration_plan(
         .isoformat()
         .replace("+00:00", "Z")
     )
-    rotation_playbooks: List[Dict[str, str]] = []
+    rotation_playbooks: List[Dict[str, Any]] = []
     for sk in unrotated_sym_keys:
         s_proj = sk.get("project_id") or clean_id
         s_loc = sk.get("location", "global")
@@ -1845,12 +2004,22 @@ def generate_pqc_migration_plan(
             f"--rotation-period=90d "
             f"--next-rotation-time={next_rot_iso}"
         )
+        rot_val_cmd = (
+            f"gcloud kms keys describe {s_name} --keyring={s_kr} --location={s_loc} --project={s_proj} "
+            f"--format='yaml(name,rotationPeriod,nextRotationTime,primary)'"
+        )
         rotation_playbooks.append(
             {
                 "project_id": s_proj,
                 "key": f"{s_proj}/{s_kr}/{s_name} ({s_loc})",
                 "hygiene_status": sk.get("hygiene_status", "NON_COMPLIANT_NO_ROTATION"),
                 "gcloud_rotation_command": rot_cmd,
+                "post_change_validation_command": rot_val_cmd,
+                "step_by_step_execution_guide": [
+                    f"Step 1 (Evaluate CMEK Impact): AES-256 key '{s_proj}/{s_kr}/{s_name}' is already resistant to Grover's Algorithm (128 effective post-quantum bits), and enabling automatic rotation in Cloud KMS is 100% transparent to BigQuery, Cloud Storage, GKE, and Compute Engine CMEK workloads (zero downtime).",
+                    f"Step 2 (Configure 90-Day Automatic Rotation): Execute `{rot_cmd}`.",
+                    f"Step 3 (Verify Cryptoperiod Schedule): Execute `{rot_val_cmd}` and confirm `rotationPeriod: 7776000s` (90 days).",
+                ],
             }
         )
 
@@ -1982,6 +2151,59 @@ def generate_pqc_migration_plan(
         },
     ]
 
+    customer_environment_execution_guide = [
+        {
+            "workstream_id": "WORKSTREAM_1_GOVERNANCE_AND_SYMMETRIC_HYGIENE",
+            "title": "Fase 1 (Dia 0–15): Governança Preventiva e Higiene de Rotação Simétrica (Zero Downtime)",
+            "objective": "Bloquear a criação de novas chaves clássicas RSA/ECC na Organização e aplicar rotação automática <= 90 dias em todas as chaves CMEK AES-256 sem impacto nas aplicações.",
+            "step_by_step_actions": [
+                f"1. Aplicar as Custom Constraints de Organization Policy (`custom.pqcEnforceQuantumSafeKmsAlgorithms` e `custom.pqcEnforceSymmetricKeyRotation90d`) na Organização `{org_target}` em modo dry-run/enforced.",
+                f"2. Executar os {len(rotation_playbooks)} comandos `gcloud kms keys update --rotation-period=90d` listados em `symmetric_rotation_playbooks`.",
+                "3. Validar que 100% das chaves simétricas exibem `COMPLIANT_ROTATION_90D` e que tentativas de criar chaves `RSA_*` ou `EC_*` são bloqueadas pela política organizacional.",
+            ],
+        },
+        {
+            "workstream_id": "WORKSTREAM_2_NETWORK_TLS13_PQC_TRANSIT",
+            "title": "Fase 2 (Dia 15–30): Blindagem de Perímetro de Rede e TLS 1.3 Hybrid PQC (X25519MLKEM768)",
+            "objective": "Eliminar a captura passiva de pacotes (HNDL em trânsito) nos Cloud Load Balancers e expandir buffers HTTP antes da migração de assinaturas PQC.",
+            "step_by_step_actions": [
+                "1. Criar ou atualizar políticas `compute.sslPolicies` com `--min-tls-version=1.3 --profile=RESTRICTED` em todos os projetos com ingress externo/interno para habilitar a troca de chaves híbrida `X25519MLKEM768`.",
+                "2. Associar a SSL Policy a todos os `target-https-proxies` e `target-ssl-proxies` (`gcloud compute target-https-proxies update <PROXY> --ssl-policy=<POLICY>`).",
+                "3. Ajustar `max_request_headers_kb: 32` no Envoy/Istio e `large_client_header_buffers 4 32k` no NGINX/Apigee para suportar tokens JWT/cabeçalhos assinados com `ML-DSA-65` (~4.4 KB Base64URL).",
+            ],
+        },
+        {
+            "workstream_id": "WORKSTREAM_3_HNDL_KEM_DATA_PLANE_MIGRATION",
+            "title": "Fase 3 (Dia 30–60): Mitigação Crítica de HNDL em Chaves de Decriptação (RSA-OAEP -> KEM_XWING / ML-KEM-1024)",
+            "objective": "Substituir chaves `ASYMMETRIC_DECRYPT` vulneráveis ao Algoritmo de Shor por mecanismos de encapsulamento pós-quânticos em Cloud HSM (`--protection-level=hsm`).",
+            "step_by_step_actions": [
+                "1. Expandir colunas de banco de dados/metadados que armazenam DEKs encapsuladas de 256 bytes para >= 1.568 bytes (`VARBINARY(2048)`).",
+                "2. Provisionar as chaves substitutas `KEM_XWING` (ou `ML_KEM_1024` para CNSA 2.0) com `--purpose=key-encapsulation --protection-level=hsm` e conceder `roles/cloudkms.cryptoKeyDecapsulator` às Service Accounts consumidoras.",
+                "3. Refatorar os microsserviços consumidores de `kms.AsymmetricDecrypt` para `kms.Decapsulate` + `HKDF-SHA256` + `AES-256-GCM` (RFC 9180 HPKE / Google Tink SDK) e desativar as versões RSA legadas após re-encapsulamento.",
+            ],
+        },
+        {
+            "workstream_id": "WORKSTREAM_4_DIGITAL_SIGNATURES_JWT_AND_PKI",
+            "title": "Fase 4 (Dia 60–90): Migração de Assinaturas Digitais, Tokens JWT e PKI (RSA/ECDSA -> ML-DSA-65 / ML-DSA-87)",
+            "objective": "Eliminar o risco de falsificação quântica de identidade, tokens OAuth/JWT e webhooks com NIST FIPS 204 (`PQ_SIGN_ML_DSA_65`).",
+            "step_by_step_actions": [
+                "1. Provisionar as chaves `PQ_SIGN_ML_DSA_65` (ou `PQ_SIGN_ML_DSA_87`) em Cloud HSM (`--protection-level=hsm`) e vincular `roles/cloudkms.signerVerifier` às Service Accounts emissoras.",
+                "2. Refatorar as chamadas de assinatura no código de `AsymmetricSign(digest={'sha256': ...})` para `AsymmetricSign(data=raw_bytes)` (ou calcular `mu` de 64 bytes via SHAKE256 em modo `_EXTERNAL_MU`).",
+                "3. Atualizar os verificadores consumidores (OpenSSL 3.5+ / BoringSSL / Tink) com a nova chave pública ML-DSA-65 (1.952 bytes) e desativar as versões RSA/ECDSA antigas.",
+            ],
+        },
+        {
+            "workstream_id": "WORKSTREAM_5_BYOK_AND_POST_CUTOVER_VALIDATION",
+            "title": "Fase 5 (Contínuo): BYOK/EKM Pós-Quântico, Descomissionamento Seguro e Atestação CBOM CycloneDX 1.6",
+            "objective": "Garantir que chaves importadas (BYOK) utilizem wrapping compatível com PQC e auditar o estado final do ambiente.",
+            "step_by_step_actions": [
+                "1. Substituir `ImportJobs` legados por `--import-method=rsa-oaep-3072-sha256-aes-256` ou `rsa-oaep-4096-sha256-aes-256`.",
+                "2. Executar os comandos `post_migration_disable_legacy_command` e `post_change_validation_command` para confirmar que nenhuma versão clássica `RSA_*` ou `EC_*` permanece `ENABLED`.",
+                "3. Exportar o inventário final `CycloneDX v1.6 CBOM` para registro de conformidade NIST IR 8547 e NSA CNSA 2.0.",
+            ],
+        },
+    ]
+
     def _slim_key_ref(k: Dict[str, Any]) -> Dict[str, Any]:
         """Projects a key dict into a token-efficient summary, avoiding repetition of nested arrays already in playbooks/matrix."""
         return {
@@ -1998,6 +2220,7 @@ def generate_pqc_migration_plan(
             "hygiene_status": k.get("hygiene_status"),
             "primary_state": k.get("primary_state"),
             "is_active": k.get("is_active", True),
+            "data_source": k.get("data_source", data_source_authenticity),
         }
 
     plan = {
@@ -2006,6 +2229,8 @@ def generate_pqc_migration_plan(
         "organization_id": DEFAULT_ORGANIZATION_ID if mode == "ORG" else None,
         "organization_domain": DEFAULT_ORGANIZATION_NAME if mode == "ORG" else None,
         "project_id": clean_id if mode == "PROJECT" else scope_uri,
+        "data_validation_manifest": data_validation_manifest,
+        "validated_executive_scorecard": validated_executive_scorecard,
         "cbom_summary": cbom_summary,
         "projects_breakdown": projects_breakdown,
         "application_compatibility_matrix": application_compatibility_matrix,
@@ -2014,6 +2239,7 @@ def generate_pqc_migration_plan(
         "inactive_or_destroyed_keys": [_slim_key_ref(ik) for ik in inactive_keys],
         "remediation_playbooks": remediation_commands,
         "symmetric_rotation_playbooks": rotation_playbooks,
+        "customer_environment_execution_guide": customer_environment_execution_guide,
         "preventive_org_policy_guardrails": preventive_org_policy_guardrails,
         "recommended_google_cloud_security_architecture_and_product_bom": recommended_product_bom,
         "governance_recommendations": [
@@ -2051,6 +2277,8 @@ def scan_organization_pqc_readiness(
         clean_org = DEFAULT_ORGANIZATION_ID
     elif clean_org.lower().startswith("organizations/"):
         clean_org = clean_org.split("/", 1)[1].strip()
+    elif _is_internal_runtime_tenant_project(clean_org):
+        clean_org = DEFAULT_ORGANIZATION_ID
 
     org_scope = f"organizations/{clean_org}"
     migration_plan = json.loads(generate_pqc_migration_plan(project_id=org_scope, location_id="all"))

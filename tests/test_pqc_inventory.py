@@ -223,14 +223,15 @@ def test_build_executive_markdown_report():
     report_md = build_executive_markdown_report("meu-projeto-gcp")
 
     # 1. Official Google Cloud Consulting Header & Metadata Table
-    assert report_md.startswith("# GOOGLE CLOUD CONSULTING\n## Post-Quantum Cryptography (PQC) Executive Readiness Assessment")
-    assert "| **Target Organization / Project** |" in report_md
+    assert report_md.startswith("# GOOGLE CLOUD CONSULTING\n## Post-Quantum Cryptography (PQC) Executive Readiness Assessment & Step-by-Step Execution Guide")
+    assert "| **Target Organization / Scope** |" in report_md
+    assert "| **Telemetry & Validation Status** |" in report_md
     assert "| **Reference Frameworks** |" in report_md
     assert "| **Overall Posture Rating** |" in report_md
     assert "| **Executive Risk Summary** |" in report_md
 
     # 2. BLUF & Clean Executive Labels (No raw variable/enum names leaked)
-    assert "## 1. Executive Summary (BLUF)" in report_md
+    assert "## 1. Executive Summary & Consultative Diagnosis (BLUF)" in report_md
     assert "Critical — Active HNDL Exposure" in report_md
     assert "High — 2030 Deprecation Risk" in report_md
     assert "Compliant — Native PQC" in report_md
@@ -240,12 +241,12 @@ def test_build_executive_markdown_report():
     assert "COMPATIBLE_ZERO_REFACTORING_CMEK" not in report_md
 
     # 3. Sections 2, 3, 4, 5, and 6 structure + --protection-level=hsm + 16KB JWT header buffer warning
-    assert "## 2. Executive PQC Maturity Scorecard" in report_md
-    assert "## 3. Application Risk & Mosca Theorem Matrix" in report_md
+    assert "## 2. Executive PQC Maturity Scorecard (Backend-Validated)" in report_md
+    assert "## 3. Application Risk, Quantum Circuit Fall-Order & Mosca Theorem Matrix" in report_md
     assert "## 4. Recommended Google Cloud Target Architecture & Product BOM" in report_md
     assert "Binary Authorization + Security Command Center (SCC) Enterprise" in report_md
-    assert "## 5. Phased Executive Transition Roadmap (30-60-90 Day Plan)" in report_md
-    assert "## 6. Technical Engineering Appendix (Runbooks & Guardrails)" in report_md
+    assert "## 5. Step-by-Step Customer Environment Execution Guide (30-60-90 Day Prescriptive Plan)" in report_md
+    assert "## 6. Technical Engineering Appendix (Complete Step-by-Step Runbooks, Code Diffs & Validation Checklist)" in report_md
     assert "KEM_XWING" in report_md
     assert "PQ_SIGN_ML_DSA_65" in report_md
     assert "gcloud kms keys create" in report_md
@@ -430,6 +431,7 @@ def test_pqc_detectors_ssl_policies_and_import_jobs():
     assert ssl_data["total_ssl_policies_scanned"] == 2
     assert ssl_data["vulnerable_to_sndl_attacks_count"] == 1
     assert ssl_data["quantum_ready_hybrid_tls13_count"] == 1
+    assert ssl_data["ssl_pqc_readiness_score_pct"] == 50.0
     statuses = {p["policy_name"]: p["pqc_status"] for p in ssl_data["ssl_policies"]}
     assert statuses["ssl-policy-legacy-tls12-ingress"] == "VULNERABLE_TO_SNDL_ATTACKS"
     assert statuses["ssl-policy-pqc-hybrid-tls13-prod"] == "QUANTUM_READY_HYBRID_TLS_1_3"
@@ -445,6 +447,7 @@ def test_pqc_detectors_ssl_policies_and_import_jobs():
     )
     assert eval_vuln["pqc_status"] == "VULNERABLE_TO_SNDL_ATTACKS"
     assert eval_vuln["supports_hybrid_pqc_key_share_x25519_mlkem768"] is False
+    assert len(eval_vuln["step_by_step_execution_guide"]) >= 3
 
     eval_ok = _evaluate_ssl_policy_dict(
         policy_name="pol-tls13",
@@ -462,6 +465,7 @@ def test_pqc_detectors_ssl_policies_and_import_jobs():
     assert ij_data["total_import_jobs_scanned"] == 2
     assert ij_data["vulnerable_key_import_transport_count"] == 1
     assert ij_data["secure_pqc_byok_count"] == 1
+    assert ij_data["byok_pqc_readiness_score_pct"] == 50.0
     ij_statuses = {j["import_job_name"]: j["pqc_status"] for j in ij_data["import_jobs"]}
     assert ij_statuses["ij-legacy-byok-rsa3072"] == "VULNERABLE_KEY_IMPORT_TRANSPORT"
     assert ij_statuses["ij-pqc-byok-xwing-prod"] == "SECURE_PQC_BYOK"
@@ -478,6 +482,7 @@ def test_pqc_detectors_ssl_policies_and_import_jobs():
         protection_level_name="HSM",
     )
     assert rsa_ij["pqc_status"] == "VULNERABLE_KEY_IMPORT_TRANSPORT"
+    assert len(rsa_ij["step_by_step_execution_guide"]) >= 4
 
     xwing_ij = _classify_import_job(
         project_id="p1",
@@ -547,7 +552,9 @@ def test_quantum_cryptanalysis_simulation_engine():
     # 3. Verify full simulation tool execution & 10,000-iteration Monte Carlo curve
     raw_sim = run_quantum_cryptanalysis_simulation("meu-projeto-gcp", "global")
     sim = json.loads(raw_sim)
-    assert sim["quantum_engine_version"].startswith("1.0.0")
+    assert sim["quantum_engine_version"].startswith("2.0.0")
+    assert "data_validation_manifest" in sim
+    assert "validated_executive_scorecard" in sim
     insights = sim["executive_quantum_physics_insights"]
     assert insights["total_active_keys_analyzed"] == 8
     assert insights["shor_vulnerable_keys_count"] == 3
@@ -560,6 +567,7 @@ def test_quantum_cryptanalysis_simulation_engine():
     assert len(ranking) == 3
     assert ranking[0]["current_algorithm"] == "EC_SIGN_P256_SHA256"
     assert ranking[0]["logical_qubits_to_break"] == 2330
+    assert "gcloud kms keys create" in ranking[0]["gcloud_remediation_command"]
     assert ranking[1]["current_algorithm"] == "RSA_DECRYPT_OAEP_2048_SHA256"
     assert ranking[1]["logical_qubits_to_break"] == 4098
     assert ranking[2]["current_algorithm"] == "RSA_SIGN_PSS_4096_SHA256"
@@ -576,6 +584,55 @@ def test_quantum_cryptanalysis_simulation_engine():
         assert row["ecdsa_p256_breach_prob_pct"] >= row["ecdsa_p384_breach_prob_pct"]
         assert row["ecdsa_p384_breach_prob_pct"] >= row["rsa_2048_breach_prob_pct"]
         assert row["rsa_2048_breach_prob_pct"] >= row["rsa_4096_breach_prob_pct"]
+
+
+def test_tenant_project_redirection_and_consultative_guide_validation():
+    """Validates automatic redirection of internal Vertex AI Agent Engine tenant projects and consultative guide output."""
+    from tools.gcp_inventory import _is_internal_runtime_tenant_project, _resolve_scope, generate_pqc_migration_plan
+    from tools.quantum_engine import run_quantum_cryptanalysis_simulation
+
+    # 1. Verify internal tenant project detection and auto-redirection to Organization 31564119954
+    assert _is_internal_runtime_tenant_project("project-cb232322-97f9-4f78-97f") is True
+    assert _is_internal_runtime_tenant_project("vertex-runtime-tp") is True
+    assert _is_internal_runtime_tenant_project("gcp-ZeroTrust-pqc-prod") is False
+
+    scope_type, scope_path, clean_id = _resolve_scope("project-cb232322-97f9-4f78-97f")
+    assert scope_type == "ORG"
+    assert scope_path == "organizations/31564119954"
+    assert clean_id == "31564119954"
+
+    # 2. Verify data_validation_manifest, validated_executive_scorecard, and consultative guides
+    plan = json.loads(generate_pqc_migration_plan("meu-projeto-gcp"))
+    manifest = plan["data_validation_manifest"]
+    assert manifest["data_source_authenticity"] == "SIMULATED_BENCHMARK_DATASET"
+    assert manifest["metrics_validation_status"] == "DETERMINISTIC_BACKEND_VALIDATED_DO_NOT_RECALCULATE"
+
+    scorecard = plan["validated_executive_scorecard"]
+    # Verify deterministic scores (never 37.5%)
+    assert scorecard["weighted_pqc_maturity_score_pct"] == 70.0
+    assert scorecard["asymmetric_pqc_migration_score_pct"] == 50.0
+    assert scorecard["symmetric_grover_resilience_score_pct"] == 100.0
+    assert scorecard["symmetric_rotation_hygiene_score_pct"] == 100.0
+    assert scorecard["application_pqc_compatibility_score_pct"] == 62.5
+    assert scorecard["weighted_pqc_maturity_score_pct"] != 37.5
+
+    qsim = json.loads(run_quantum_cryptanalysis_simulation("meu-projeto-gcp"))
+    q_scorecard = qsim["validated_executive_scorecard"]
+    assert q_scorecard["ssl_pqc_readiness_score_pct"] == 50.0
+    assert q_scorecard["byok_pqc_readiness_score_pct"] == 50.0
+
+    # Verify consultative execution guide on every remediation playbook
+    for pb in plan["remediation_playbooks"]:
+        guide = pb["consultative_execution_guide"]
+        assert "current_state_evaluation" in guide
+        assert "architectural_impact_assessment" in guide
+        assert len(guide["step_by_step_execution_plan"]) == 5
+        assert "gcloud kms keys add-iam-policy-binding" in pb["iam_binding_command"]
+        assert "gcloud kms keys describe" in pb["post_change_validation_command"]
+
+    # Verify 5-workstream customer_environment_execution_guide
+    env_guide = plan["customer_environment_execution_guide"]
+    assert len(env_guide) == 5
 
 
 def test_performance_ttl_cache_and_compact_json_token_optimization():
@@ -598,5 +655,59 @@ def test_performance_ttl_cache_and_compact_json_token_optimization():
     assert "\n  " not in raw_qsim
     # Both generate_pqc_migration_plan + 10,000-iteration Monte Carlo quantum simulation should complete fast
     assert elapsed_ms < 150.0, f"Expected fast cached execution (<150ms), took {elapsed_ms:.2f}ms"
+
+
+def test_export_pqc_assessment_reports_executive_and_technical(tmp_path):
+    """Validates the 4-part Executive, Technical, CycloneDX CBOM, and Consolidated report exporter."""
+    import pathlib
+    import main
+    from pqc_agent.agent import root_agent
+    from tools.report_exporter import export_pqc_assessment_reports
+
+    tool_names = [getattr(t, "__name__", str(t)) for t in root_agent.tools]
+    assert "export_pqc_assessment_reports" in tool_names
+    assert "export_pqc_assessment_reports" in main.SYSTEM_INSTRUCTION
+
+    raw_export = export_pqc_assessment_reports("meu-projeto-gcp", "global", output_dir=str(tmp_path))
+    export_manifest = json.loads(raw_export)
+    assert export_manifest["export_status"] == "SUCCESS"
+    assert len(export_manifest["exported_deliverables"]) == 4
+
+    exec_item = export_manifest["exported_deliverables"][0]
+    tech_item = export_manifest["exported_deliverables"][1]
+    cbom_item = export_manifest["exported_deliverables"][2]
+    cons_item = export_manifest["exported_deliverables"][3]
+
+    exec_md_text = pathlib.Path(exec_item["markdown_path"]).read_text(encoding="utf-8")
+    exec_html_text = pathlib.Path(exec_item["html_print_to_pdf_path"]).read_text(encoding="utf-8")
+    tech_md_text = pathlib.Path(tech_item["markdown_path"]).read_text(encoding="utf-8")
+    tech_html_text = pathlib.Path(tech_item["html_print_to_pdf_path"]).read_text(encoding="utf-8")
+    cbom_json_text = pathlib.Path(cbom_item["json_path"]).read_text(encoding="utf-8")
+    cons_md_text = pathlib.Path(cons_item["markdown_path"]).read_text(encoding="utf-8")
+
+    assert "Executive Board & CISO Readiness Report" in exec_md_text
+    assert "Recommended Google Cloud Target Architecture & Product BOM" in exec_md_text
+    assert "@media print" in exec_html_text
+    assert "<table>" in exec_html_text
+
+    assert "TECHNICAL ENGINEERING PLAYBOOK" in tech_md_text
+    assert "gcloud kms keys create" in tech_md_text
+    assert "--protection-level=hsm" in tech_md_text
+    assert "max_request_headers_kb: 32" in tech_md_text
+    assert "@media print" in tech_html_text
+    assert "<pre><code>" in tech_html_text
+
+    assert json.loads(cbom_json_text)["bomFormat"] == "CycloneDX"
+    assert len(cons_md_text) > len(exec_md_text)
+
+    # Verify <= 5 columns rule across both Executive and Technical Markdown reports
+    for doc_name, md_doc in [("Executive", exec_md_text), ("Technical", tech_md_text)]:
+        for line in md_doc.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("|") and stripped.endswith("|"):
+                cols = [c.strip() for c in stripped.strip("|").split("|")]
+                assert len(cols) <= 5, f"{doc_name} table row exceeds 5 columns ({len(cols)}): {line}"
+
+
 
 

@@ -15,14 +15,14 @@ Use the production metadata below directly in the **Gemini Enterprise > Apps > [
 | **Default GCP Organization Scope** | `organizations/31564119954` (`jsaccomani.altostrat.com`) |
 | **Host Project ID / Number** | `pqc-inventory-agent-cd06` (`110254026096`) |
 | **Region** | `us-central1` (Automatic `global` endpoint routing for Gemini 3.1 Preview) |
-| **Vertex AI Agent Engine Resource Path** | `projects/110254026096/locations/us-central1/reasoningEngines/5079022715575205888` |
+| **Vertex AI Agent Engine Resource Path** | `projects/110254026096/locations/us-central1/reasoningEngines/519268830350934016` |
 | **Cloud Run ADK Web UI (Active)** | `https://pqc-inventory-agent-110254026096.us-central1.run.app/dev-ui/?app=pqc_agent` |
 | **Active Cloud Run Revision** | `pqc-inventory-agent-00013-dmr` (Serving 100% of traffic) |
 | **Runtime Service Account** | `pqc-agent-runner@pqc-inventory-agent-cd06.iam.gserviceaccount.com` |
 
 ### Recommended Agent Description for Gemini Enterprise (Copy & Paste)
 
-> `Expert AI Agent powered by Gemini 3.1 (gemini-3.1-pro-preview-customtools) for Post-Quantum Cryptography (PQC) Readiness Assessment, Quantum Physics & Cryptanalysis Simulation (Shor Surface-Code Qubits, Core-SVP Lattice Hardness, Monte Carlo Q-VaR 95%), 4-Vector Live Application-to-Key Dependency Mapping, Network SSL Policy SNDL Detection (TLS 1.3 + X25519MLKEM768), Cloud KMS BYOK ImportJob Verification (HPKE X-Wing), PQC Application Compatibility Evaluation, Mosca's Theorem (X+Y>Z) Risk Quantification, OWASP CycloneDX v1.6 CBOM Export, SDK/Gateway Code Refactoring, Preventive GCP Organization Policy Guardrails, and Programmatic Google Cloud Security Product BOM Recommendations across Google Cloud Organizations (organizations/31564119954) and Projects, aligned with NIST FIPS 203 (ML-KEM / KEM_XWING), FIPS 204 (ML-DSA), FIPS 205 (SLH-DSA), NIST IR 8547, NIST SP 800-57, and NSA CNSA 2.0.`
+> `Expert AI Agent powered by Gemini 3.1 (gemini-3.1-pro-preview-customtools) for Post-Quantum Cryptography (PQC) Consultative Readiness Assessment, Step-by-Step Environment Execution Guide, Quantum Physics & Cryptanalysis Simulation (Shor Surface-Code Qubits, Core-SVP Lattice Hardness, Monte Carlo Q-VaR 95%), 4-Vector Live Application-to-Key Dependency Mapping, Network SSL Policy SNDL Detection (TLS 1.3 + X25519MLKEM768), Cloud KMS BYOK ImportJob Verification (HPKE X-Wing), PQC Application Compatibility Evaluation, Mosca's Theorem (X+Y>Z) Risk Quantification, OWASP CycloneDX v1.6 CBOM Export, SDK/Gateway Code Refactoring, Preventive GCP Organization Policy Guardrails, Recommended Google Cloud Security Product BOM, and Multi-Format Executive/Technical Report Export across Google Cloud Organizations (organizations/31564119954).`
 
 ---
 
@@ -37,11 +37,11 @@ flowchart TB
     subgraph UX["1. Executive Experience & Orchestration Layer"]
         GE["Gemini Enterprise (Google Agentspace)<br/>Enterprise Conversational Interface"]
         CR["Cloud Run ADK Web UI (/dev-ui)<br/>Revision: pqc-inventory-agent-00013-dmr"]
-        CLI["Local CLI & Validation Harness (main.py)<br/>test / ask / deploy"]
+        CLI["Local CLI & Validation Harness (main.py)<br/>test / ask / export / deploy"]
     end
 
     subgraph BRAIN["2. Agentic Reasoning Layer (Vertex AI Agent Engine & Google ADK)"]
-        RE["Vertex AI Reasoning Engine (AdkApp / LangchainAgent)<br/>reasoningEngines/5079022715575205888"]
+        RE["Vertex AI Reasoning Engine (AdkApp / LangchainAgent)<br/>reasoningEngines/519268830350934016"]
         LLM["Model: gemini-3.1-pro-preview-customtools<br/>thinking_level: MEDIUM | max_output_tokens: 1,048,576<br/>Endpoint: global"]
         SYS["Multi-Layered System Instruction<br/>NIST FIPS 203/204/205 + IR 8547 + CNSA 2.0 + Product BOM"]
         RE --> LLM

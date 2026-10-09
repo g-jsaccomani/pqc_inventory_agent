@@ -18,6 +18,12 @@ from tools.quantum_engine import (
     map_algorithm_to_quantum_profile,
     run_quantum_cryptanalysis_simulation,
 )
+from tools.report_exporter import (
+    build_executive_board_report_markdown,
+    build_technical_engineering_playbook_markdown,
+    export_pqc_assessment_reports,
+    render_styled_consulting_html,
+)
 
 __all__ = [
     "classify_crypto_key",
@@ -31,5 +37,10 @@ __all__ = [
     "scan_import_jobs_pqc",
     "map_algorithm_to_quantum_profile",
     "run_quantum_cryptanalysis_simulation",
+    "export_pqc_assessment_reports",
+    "build_executive_board_report_markdown",
+    "build_technical_engineering_playbook_markdown",
+    "render_styled_consulting_html",
 ]
+
 
