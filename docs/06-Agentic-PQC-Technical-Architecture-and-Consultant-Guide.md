@@ -3,7 +3,7 @@
 
 > **Google Drive Official Deliverable:** [Agentic PQC Technical Architecture and Consultant Guide](https://docs.google.com/document/d/1YZOE7t4veH1S_xIrMMKRTsp8DG36_bWebB0f8_dDwwI/edit)
 
-> **Executive Summary:** This L300/L400 System Architecture Specification defines the enterprise reference architecture for the Agentic Post-Quantum Cryptography (PQC) Readiness & CBOM Engine. Designed as a modular, template-driven specification for deployment in any contracted customer Google Cloud environment, it details the 5-plane neuro-symbolic AI architecture (combining Gemini 3.1 Pro / 2.5 Pro cognitive orchestration on Google ADK with deterministic quantum physics, 4-vector Cloud Asset Inventory introspection, and closed-loop historical self-calibration), enterprise VPC-SC deployment patterns, and STRIDE zero-trust security boundaries. This L400 Technical Design Document (TDD) specifies the low-level software engineering, mathematical equations, API introspection schemas, and self-calibrating memory structures of the Agentic PQC Readiness & CBOM Engine. Designed as a reusable Google Cloud Consulting (PSO) technical blueprint, it connects the macro topology in Agentic PQC Technical Architecture and Consultant Guide, the stakeholder calibration parameters from Agentic PQC Discovery Questionnaire, and the deployment workflows in Agentic PQC Technical Architecture and Consultant Guide.
+> **Executive Summary:** This L300/L400 System Architecture Specification defines the enterprise reference architecture for the Agentic Post-Quantum Cryptography (PQC) Readiness & CBOM Engine. Designed as a modular, template-driven specification for deployment in any contracted customer Google Cloud environment, it details the 5-plane neuro-symbolic AI architecture (combining Gemini 3.1 Pro / 2.5 Pro cognitive orchestration on Google ADK with deterministic quantum physics, 4-vector Cloud Asset Inventory introspection, and closed-loop historical self-calibration), enterprise VPC-SC deployment patterns, and STRIDE zero-trust security boundaries. This L400 Technical Design Document (TDD) specifies the low-level software engineering, mathematical equations, API introspection schemas, and self-calibrating memory structures of the Agentic PQC Readiness & CBOM Engine. Designed as a reusable Google Cloud Consulting (PSO) technical blueprint, it connects the macro topology, mathematical engines, and deployment workflows detailed in Parts I, II, and III of this Guide with the stakeholder calibration parameters from Agentic PQC Discovery Questionnaire.
 
 ---
 
@@ -15,12 +15,12 @@ Analyzing an enterprise's Post-Quantum Cryptography (PQC) posture requires simul
 
 - Tenet 1 — Neuro-Symbolic Separation of Concerns (Cognitive Orchestration vs. Deterministic Math/Physics): The Large Language Model (Gemini 3.1 Pro / 2.5 Pro orchestrated via Google ADK) handles natural-language intent routing, stakeholder calibration synthesis, and consultative report structuring, while 100% of GCP API discovery, Shor/Roetteler/Grover/Core-SVP qubit equations, 10,000-run Monte Carlo Q-VaR simulations, and KPI percentage calculations execute inside deterministic, auditable Python engines.
 - Tenet 2 — 100% Agentless, Zero-Plaintext Control-Plane Introspection: The system operates exclusively via read-only Google Cloud control-plane APIs. It never installs host agents, never inspects data-plane network packets, never reads Secret Manager payloads, and never accesses private cryptographic key material.
-- Tenet 3 — Closed-Loop Self-Calibrating Intelligence: Stakeholder context captured via Agentic PQC Discovery Questionnaire and interactive consultant feedback (Agentic PQC Technical Architecture and Consultant Guide) are persisted in a longitudinal calibration ledger (tools/calibration-engine.py), allowing the agent to automatically learn from its history and refine Mosca (X + Y > Z) and Q-VaR parameters across runs.
+- Tenet 3 — Closed-Loop Self-Calibrating Intelligence: Stakeholder context captured via Agentic PQC Discovery Questionnaire and interactive consultant feedback (detailed in Part III of this Guide) are persisted in a longitudinal calibration ledger (tools/calibration-engine.py), allowing the agent to automatically learn from its history and refine Mosca (X + Y > Z) and Q-VaR parameters across runs.
 - Tenet 4 — Portable Customer-Environment Template Design: Every runtime URI, project identifier, storage bucket, and IAM principal is parameterized via environment variables so the architecture can be deployed identically in a customer's single-tenant production enclave, a central governance hub, or a consultant's workstation.
 
 ### 1.1 Customer Environment Parameterization Table (Engagement Template)
 
-To instantiate this architecture in a customer's contracted Google Cloud environment, replace the template placeholders below with the customer's provisioned resource identifiers (detailed step-by-step in Agentic PQC Technical Architecture and Consultant Guide):
+To instantiate this architecture in a customer's contracted Google Cloud environment, replace the template placeholders below with the customer's provisioned resource identifiers (detailed step-by-step in Part III of this Guide):
 
 | Architectural Component | Template Placeholder Variable | Standard GCP Resource URI Pattern | Contracted Customer Environment Value |
 | --- | --- | --- | --- |
@@ -45,9 +45,9 @@ The platform is architected across five decoupled horizontal planes that process
 
 | Architectural Plane & Sub-Engine | Implementation Module | Key Capabilities & Algorithms | Connected Accelerator Document |
 | --- | --- | --- | --- |
-| Plane 1: Presentation & SSE Gateway | main.py / FastAPI / ADK Web | Async SSE streaming, REST export endpoints, session state management, health probes. | Agentic PQC Technical Architecture and Consultant Guide |
-| Plane 2: Cognitive ADK Orchestrator | pqc-agent/agent.py | Gemini 3.1 Pro / 2.5 Pro reasoning, 12-tool routing, zero-hallucination scorecard locking. | Agentic PQC Technical Architecture and Consultant Guide |
-| Plane 3A: 4-Vector Telemetry Engine | tools/gcp-inventory.py | 16-worker ThreadPoolExecutor org scan, KMS/HSM/CAS inventory, 4-vector app blast-radius. | Agentic PQC Technical Architecture and Consultant Guide |
+| Plane 1: Presentation & SSE Gateway | main.py / FastAPI / ADK Web | Async SSE streaming, REST export endpoints, session state management, health probes. | Parts II & III of this Guide |
+| Plane 2: Cognitive ADK Orchestrator | pqc-agent/agent.py | Gemini 3.1 Pro / 2.5 Pro reasoning, 12-tool routing, zero-hallucination scorecard locking. | Parts II & III of this Guide |
+| Plane 3A: 4-Vector Telemetry Engine | tools/gcp-inventory.py | 16-worker ThreadPoolExecutor org scan, KMS/HSM/CAS inventory, 4-vector app blast-radius. | Parts II & III of this Guide |
 | Plane 3B: Edge TLS & BYOK Detectors | tools/pqc-detectors.py | Compute SslPolicy (X25519MLKEM768) detector, ImportJob wrapping audit, Tink & OrgPolicy YAML. | Agentic PQC Security Recommendations Book |
 | Plane 3C: Quantum Physics & Q-VaR | tools/quantum-engine.py | Gidney-Ekera Shor, Roetteler ECDLP, Grassl Grover, Core-SVP, 10k Monte Carlo Q-VaR (95%). | Agentic PQC Security Recommendations Book |
 | Plane 3D: Self-Calibrating Memory | tools/calibration-engine.py | Sector baselines (BFSI, Healthcare, Public Sector, Telecom, OT), Mosca (X+Y>Z) ledger. | Agentic PQC Discovery Questionnaire |
@@ -55,7 +55,7 @@ The platform is architected across five decoupled horizontal planes that process
 
 ## 3. Enterprise Reference Deployment Topologies (Customer vs. Consultant Environments)
 
-Depending on the customer's regulatory posture, data residency rules, and engagement phase, the architecture supports three validated deployment topologies (with step-by-step commands provided in Agentic PQC Technical Architecture and Consultant Guide):
+Depending on the customer's regulatory posture, data residency rules, and engagement phase, the architecture supports three validated deployment topologies (with step-by-step commands provided in Part III of this Guide):
 
 | Deployment Topology | Runtime Hosting Location | Authentication & IAM Model | Network & Data Isolation Boundary | Recommended Engagement Scenario |
 | --- | --- | --- | --- | --- |
@@ -67,7 +67,7 @@ Depending on the customer's regulatory posture, data residency rules, and engage
 
 A core architectural differentiator of this AI system is its ability to self-calibrate its analytical models by learning from stakeholder discovery inputs and historical consultant feedback:
 
-1. Phase 1 — Structured Context Ingestion: During stakeholder interviews (guided by Agentic PQC Discovery Questionnaire), the consultant executes Calibration Prompts (cataloged in Agentic PQC Technical Architecture and Consultant Guide). The ADK agent invokes calibrate-assessment-context(), validating and writing the organization's sector profile, confidentiality horizon (X), refactoring velocity (Y), CRQC threat window (Z), API gateway header limits, and project criticality overrides into calibration-history.jsonl.
+1. Phase 1 — Structured Context Ingestion: During stakeholder interviews (guided by Agentic PQC Discovery Questionnaire), the consultant executes Calibration Prompts (cataloged in Part III of this Guide). The ADK agent invokes calibrate-assessment-context(), validating and writing the organization's sector profile, confidentiality horizon (X), refactoring velocity (Y), CRQC threat window (Z), API gateway header limits, and project criticality overrides into calibration-history.jsonl.
 2. Phase 2 — Automatic Pre-Execution Memory Retrieval: Whenever a user asks the agent to assess an organization, evaluate quantum risk, or generate migration runbooks, the agent first invokes get-historical-calibration-profile(scope). This loads the cumulative historical calibration state into the active execution context without requiring the user to repeat prior constraints.
 3. Phase 3 — Dynamic Recalibration of Mosca Horizons & Q-VaR Multipliers: The retrieved calibration parameters dynamically adjust the Mosca safety margin (M = Z - (X + Y)), re-weight the 10,000-iteration Monte Carlo Q-VaR financial exposure by the sector multiplier, flag HTTP header overflow risks if gateway limits are <16KB, and prioritize Tier-0 business projects first in the 30-60-90 day execution plan.
 
@@ -108,7 +108,7 @@ Migrating enterprise cloud infrastructure to Post-Quantum Cryptography (PQC) und
 
 ### 1.1 Customer Deployment Configuration Manifest (Template Specification)
 
-When deploying the agent in a contracted customer environment or PSO project (following Agentic PQC Technical Architecture and Consultant Guide), populate the environment identifiers below. Fields are intentionally left blank in this master template so each engagement records its isolated runtime endpoints:
+When deploying the agent in a contracted customer environment or PSO project (following Part III of this Guide), populate the environment identifiers below. Fields are intentionally left blank in this master template so each engagement records its isolated runtime endpoints:
 
 | Configuration Parameter | Environment Variable / Config Key | Expected Format / URI Pattern | Customer Environment Value (Populate at Deployment) |
 | --- | --- | --- | --- |
@@ -218,8 +218,8 @@ To prevent LLMs from conflating symmetric AES-256 keys with asymmetric RSA/ECC k
 
 To execute a consistent, high-margin PQC Readiness Assessment, the practitioner follows a 4-step closed-loop operational workflow that connects all documents in the Technical and Executive folders:
 
-1. Step 1 — Deploy & Authenticate (Sections 2 & 3 below): Deploy the agent either in the Consultant's workstation/Cloud Shell (Topology C) or inside the Customer's contracted GCP environment (Topology A/B, as architected in Agentic PQC Technical Architecture and Consultant Guide) and bind the 4 read-only IAM roles.
-2. Step 2 — Calibrate with Stakeholder Discovery Context (Section 4 below): Conduct the 7-domain interview using Agentic PQC Discovery Questionnaire and run the Calibration Prompts below. The agent invokes calibrate-assessment-context() (specified in Agentic PQC Technical Architecture and Consultant Guide) to persist sector parameters (X, Y, Z, gateway limits, and project overrides) into its historical ledger.
+1. Step 1 — Deploy & Authenticate (Sections 2 & 3 below): Deploy the agent either in the Consultant's workstation/Cloud Shell (Topology C) or inside the Customer's contracted GCP environment (Topology A/B, as architected in Part I of this Guide) and bind the 4 read-only IAM roles.
+2. Step 2 — Calibrate with Stakeholder Discovery Context (Section 4 below): Conduct the 7-domain interview using Agentic PQC Discovery Questionnaire and run the Calibration Prompts below. The agent invokes calibrate-assessment-context() (specified in Part II of this Guide) to persist sector parameters (X, Y, Z, gateway limits, and project overrides) into its historical ledger.
 3. Step 3 — Execute Self-Calibrated Multi-Layer Scan (Section 5 below): Run the full assessment prompt. The agent automatically retrieves its learned history via get-historical-calibration-profile(), scans all 4 GCP telemetry layers, runs the 10,000-iteration Monte Carlo Q-VaR simulation, and synthesizes the 6-part consultative report.
 4. Step 4 — Export Multi-Persona Deliverables & Execute Runbooks (Section 6 below): Export the Executive Board Report (aligned with Agentic PQC Security Recommendations Book), the Technical Engineering Playbook (5-step Cloud HSM runbooks), and the OWASP CycloneDX v1.6 CBOM (.json).
 
@@ -243,13 +243,13 @@ Use this workflow when running the agent from a PSO Consultant laptop, Google Cl
 
 ## 3. Part 2 — How-To: Deploying in the Customer's Contracted GCP Environment
 
-Use this workflow when deploying the agent as a permanent or engagement-long single-tenant service inside the customer's own Google Cloud Organization (Topology A in Agentic PQC Technical Architecture and Consultant Guide):
+Use this workflow when deploying the agent as a permanent or engagement-long single-tenant service inside the customer's own Google Cloud Organization (Topology A in Part I of this Guide):
 
 1. Step 3.1 — Enable Required Control-Plane APIs in the Customer Host Project: Run gcloud services enable aiplatform.googleapis.com run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com cloudasset.googleapis.com cloudkms.googleapis.com privateca.googleapis.com compute.googleapis.com cloudresourcemanager.googleapis.com --project=<CUSTOMER-HOST-PROJECT-ID>
 2. Step 3.2 — Create the Dedicated Read-Only Scanner Service Account: Run gcloud iam service-accounts create pqc-scanner-sa --display-name="PQC Readiness Assessment Scanner SA" --project=<CUSTOMER-HOST-PROJECT-ID>
 3. Step 3.3 — Bind Least-Privilege Read-Only Roles at the Customer Organization Scope: Grant the 4 metadata-only viewer roles across organizations/<CUSTOMER-ORG-ID> (for ROLE in roles/cloudasset.viewer roles/cloudkms.viewer roles/privateca.auditor roles/compute.viewer; do gcloud organizations add-iam-policy-binding <CUSTOMER-ORG-ID> --member="serviceAccount:pqc-scanner-sa@<CUSTOMER-HOST-PROJECT-ID>.iam.gserviceaccount.com" --role="$ROLE"; done) and grant roles/aiplatform.user on <CUSTOMER-HOST-PROJECT-ID> so the Service Account can invoke Vertex AI Gemini.
 4. Step 3.4 — Deploy to Customer Google Cloud Run (Zero-Trust Internal + IAP): Run gcloud run deploy pqc-inventory-agent --source=. --region=<REGION> --project=<CUSTOMER-HOST-PROJECT-ID> --service-account=pqc-scanner-sa@<CUSTOMER-HOST-PROJECT-ID>.iam.gserviceaccount.com --no-allow-unauthenticated --ingress=internal-and-cloud-load-balancing --set-env-vars="GOOGLE-GENAI-USE-VERTEXAI=TRUE,GOOGLE-CLOUD-PROJECT=<CUSTOMER-HOST-PROJECT-ID>,GOOGLE-CLOUD-LOCATION=global,PQC-TARGET-ORG-ID=organizations/<CUSTOMER-ORG-ID>"
-5. Step 3.5 — Deploy to Vertex AI Agent Engine (Reasoning Engine / Gemini Enterprise): Run adk deploy agent-engine --project=<CUSTOMER-HOST-PROJECT-ID> --region=<REGION> --staging-bucket=gs://<CUSTOMER-STAGING-BUCKET> pqc-agent. Record the output resource URI (projects/<PROJECT-NUM>/locations/<REGION>/reasoningEngines/<ENGINE-ID>) in the Customer Configuration Manifest of Agentic PQC Technical Architecture and Consultant Guide and Agentic PQC Technical Architecture and Consultant Guide.
+5. Step 3.5 — Deploy to Vertex AI Agent Engine (Reasoning Engine / Gemini Enterprise): Run adk deploy agent-engine --project=<CUSTOMER-HOST-PROJECT-ID> --region=<REGION> --staging-bucket=gs://<CUSTOMER-STAGING-BUCKET> pqc-agent. Record the output resource URI (projects/<PROJECT-NUM>/locations/<REGION>/reasoningEngines/<ENGINE-ID>) in the Customer Configuration Manifest (detailed in Parts I, II, and III of this Guide).
 
 ## 4. Part 3 — Calibration Prompts Library (Sector, Mosca X+Y>Z & Constraint Tuning)
 
