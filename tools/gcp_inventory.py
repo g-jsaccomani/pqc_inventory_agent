@@ -749,13 +749,17 @@ def _evaluate_mosca_theorem_risk(
     quantum_status: str,
     is_active: bool,
 ) -> Dict[str, Any]:
-    """Quantifies Post-Quantum risk using Dr. Michele Mosca's Theorem (X + Y > Z) and NIST IR 8547 (2030/2035) horizons.
+    """Quantifies Post-Quantum risk using Dr. Michele Mosca's Theorem (X + Y > Z) and authoritative 2026 regulatory horizons:
+    - NIST IR 8547 Final (Published Oct 27, 2026, DOI 10.6028/NIST.IR.8547): 2030 Deprecation / 2035 Disallowance.
+    - White House Executive Order 14412 (Issued June 22, 2026) & OMB M-26-15: PQC Key Establishment (FIPS 203) by Dec 31, 2030;
+      PQC Digital Signatures (FIPS 204/205) by Dec 31, 2031; FAR Contractor Compliance & VDP by Dec 31, 2030.
+    - UK NCSC PQC Migration Roadmap: 2028 Discovery & CBOM Plan / 2031 High-Priority Migration / 2035 Full Migration.
 
     Parameters:
     - X (shelf_life_years): Required confidentiality or trust validity duration of the protected assets.
     - Y (migration_time_years): Estimated engineering lead time to refactor KMS APIs, SDKs, and infrastructure.
-    - Z_nist_2030 (4.0 years): Years remaining until NIST IR 8547 classical algorithm deprecation (2030).
-    - Z_crqc_2035 (9.0 years): Years remaining until NIST IR 8547 classical disallowance / CRQC horizon (2035).
+    - Z_nist_2030 (4.0 years): Years remaining until NIST IR 8547 & EO 14412 classical deprecation (2030).
+    - Z_crqc_2035 (9.0 years): Years remaining until NIST IR 8547 & UK NCSC classical disallowance / CRQC horizon (2035).
     """
     if not is_active:
         return {
@@ -766,6 +770,9 @@ def _evaluate_mosca_theorem_risk(
             "z_nist_2030_deprecation_horizon_years": 4.0,
             "z_crqc_2035_disallowance_horizon_years": 9.0,
             "mosca_inequality_breached": False,
+            "nist_ir_8547_status": "EXEMPT_INACTIVE_KEY",
+            "eo_14412_and_omb_m_26_15_mandate": "EXEMPT_NO_ENABLED_VERSIONS",
+            "uk_ncsc_milestone_alignment": "EXEMPT_DECOMMISSIONED",
             "urgency_explanation": "Key is inactive/decommissioned (0 ENABLED versions).",
         }
 
@@ -778,6 +785,9 @@ def _evaluate_mosca_theorem_risk(
             "z_nist_2030_deprecation_horizon_years": 4.0,
             "z_crqc_2035_disallowance_horizon_years": 9.0,
             "mosca_inequality_breached": False,
+            "nist_ir_8547_status": "COMPLIANT_NIST_IR_8547_FINAL_OCT_2026",
+            "eo_14412_and_omb_m_26_15_mandate": "COMPLIANT_EO_14412_AND_OMB_M_26_15",
+            "uk_ncsc_milestone_alignment": "COMPLIANT_UK_NCSC_2028_2031_2035",
             "urgency_explanation": (
                 f"Algorithm ({algo_upper}) is already quantum-resistant (immune to Shor's Algorithm and >= 128-bit Grover-resilient); "
                 "Y = 0 years migration needed."
@@ -800,10 +810,15 @@ def _evaluate_mosca_theorem_risk(
             "z_nist_2030_deprecation_horizon_years": z_2030,
             "z_crqc_2035_disallowance_horizon_years": z_2035,
             "mosca_inequality_breached": True,
+            "nist_ir_8547_status": "NON_COMPLIANT_DEPRECATED_2030_DISALLOWED_2035 (NIST IR 8547 Final, Oct 2026)",
+            "eo_14412_and_omb_m_26_15_mandate": (
+                "EO 14412 Sec. 4(b)(ii) & OMB M-26-15: Mandatory transition to PQC Key Establishment (FIPS 203) by Dec 31, 2030"
+            ),
+            "uk_ncsc_milestone_alignment": "UK NCSC 2028 (Discovery/CBOM) & 2031 (High-Priority HNDL Migration)",
             "urgency_explanation": (
                 f"MOSCA INEQUALITY BREACHED (X={x_years}y confidentiality + Y={y_years}y API/HPKE refactoring = {total_xy}y > Z_2035={z_2035}y): "
-                f"Ciphertexts captured today remain confidential-sensitive {overrun_2035} years past the 2035 CRQC horizon "
-                "('Harvest Now, Decrypt Later' breach is active TODAY)."
+                f"Ciphertexts captured today remain confidential-sensitive {overrun_2035} years past the 2035 CRQC disallowance horizon "
+                "('Harvest Now, Decrypt Later' breach is active TODAY under NIST IR 8547 Final & EO 14412 Sec. 4(b)(ii))."
             ),
         }
 
@@ -821,9 +836,14 @@ def _evaluate_mosca_theorem_risk(
         "z_nist_2030_deprecation_horizon_years": z_2030,
         "z_crqc_2035_disallowance_horizon_years": z_2035,
         "mosca_inequality_breached": total_xy > z_2030,
+        "nist_ir_8547_status": "NON_COMPLIANT_DEPRECATED_2030_DISALLOWED_2035 (NIST IR 8547 Final, Oct 2026)",
+        "eo_14412_and_omb_m_26_15_mandate": (
+            "EO 14412 Sec. 4(b)(iii) & OMB M-26-15: Mandatory transition to PQC Digital Signatures (FIPS 204/205) by Dec 31, 2031 (NIST 2030 Deprecation)"
+        ),
+        "uk_ncsc_milestone_alignment": "UK NCSC 2028 (Discovery/CBOM), 2031 (High-Priority PKI/Auth) & 2035 (Full Disallowance)",
         "urgency_explanation": (
-            f"MOSCA DEADLINE BREACHED AGAINST NIST IR 8547 (X={x_years}y trust validity + Y={y_years}y KMS API/MTU refactoring = {total_xy}y > Z_2030={z_2030}y): "
-            f"Exceeds the 2030 NIST classical signature deprecation deadline by +{overrun_2030} years."
+            f"MOSCA DEADLINE BREACHED AGAINST NIST IR 8547 FINAL & EO 14412 (X={x_years}y trust validity + Y={y_years}y KMS API/MTU refactoring = {total_xy}y > Z_2030={z_2030}y): "
+            f"Exceeds the 2030 NIST IR 8547 classical signature deprecation deadline by +{overrun_2030} years."
         ),
     }
 
@@ -2194,12 +2214,12 @@ def generate_pqc_migration_plan(
         },
         {
             "workstream_id": "WORKSTREAM_5_BYOK_AND_POST_CUTOVER_VALIDATION",
-            "title": "Fase 5 (Contínuo): BYOK/EKM Pós-Quântico, Descomissionamento Seguro e Atestação CBOM CycloneDX 1.6",
-            "objective": "Garantir que chaves importadas (BYOK) utilizem wrapping compatível com PQC e auditar o estado final do ambiente.",
+            "title": "Fase 5 (Contínuo): BYOK/EKM Pós-Quântico, Governança de Fornecedores (FAR/NCCoE) e Atestação CBOM CycloneDX 1.6",
+            "objective": "Garantir que chaves importadas (BYOK) utilizem wrapping híbrido pós-quântico RFC 9180 HPKE, validar dependências de terceiros e auditar o estado final do ambiente.",
             "step_by_step_actions": [
-                "1. Substituir `ImportJobs` legados por `--import-method=rsa-oaep-3072-sha256-aes-256` ou `rsa-oaep-4096-sha256-aes-256`.",
-                "2. Executar os comandos `post_migration_disable_legacy_command` e `post_change_validation_command` para confirmar que nenhuma versão clássica `RSA_*` ou `EC_*` permanece `ENABLED`.",
-                "3. Exportar o inventário final `CycloneDX v1.6 CBOM` para registro de conformidade NIST IR 8547 e NSA CNSA 2.0.",
+                "1. Substituir `ImportJobs` clássicos (`RSA_OAEP_*`) por wrapping pós-quântico RFC 9180 HPKE (`--import-method=hpke-kem-xwing-hkdf-sha256-aes-256-gcm`, `hpke-kem-ml-kem-768-hkdf-sha256-aes-256-gcm` ou `hpke-kem-ml-kem-1024-hkdf-sha256-aes-256-gcm`).",
+                "2. Executar os comandos `post_migration_disable_legacy_command` e `post_change_validation_command` e reconciliar com o painel nativo `Asymmetric PQC insights` do Cloud KMS e Wiz para confirmar que nenhuma versão clássica `RSA_*` ou `EC_*` permanece `ENABLED`.",
+                "3. Nomear formalmente o `PQC Migration Lead` (EO 14412 Sec. 4(a) / OMB M-26-15), incluir vulnerabilidades criptográficas na política de VDP/aquisições de fornecedores (EO 14412 Sec. 6(c)-(d) / NIST NCCoE) e exportar o inventário `CycloneDX v1.6 CBOM` para conformidade NIST IR 8547 (Final, Out/2026), UK NCSC (2028/2031/2035) e NSA CNSA 2.0.",
             ],
         },
     ]
@@ -2242,14 +2262,33 @@ def generate_pqc_migration_plan(
         "customer_environment_execution_guide": customer_environment_execution_guide,
         "preventive_org_policy_guardrails": preventive_org_policy_guardrails,
         "recommended_google_cloud_security_architecture_and_product_bom": recommended_product_bom,
+        "regulatory_and_standards_alignment_2026": {
+            "nist_ir_8547_final": "Published October 27, 2026 (DOI: 10.6028/NIST.IR.8547) — Deprecates RSA/ECDSA/EdDSA/ECDH/FFDH in 2030 and disallows them after 2035.",
+            "white_house_eo_14412_and_omb_m_26_15": (
+                "Executive Order 14412 (June 22, 2026) & OMB M-26-15 mandate appointing a PQC Migration Lead (Sec. 4(a)), "
+                "automated CBOM inventories (Sec. 5(d)), PQC Key Establishment (FIPS 203) by Dec 31, 2030 (Sec. 4(b)(ii)), "
+                "PQC Digital Signatures (FIPS 204/205) by Dec 31, 2031 (Sec. 4(b)(iii)), accelerated CMVP FIPS 140-3 validations (Sec. 6(b)), "
+                "and Federal Acquisition Regulation (FAR) contractor PQC compliance & VDP coverage by Dec 31, 2030 (Sec. 6(c)-(d))."
+            ),
+            "uk_ncsc_and_nccoe_timelines": (
+                "UK NCSC 3-Phase Roadmap (2028 Discovery & CBOM Plan / 2031 High-Priority Migration / 2035 Full Migration) "
+                "and NIST NCCoE Migration to PQC Project (end-to-end business service interoperability & third-party supplier readiness)."
+            ),
+            "google_cloud_kms_pqc_capabilities": (
+                "Supports NIST FIPS 203 (KEM_XWING, ML_KEM_768, ML_KEM_1024), FIPS 204 (PQ_SIGN_ML_DSA_44/65/87 & _EXTERNAL_MU), "
+                "FIPS 205 (PQ_SIGN_SLH_DSA_SHA2_128S & _HASH_), Quantum-Safe BYOK Import (HPKE_KEM_XWING / ML_KEM_768 / ML_KEM_1024), "
+                "native Asymmetric PQC insights dashboard, and Wiz cryptographic posture integration."
+            ),
+        },
         "governance_recommendations": [
-            "1. Critical Priority (Phase 1 - HNDL / FIPS 203): Replace ASYMMETRIC_DECRYPT (RSA-OAEP) keys with KEM_XWING (Hybrid X25519 + ML-KEM-768) or ML_KEM_1024 (CNSA 2.0 Category 5), refactoring consuming applications from AsymmetricDecrypt to Decapsulate + HPKE/AES-256-GCM.",
-            "2. High Priority (Phase 2 - Signatures & PKI / FIPS 204 & 205): Migrate ASYMMETRIC_SIGN (RSA-PSS/PKCS1, ECDSA P-256/P-384, Ed25519) keys to PQ_SIGN_ML_DSA_65 (or PQ_SIGN_ML_DSA_87 for CNSA 2.0), refactor KMS signing calls from `digest` to `data` (or `_EXTERNAL_MU`), and validate HTTP header/payload size limits (3,309-byte signature vs. 64-byte ECDSA).",
-            "3. Symmetric Cryptographic Hygiene (Grover & NIST SP 800-57): Applications using AES-256 (GOOGLE_SYMMETRIC_ENCRYPTION) CMEK are 100% compatible with the PQC model with zero code changes; maintain automatic key rotation <= 90 days (CIS GCP Benchmark 1.10).",
+            "1. Critical Priority (Phase 1 - HNDL / FIPS 203 / EO 14412 Dec 31, 2030 Deadline): Replace ASYMMETRIC_DECRYPT (RSA-OAEP) keys with KEM_XWING (Hybrid X25519 + ML-KEM-768) or ML_KEM_1024 (CNSA 2.0 Category 5), refactoring consuming applications from AsymmetricDecrypt to client-side Encapsulate + KMS Decapsulate + HPKE/AES-256-GCM.",
+            "2. High Priority (Phase 2 - Signatures & PKI / FIPS 204 & 205 / NIST IR 8547 2030 Deprecation & EO 14412 Dec 31, 2031 Deadline): Migrate ASYMMETRIC_SIGN (RSA-PSS/PKCS1, ECDSA P-256/P-384, Ed25519) keys to PQ_SIGN_ML_DSA_65 (or PQ_SIGN_ML_DSA_87 for CNSA 2.0), refactor KMS signing calls from `digest` to `data` (or `_EXTERNAL_MU`), and validate HTTP header/payload size limits (3,309-byte signature vs. 64-byte ECDSA).",
+            "3. Symmetric Cryptographic Hygiene (Grover & NIST SP 800-57): Applications using AES-256 (GOOGLE_SYMMETRIC_ENCRYPTION) CMEK and HMAC-SHA256+ are 100% compatible with the PQC model with zero code changes (note: HMAC_SHA1 is non-quantum-safe and must be replaced); maintain automatic key rotation <= 90 days (CIS GCP Benchmark 1.10).",
             "4. Data-in-Transit Security (TLS 1.3 PQC Hybrid KEX): Ensure all Cloud Load Balancing SslPolicies enforce minTlsVersion=TLS_1_3 to enable Post-Quantum Hybrid Key Exchange (X25519MLKEM768) against passive network packet harvesting.",
             "5. Safe Decommissioning & Downgrade Prevention: After migrating consuming applications to PQC keys, disable and schedule destruction of legacy classical key versions (gcloud kms keys versions disable/destroy).",
             "6. Preventive Organization Policy Guardrails: Deploy `custom.pqcEnforceQuantumSafeKmsAlgorithms` and `custom.pqcEnforceSymmetricKeyRotation90d` via GCP Organization Policy Service to block creation of new classical RSA/ECC keys.",
-            "7. Recommended Google Cloud Security Architecture & Product BOM: Combine Cloud HSM (FIPS 140-3 Level 3), Google Tink SDK (RFC 9180 HPKE), VPC Service Controls (VPC-SC) + Private Service Connect (PSC), Cloud Global Load Balancing (L7 TLS 1.3) + Certificate Authority Service (CAS), and Binary Authorization.",
+            "7. Recommended Google Cloud Security Architecture & Product BOM: Combine Cloud HSM (FIPS 140-3 Level 3), Google Tink SDK (RFC 9180 HPKE), VPC Service Controls (VPC-SC) + Private Service Connect (PSC), Cloud Global Load Balancing (L7 TLS 1.3) + Certificate Authority Service (CAS), Binary Authorization, Cloud KMS Asymmetric PQC insights, and Wiz.",
+            "8. Executive Governance, Supplier Readiness & CBOM Mandate (NIST IR 8547 Final Oct 2026 / EO 14412 / UK NCSC 2028): Designate an enterprise PQC Migration Lead, enforce third-party SaaS/HSM supplier PQC clauses (FAR Sec. 6(c)) and Vulnerability Disclosure Policy (VDP) coverage for quantum-vulnerable cryptography (Sec. 6(d)), and maintain an automated CycloneDX v1.6 CBOM.",
         ],
     }
 

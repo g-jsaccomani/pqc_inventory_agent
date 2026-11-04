@@ -18,6 +18,10 @@ from tools.quantum_engine import (
     map_algorithm_to_quantum_profile,
     run_quantum_cryptanalysis_simulation,
 )
+from tools.calibration_engine import (
+    calibrate_assessment_context,
+    get_historical_calibration_profile,
+)
 from tools.report_exporter import (
     build_executive_board_report_markdown,
     build_technical_engineering_playbook_markdown,
@@ -37,10 +41,13 @@ __all__ = [
     "scan_import_jobs_pqc",
     "map_algorithm_to_quantum_profile",
     "run_quantum_cryptanalysis_simulation",
+    "calibrate_assessment_context",
+    "get_historical_calibration_profile",
     "export_pqc_assessment_reports",
     "build_executive_board_report_markdown",
     "build_technical_engineering_playbook_markdown",
     "render_styled_consulting_html",
 ]
+
 
 

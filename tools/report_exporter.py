@@ -176,7 +176,7 @@ def build_executive_board_report_markdown(
         "| :--- | :--- |",
         f"| **Target Organization / Scope** | `{resolved_scope}`{redirect_badge} |",
         f"| **Telemetry & Validation Status** | `{data_authenticity}` — Deterministic Backend-Validated Scorecard |",
-        "| **Reference Frameworks** | Google Cloud Security Foundations, NIST FIPS 203/204/205, NIST IR 8547, NIST SP 800-57, NSA CNSA 2.0 |",
+        "| **Reference Frameworks** | Google Cloud Security Foundations, NIST FIPS 203/204/205, NIST IR 8547 (Final, Oct 2026), EO 14412 (June 2026), OMB M-26-15, UK NCSC (2028/2031/2035), NIST SP 800-57, NSA CNSA 2.0 |",
         f"| **Overall Posture Rating** | **{posture_rating}** |",
         (
             f"| **Executive Financial & Operational Risk** | **US$ {qvar_unmitigated}M** Unmitigated Quantum Value-at-Risk (Q-VaR 95%), "
@@ -195,7 +195,7 @@ def build_executive_board_report_markdown(
             "NIST-standardized Post-Quantum Cryptography (`KEM_XWING`, `PQ_SIGN_ML_DSA_65`) or leveraging 256-bit symmetric Customer-Managed "
             "Encryption Keys (CMEK) resilient to Grover's Algorithm (`1.51e43` Toffoli gates > NIST MAXDEPTH `2^96`) with zero code changes "
             f"required. However, **{vuln_keys_count} classical RSA/ECDSA keys** supporting **{incompat_apps} mission-critical workloads** "
-            "require architectural modernization before NIST IR 8547 deprecation milestones."
+            "require architectural modernization before **NIST IR 8547 (Final, Oct 2026)**, **Executive Order 14412 (June 2026)**, and **UK NCSC** deprecation milestones."
         ),
         "",
         (
@@ -212,8 +212,9 @@ def build_executive_board_report_markdown(
             "(`~20.0M` physical qubits). Elliptic-curve identity and JWT signing keys will therefore be compromised **before** RSA-2048."
         ),
         (
-            f"- **Application Modernization Scope:** `{deadline_breaches}` signing key(s) breach the **NIST 2030 deprecation horizon**. "
-            "Because NIST FIPS 203 (`KEM_XWING`) and FIPS 204 (`PQ_SIGN_ML_DSA_65`) alter API contracts (`AsymmetricDecrypt` ➡️ `Decapsulate`) "
+            f"- **Application Modernization & 2026 Regulatory Deadlines (NIST IR 8547 Final, EO 14412 & UK NCSC):** `{deadline_breaches}` signing key(s) breach the **NIST IR 8547 (Final, Oct 27, 2026) 2030 deprecation horizon** (and **2035 full disallowance**). "
+            "Under **White House Executive Order 14412 (June 22, 2026)** and **OMB M-26-15**, High-Value Assets and FAR contractors must complete **PQC Key Establishment (FIPS 203) by Dec 31, 2030** and **PQC Digital Signatures (FIPS 204/205) by Dec 31, 2031**, appoint a formal **PQC Migration Lead**, maintain an automated **CBOM**, and include quantum-vulnerable cryptography in **Vulnerability Disclosure Policies (VDPs)**—aligned with **UK NCSC (2028 Discovery / 2031 High-Priority / 2035 Full Migration)** and **NIST NCCoE** supplier readiness. "
+            "Because NIST FIPS 203 (`KEM_XWING`) and FIPS 204 (`PQ_SIGN_ML_DSA_65`) alter API contracts (`AsymmetricDecrypt` ➡️ client-side `Encapsulate` + KMS `Decapsulate`) "
             "and expand signatures to `3,309 bytes` (`~4.4 KB` Base64URL), migration requires coordinated SDK upgrades (**Google Tink**) "
             "and API Gateway buffer expansion (`16KB–32KB`), detailed in the companion *Technical Engineering Playbook*."
         ),
