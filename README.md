@@ -29,7 +29,7 @@ Whenever someone mentions a technical acronym in a meeting, use this simple chea
 | Q-VaR 95% (Quantum Value-at-Risk) | A financial calculator that translates technical encryption risk into dollars (e.g., "$10.3M of potential loss"). | Helps the Security Lead and IT team justify budget to the CEO, CFO, and Board of Directors using clear financial ROI. |
 | Mosca's Rule (X + Y > Z) | A simple deadline check: (Years data must stay secret) + (Years needed to upgrade) vs. (Years until quantum arrives). | If keeping data secret (e.g., 7 yrs) + upgrading (2 yrs) = 9 yrs, and quantum arrives in 5 yrs, you are already 4 years late! |
 
-## 3. Which File Should I Open? (Guide to the 7 Consolidated Deliverables)
+## 3. Which File Should I Open? (Guide to the 8 Consolidated Deliverables)
 
 All documentation is synchronized between the Google Drive folder and the `docs/` directory in this Git repository:
 
@@ -42,6 +42,7 @@ All documentation is synchronized between the Google Drive folder and the `docs/
 | 5 | Agentic PQC Security Recommendations Book | [docs/05-Agentic-PQC-Security-Recommendations-Book.md](docs/05-Agentic-PQC-Security-Recommendations-Book.md) | [Google Doc](https://docs.google.com/document/d/1D-uN1-0OiTgp9x03F9RWrtDHNmZFRaJ-5dg8UWnuc0I/edit) | Heads of Security & Architects: 8-section security architecture book + Golden Sample report. |
 | 6 | Agentic PQC Technical Architecture and Consultant Guide | [docs/06-Agentic-PQC-Technical-Architecture-and-Consultant-Guide.md](docs/06-Agentic-PQC-Technical-Architecture-and-Consultant-Guide.md) | [Google Doc](https://docs.google.com/document/d/1YZOE7t4veH1S_xIrMMKRTsp8DG36_bWebB0f8_dDwwI/edit) | Technical Consultants & Engineers: System Architecture + L400 TDD + Consultant How-To Guide. |
 | 7 | Agentic PQC Discovery Questionnaire | [docs/07-Agentic-PQC-Discovery-Questionnaire.md](docs/07-Agentic-PQC-Discovery-Questionnaire.md) | [Google Doc](https://docs.google.com/document/d/1iaw9_AviJ6APW5gZwHMjgecJwycrPoNc-Izs3_SvEIM/edit) | Customer SMEs: Standalone 7-domain discovery questionnaire to send before Kickoff. |
+| 8 | OnePage : Agentic PQC | [docs/08-Agentic-PQC-One-Pager.md](docs/08-Agentic-PQC-One-Pager.md) | [Google Slides](https://docs.google.com/presentation/d/1PdwQw-gLSQ8pc_kQlRQDKKQYGuu3djES43ACXS0Rol8/edit) | Sales & Account Teams: 1-page visual executive summary of the 6-week (224-hour) offering. |
 
 ## 4. The 60-Second Elevator Pitch & Top 5 Customer Questions (FAQ)
 

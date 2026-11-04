@@ -1530,16 +1530,16 @@ DOCUMENTS_SPEC = [
             ("H2", "1. End-to-End 4-Stage Delivery Flow"),
             ("NUMBERED", [
                 "Stage 1 — Automated Setup & 7-Domain Scope Calibration (Day 1): Configure read-only IAM permissions (PQC_User_and_Consultant_Guide) and execute PQC_Discovery_Questionnaire to calibrate industry data shelf-life (X), migration velocity (Y), and CRQC horizon (Z).",
-                "Stage 2 — 7-Second Agentic Telemetry & Blast-Radius Scan (Days 2-3): Execute parallel discovery across Cloud KMS, CAI 4-Vector workload bindings, Compute SSL Policies, Certificate Authority Service, and BYOK ImportJobs.",
-                "Stage 3 — Quantum Cryptanalysis & Refactoring Architecture (Week 2): Run Shor/Roetteler/Grover simulations, generate OWASP CycloneDX v1.6 CBOM, and conduct application refactoring sessions (Google Tink SDK & Envoy/L7 TLS 1.3).",
-                "Stage 4 — Prescriptive Runbook Handover & Org Policy Guardrails (Weeks 3-4): Deliver the CISO Board Report, 5-step per-key HSM runbooks, and preventive GCP Organization Policy YAML manifests.",
+                "Stage 2 — Automated 4-Vector Telemetry Scan, CBOM & Quantum Risk Modeling (Weeks 2–3): Execute parallel discovery across Cloud KMS, CAI 4-Vector workload bindings, Compute SSL Policies, Certificate Authority Service, and BYOK ImportJobs, generating the OWASP CycloneDX v1.6 CBOM and Monte Carlo Q-VaR (95%) model.",
+                "Stage 3 — Edge TLS 1.3 Architecture, Tink SDK Crypto Agility & Non-Prod HSM Pilot (Weeks 4–5): Design hybrid post-quantum TLS 1.3 (X25519MLKEM768) and CAS PQC PKI hierarchies, conduct application refactoring workshops (Google Tink SDK & 16KB–32KB JWT buffers), and execute the guided 5-step Cloud HSM PQC cutover pilot.",
+                "Stage 4 — Preventive GCP Org Policy Guardrails, Security Recommendations Book & Closeout (Week 6): Deliver preventive GCP Organization Policy YAML constraints blocking legacy RSA/ECC creation, finalize the Agentic PQC Security Recommendations Book and 2026–2035 Migration Roadmap, and conduct the Executive Board Closeout.",
             ]),
             ("H2", "2. Engagement T-Shirt Sizing Matrix (Small / Medium / Large)"),
             ("TABLE", [
                 ["Sizing Tier", "Customer Footprint", "Manual Effort (Legacy)", "Agent-Accelerated Effort", "Recommended PSO Staffing"],
-                ["Small (Fast-Track)", "1-15 GCP Projects | <50 KMS Keys", "3 Weeks (120 hrs)", "1 Week (16 hrs)", "1 Principal Security Architect (Part-Time)"],
-                ["Medium (Enterprise)", "15-100 GCP Projects | 50-300 KMS Keys", "6 Weeks (240 hrs)", "2-3 Weeks (48 hrs)", "1 Security Architect + 1 Cloud Infra Engineer"],
-                ["Large (Global Org)", "100-1,000+ GCP Projects | 300+ Keys & PKI", "10-12 Weeks (480 hrs)", "4-6 Weeks (96 hrs)", "1 Lead Architect + 1 AppSec Specialist + TAM"],
+                ["Small (Fast-Track / Single Domain)", "1-15 GCP Projects | <50 KMS Keys", "6–8 Weeks (240–320 Hours)", "2–3 Weeks (88–120 Hours)", "1 PSO Security Consultant + 1 Security CE (Part-Time)"],
+                ["Medium (Standard Enterprise — Baseline SOW)", "15-100 GCP Projects | 50-300 KMS Keys", "12–16 Weeks (480–640 Hours)", "6 Weeks (224 Hours: 100h PSO Consultant, 80h Security CE, 44h GSD Architect)", "1 PSO Security Consultant (100h) + 1 Security CE (80h) + 1 GSD Architect (44h)"],
+                ["Large (Global / Multi-Org Regulated)", "100-1,000+ GCP Projects | 300+ Keys & PKI", "20–24 Weeks (800–960 Hours)", "8–10 Weeks (320–400 Hours)", "2 PSO Security Consultants + 1 Security CE + 1 GSD Lead Architect"],
             ]),
             ("H2", "3. RACI Governance Matrix"),
             ("TABLE", [
