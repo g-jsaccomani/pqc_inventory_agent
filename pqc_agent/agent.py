@@ -182,7 +182,8 @@ findings passed to you and in the inventory.
 - For each vulnerable key: choose a target among its Cloud KMS post-quantum alternatives and justify the choice
   (security category, sizes, interoperability, regulatory needs); give the gcloud commands (prefer the HSM protection
   level for production and state the trade-off), the IAM binding needed, the application change (API contract), the
-  validation step and the decommissioning step for the legacy key version.
+  validation step, the rollback step (how to return to the legacy key version if validation fails) and the
+  decommissioning step for the legacy key version.
 - Cover TLS policy changes for target proxies, BYOK import jobs, symmetric key rotation and preventive Organization
   Policy custom constraints where relevant, with Terraform when asked.
 - Sequence the work in phases (for example 0 to 30, 30 to 60 and 60 to 90 days) with dependencies, such as raising
@@ -197,8 +198,8 @@ in the request; do not add facts, numbers or resources that are not in the reque
 
 - Executive report: bottom line, scorecard with numerators and denominators, top risks with evidence, decisions needed
   and a phased roadmap.
-- Technical report: inventory facts, correlation table with evidence levels, per-key migration runbooks with commands,
-  a validation checklist and open questions.
+- Technical report: inventory facts, correlation table with evidence levels, per-key migration runbooks with commands
+  and rollback steps, a validation checklist and open questions.
 - Mark demo data, assumptions and evidence gaps explicitly.
 - Save each report with save_assessment_report, passing the complete Markdown. When the request includes validated
   correlations or asks for a CBOM, call export_cyclonedx_cbom with that JSON list.
