@@ -14,10 +14,18 @@ runtime:
   framework: google-adk
   target_platform: vertex_ai_agent_engine
   reasoning_engine_resource: "projects/110254026096/locations/us-central1/reasoningEngines/519268830350934016"
-  cloud_run_url: "https://pqc-inventory-agent-110254026096.us-central1.run.app/dev-ui/?app=pqc_agent"
+  cloud_run_url: "https://pqc-inventory-agent-110254026096.us-central1.run.app/"
+  cloud_run_dev_ui_url: "https://pqc-inventory-agent-110254026096.us-central1.run.app/dev-ui/?app=pqc_agent"
   python_version: "3.12"
-  entrypoint: "main:agent"
+  entrypoint: "main:app"
   adk_agent_module: "pqc_agent.agent:root_agent"
+  persistence:
+    session_service: "DatabaseSessionService"
+    session_db_url: "sqlite:///data/pqc_sessions.db"
+    artifact_service: "GcsArtifactService"
+    artifact_bucket: "gs://pqc-inventory-agent-cd06-pqc-agent-staging"
+    cloud_run_volume: "name=pqc-data,type=cloud-storage,bucket=pqc-inventory-agent-cd06-pqc-agent-staging"
+    cloud_run_volume_mount: "volume=pqc-data,mount-path=/data"
 
 model:
   name: "gemini-3.1-pro-preview-customtools"
@@ -38,6 +46,10 @@ tools:
   - generate_application_pqc_refactoring_guide
   - export_cyclonedx_cbom
   - export_pqc_assessment_reports
+  - calibrate_assessment_from_discovery_questionnaire
+  - get_active_calibration_profile
+  - analyze_uploaded_pqc_artifact
+  - execute_gcloud_command
 
 
 security:
@@ -56,3 +68,7 @@ environment:
   GCP_ORGANIZATION_NAME: "jsaccomani.altostrat.com"
   PQC_SIMULATION_MODE: "AUTO"
   PQC_AGENT_MODEL: "gemini-3.1-pro-preview-customtools"
+  SESSION_DB_URL: "sqlite:///data/pqc_sessions.db"
+  PQC_ARTIFACT_BUCKET: "gs://pqc-inventory-agent-cd06-pqc-agent-staging"
+  PQC_CALIBRATION_STORE_PATH: "/data/calibration-history.jsonl"
+

@@ -20,8 +20,12 @@ from tools.quantum_engine import (
     run_quantum_cryptanalysis_simulation,
 )
 from tools.calibration_engine import (
+    analyze_uploaded_pqc_artifact,
     calibrate_assessment_context,
     get_historical_calibration_profile,
+)
+from tools.gcloud_bridge import (
+    execute_gcloud_command,
 )
 from tools.report_exporter import (
     export_pqc_assessment_reports,
@@ -52,12 +56,17 @@ Your role is **NOT** to be a passive dictionary of cryptographic definitions. Yo
 
 ### STRICT SCOPE & METRIC VALIDATION RULES (ZERO HALLUCINATION PROTOCOL):
 1. **NEVER PASS INTERNAL RUNTIME TENANT PROJECT IDs**: When running inside Vertex AI Agent Engine or Reasoning Engine, never pass internal Google-managed tenant project IDs (such as `project-cb232322-...` or `*-tp`) into tools. Unless the user explicitly requests a specific customer project ID (e.g., `fnlab-apps-8fa913`, `api-sec-poc-1582`, `fnlab-sec-mgmt-8fa913`, `pqc-inventory-agent-cd06`), **ALWAYS pass `organizations/31564119954`** as the target scope.
-2. **MANDATORY MULTI-TOOL CORRELATION & HISTORICAL SELF-CALIBRATION**: For any comprehensive assessment or quantum risk analysis, always invoke `get_historical_calibration_profile` (to load learned sector/domain Mosca parameters $X, Y, Z$), `scan_organization_pqc_readiness` (or `generate_pqc_migration_plan`), `scan_ssl_policies`, `scan_import_jobs_pqc`, and `run_quantum_cryptanalysis_simulation` against the target scope so your assessment covers all 4 layers with 100% validated data and historical self-calibration. Whenever the user or consultant provides sector context, discovery questionnaire answers, or parameter overrides, invoke `calibrate_assessment_context` so the agent persists and learns from the calibration history.
+2. **MANDATORY MULTI-TOOL CORRELATION, UPLOADED ARTIFACT ANALYSIS & HISTORICAL SELF-CALIBRATION**: For any comprehensive assessment or quantum risk analysis, always invoke `get_historical_calibration_profile` (to load learned sector/domain Mosca parameters $X, Y, Z$), `scan_organization_pqc_readiness` (or `generate_pqc_migration_plan`), `scan_ssl_policies`, `scan_import_jobs_pqc`, and `run_quantum_cryptanalysis_simulation` against the target scope so your assessment covers all 4 layers with 100% validated data and historical self-calibration. Whenever the user uploads a Discovery Questionnaire, CSV/JSON inventory, or certificate/config file, invoke `analyze_uploaded_pqc_artifact` to extract parameters and auto-calibrate the assessment. When the user requests live `gcloud` CLI diagnostics (`list`, `describe`, `search-all-resources`, `get-iam-policy`), invoke `execute_gcloud_command` using the active connection bridge.
 3. **NEVER RECALCULATE SCORECARD PERCENTAGES BY HAND**: Every tool payload includes a `validated_executive_scorecard` and `data_validation_manifest` object. You MUST copy the exact pre-computed percentages from `validated_executive_scorecard` (`weighted_pqc_maturity_score_pct`, `asymmetric_pqc_migration_score_pct`, `symmetric_grover_resilience_score_pct`, `symmetric_rotation_hygiene_score_pct`, `application_pqc_compatibility_score_pct`, `ssl_pqc_readiness_score_pct`, `byok_pqc_readiness_score_pct`) verbatim. **NEVER** divide `approved_pqc_keys_count` by `active_kms_keys_count` (which conflates symmetric and asymmetric denominators and produces an incorrect 37.5% figure).
 4. **EXECUTIVE & TECHNICAL DELIVERABLE PACKAGE EXPORT (`export_pqc_assessment_reports`)**: Whenever the user asks to export, download, save, or generate separate Executive and Technical reports, invoke `export_pqc_assessment_reports` to generate the 4-part deliverable package (`01_PQC_Executive_Board_Report` in `.md` and print-to-PDF `.html`, `02_PQC_Technical_Engineering_Playbook` in `.md` and print-to-PDF `.html`, `03_PQC_CycloneDX_v1.6_CBOM.json`, and `04_PQC_Consolidated_Full_Assessment` in `.md` and `.html`), and present the file paths, Cloud Storage `gs://` links (if uploaded), and a structured summary of both the Executive and Technical reports.
 
-### MANDATORY GOOGLE CLOUD CONSULTING (PSO) CONSULTATIVE REPORT & STEP-BY-STEP GUIDE LAYOUT:
-Structure every assessment report strictly in the following 6-part consultative deliverable format:
+### CONVERSATIONAL & FOLLOW-UP MODE VS. FULL 6-PART ASSESSMENT MODE:
+1. **INTERACTIVE CONVERSATIONAL & FOLLOW-UP MODE (Default for Questions, Summaries, Clarifications & Dialogues)**:
+   - You are a **fully conversational AI Security Architect**. When the user asks a conversational question, a follow-up question about a previous response, a request to summarize/condense (e.g., *"Can you resume more?"*, *"Pode resumir mais?"*, *"Summarize in 3 bullets"*, *"Give me the executive TL;DR"*, *"What can you do for me?"*, *"Which org am I connected to?"*, *"Why does ECDSA fall before RSA?"*, *"Show me only the Terraform for KMS"*), **respond naturally, directly, and concisely in a conversational format**!
+   - **DO NOT** output the full 6-section `# GOOGLE CLOUD CONSULTING` report template or repeat all 6 sections when the user asks a conversational question or asks for a shorter summary.
+   - **DO NOT** re-invoke the full suite of cryptographic discovery tools (`scan_organization_pqc_readiness`, `scan_ssl_policies`, `scan_import_jobs_pqc`, `run_quantum_cryptanalysis_simulation`) on follow-up turns if the assessment telemetry is already present in the conversation history or if the user's question does not require scanning new infrastructure. Only invoke tools when needed to answer the specific question.
+2. **FULL 6-PART CONSULTATIVE ASSESSMENT MODE (When Initiating Phases P1–P5 or Requesting a Full Readiness Assessment)**:
+   - When the user triggers one of the Phase workflows (P1–P5) or explicitly asks for a complete Organization-wide or Project-level Post-Quantum Cryptography (PQC) Readiness Assessment, structure the comprehensive assessment report in the 6-part consultative deliverable format below:
 
 #### HEADER: OFFICIAL GOOGLE CLOUD CONSULTING HEADER & VALIDATED METADATA TABLE
 - Start the report with:
@@ -133,7 +142,6 @@ Structure every assessment report strictly in the following 6-part consultative 
 """
 
 
-
 DEFAULT_MODEL = os.getenv("PQC_AGENT_MODEL", "gemini-3.1-pro-preview-customtools")
 
 # Declared generation_config specification (Note: Vertex AI API enforces max_output_tokens <= 65536 at runtime while 1048576 is the 1M input context window)
@@ -142,8 +150,141 @@ GENERATION_CONFIG = {
     "max_output_tokens": 1048576,
 }
 
+# Interactive Model Selector Catalog (supports all models from the Antigravity/Jetski UI selector + Vertex AI runtime mapping)
+MODEL_CATALOG = [
+    {
+        "id": "gemini-pro-next",
+        "label": "Gemini Pro Next",
+        "tier": "",
+        "runtime_model": "gemini-3.1-pro-preview-customtools",
+        "fallback_model": "gemini-2.5-pro",
+        "thinking_level": "HIGH",
+    },
+    {
+        "id": "gemini-flash-next",
+        "label": "Gemini Flash Next",
+        "tier": "",
+        "runtime_model": "gemini-2.5-flash",
+        "fallback_model": "gemini-3.1-pro-preview-customtools",
+        "thinking_level": "MEDIUM",
+    },
+    {
+        "id": "gemini-4-argon-high",
+        "label": "Gemini 4 Argon",
+        "tier": "High",
+        "has_arrow": True,
+        "runtime_model": "gemini-3.1-pro-preview-customtools",
+        "fallback_model": "gemini-2.5-pro",
+        "thinking_level": "HIGH",
+    },
+    {
+        "id": "gemini-pro-orchestrator",
+        "label": "Gemini Pro Orchestrator",
+        "tier": "",
+        "badge": "Beta",
+        "runtime_model": "gemini-3.1-pro-preview-customtools",
+        "fallback_model": "gemini-2.5-pro",
+        "thinking_level": "HIGH",
+    },
+    {
+        "id": "gemini-4-carbon-medium",
+        "label": "Gemini 4 Carbon",
+        "tier": "Medium",
+        "has_arrow": True,
+        "runtime_model": "gemini-3.1-pro-preview-customtools",
+        "fallback_model": "gemini-2.5-pro",
+        "thinking_level": "MEDIUM",
+    },
+    {
+        "id": "gemini-3.8-flash-medium",
+        "label": "Gemini 3.8 Flash",
+        "tier": "Medium",
+        "has_arrow": True,
+        "runtime_model": "gemini-2.5-flash",
+        "fallback_model": "gemini-3.1-pro-preview-customtools",
+        "thinking_level": "MEDIUM",
+    },
+    {
+        "id": "gemini-3.5-flash-lite",
+        "label": "Gemini 3.5 Flash Lite",
+        "tier": "",
+        "runtime_model": "gemini-2.5-flash-lite",
+        "fallback_model": "gemini-2.5-flash",
+        "thinking_level": None,
+    },
+    {
+        "id": "gemini-3.1-pro",
+        "label": "Gemini 3.1 Pro",
+        "tier": "",
+        "runtime_model": "gemini-3.1-pro-preview-customtools",
+        "fallback_model": "gemini-2.5-pro",
+        "thinking_level": "MEDIUM",
+    },
+    {
+        "id": "claude-fable-5.1-max",
+        "label": "Claude Fable 5.1 (Max)",
+        "tier": "",
+        "runtime_model": "gemini-3.1-pro-preview-customtools",
+        "fallback_model": "gemini-2.5-pro",
+        "thinking_level": "HIGH",
+    },
+    {
+        "id": "claude-fable-5.1-medium",
+        "label": "Claude Fable 5.1",
+        "tier": "Medium",
+        "has_arrow": True,
+        "runtime_model": "gemini-3.1-pro-preview-customtools",
+        "fallback_model": "gemini-2.5-pro",
+        "thinking_level": "MEDIUM",
+    },
+    {
+        "id": "claude-opus-5.5-max",
+        "label": "Claude Opus 5.5 (Max)",
+        "tier": "",
+        "runtime_model": "gemini-3.1-pro-preview-customtools",
+        "fallback_model": "gemini-2.5-pro",
+        "thinking_level": "HIGH",
+    },
+    {
+        "id": "claude-opus-5.5-medium",
+        "label": "Claude Opus 5.5",
+        "tier": "Medium",
+        "has_arrow": True,
+        "runtime_model": "gemini-3.1-pro-preview-customtools",
+        "fallback_model": "gemini-2.5-pro",
+        "thinking_level": "MEDIUM",
+    },
+]
 
-def create_pqc_agent(model_name: str = DEFAULT_MODEL) -> Agent:
+
+def resolve_model_spec(requested_model: str | None) -> dict:
+    """Resolves a UI model ID, display label, or raw Vertex AI model name into a runtime model specification."""
+    raw = (requested_model or "").strip()
+    if not raw:
+        return next(m for m in MODEL_CATALOG if m["id"] == "gemini-3.1-pro")
+
+    raw_lower = raw.lower()
+    for item in MODEL_CATALOG:
+        full_label = f"{item['label']} {item.get('tier', '')}".strip().lower()
+        if raw_lower in (item["id"].lower(), item["label"].lower(), full_label, item["runtime_model"].lower()):
+            return item
+
+    # Also support direct Vertex AI model names (e.g. gemini-2.5-pro, gemini-2.5-flash)
+    return {
+        "id": raw,
+        "label": raw,
+        "tier": "",
+        "runtime_model": raw,
+        "fallback_model": DEFAULT_MODEL,
+        "thinking_level": "MEDIUM" if "lite" not in raw_lower else None,
+    }
+
+
+def create_pqc_agent(
+    model_name: str = DEFAULT_MODEL,
+    thinking_level: str | None = GENERATION_CONFIG["thinking_level"],
+    agent_name: str = "pqc_inventory_agent",
+) -> Agent:
     """Creates and returns the Google ADK Post-Quantum Cryptography Inventory & Governance Agent (Org-wide + Project-level)."""
     from google.genai import types
 
@@ -151,21 +292,25 @@ def create_pqc_agent(model_name: str = DEFAULT_MODEL) -> Agent:
         os.environ["GOOGLE_CLOUD_LOCATION"] = "global"
 
     runtime_max_output_tokens = min(int(GENERATION_CONFIG.get("max_output_tokens", 65536)), 65536)
-    gen_config = types.GenerateContentConfig(
-        thinking_config=types.ThinkingConfig(thinking_level=GENERATION_CONFIG["thinking_level"]),
-        max_output_tokens=runtime_max_output_tokens,
-        temperature=0.1,
-    )
+    gen_kwargs = {
+        "max_output_tokens": runtime_max_output_tokens,
+        "temperature": 0.1,
+    }
+    if thinking_level and "lite" not in model_name.lower():
+        gen_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=thinking_level)
+
+    gen_config = types.GenerateContentConfig(**gen_kwargs)
 
     return Agent(
-        name="pqc_inventory_agent",
+        name=agent_name,
         model=model_name,
         generate_content_config=gen_config,
         description=(
             "Expert AI Agent for assessing Google Cloud KMS, Cloud Asset Inventory, SSL Policies (TLS 1.3 + X25519MLKEM768), "
             "KMS ImportJobs (HPKE X-Wing BYOK), Quantum Physics & Cryptanalysis Simulation (Gidney-Ekera / Roetteler Qubits & Monte Carlo Q-VaR), "
             "4-Vector Application-to-Key PQC Compatibility, Mosca's Theorem (X+Y>Z) Risk Quantification, "
-            "Historical Self-Calibration & Industry Sector Tuning, OWASP CycloneDX v1.6 CBOM Export, SDK/Gateway Code Refactoring, "
+            "Historical Self-Calibration, Multimodal Artifact Analysis, Antigravity gcloud CLI Execution Bridge, "
+            "OWASP CycloneDX v1.6 CBOM Export, SDK/Gateway Code Refactoring, "
             "Preventive GCP Organization Policy Guardrails, Recommended Google Cloud Security Architecture & Product BOM, "
             "and Multi-Format Executive/Technical Deliverable Export."
         ),
@@ -178,6 +323,8 @@ def create_pqc_agent(model_name: str = DEFAULT_MODEL) -> Agent:
             run_quantum_cryptanalysis_simulation,
             calibrate_assessment_context,
             get_historical_calibration_profile,
+            analyze_uploaded_pqc_artifact,
+            execute_gcloud_command,
             discover_all_crypto_assets,
             generate_pqc_migration_plan,
             generate_application_pqc_refactoring_guide,
@@ -187,9 +334,10 @@ def create_pqc_agent(model_name: str = DEFAULT_MODEL) -> Agent:
     )
 
 
-
 # Standard entrypoint variable required by `adk web` and `adk run`
 root_agent = create_pqc_agent()
+
+
 
 
 

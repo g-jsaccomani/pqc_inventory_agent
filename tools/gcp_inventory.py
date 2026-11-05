@@ -40,6 +40,20 @@ def _compact_json(payload: Any) -> str:
     return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
 
 
+def _get_client_kwargs() -> Dict[str, Any]:
+    """Returns {'credentials': creds} if a non-default connection mode (impersonation / access_token) is active."""
+    try:
+        from tools.gcloud_bridge import get_active_gcp_credentials
+
+        creds = get_active_gcp_credentials()
+        if creds is not None:
+            return {"credentials": creds}
+    except Exception:
+        pass
+    return {}
+
+
+
 # Local harness test/simulation project identifiers
 SIMULATION_PROJECT_IDS = {
     "meu-projeto-gcp",
@@ -447,7 +461,7 @@ def _discover_live_workloads_via_cai(scope_uri: str) -> Dict[str, Any]:
     ]
 
     try:
-        cai_client = asset_v1.AssetServiceClient()
+        cai_client = asset_v1.AssetServiceClient(**_get_client_kwargs())
         response = cai_client.search_all_resources(
             request={
                 "scope": scope_uri,
@@ -1112,7 +1126,7 @@ def _discover_kms_targets_via_cai(scope_uri: str) -> List[Tuple[str, str]]:
     """Discovers all (project_id, location_id) pairs containing KeyRings/CryptoKeys within an Org, Folder, or Project scope."""
     targets: Set[Tuple[str, str]] = set()
     try:
-        cai_client = asset_v1.AssetServiceClient()
+        cai_client = asset_v1.AssetServiceClient(**_get_client_kwargs())
         response = cai_client.search_all_resources(
             request={
                 "scope": scope_uri,
@@ -1312,7 +1326,7 @@ def scan_pqc_readiness(
 
     report: List[Dict[str, Any]] = []
     try:
-        client = kms_v1.KeyManagementServiceClient()
+        client = kms_v1.KeyManagementServiceClient(**_get_client_kwargs())
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as cai_exec:
             wl_future = cai_exec.submit(_discover_live_workloads_via_cai, scope_uri)
             tgt_future = cai_exec.submit(_discover_kms_targets_via_cai, scope_uri)
@@ -1511,7 +1525,7 @@ def discover_all_crypto_assets(
 
     discovered_assets: List[Dict[str, Any]] = []
     try:
-        cai_client = asset_v1.AssetServiceClient()
+        cai_client = asset_v1.AssetServiceClient(**_get_client_kwargs())
         response = cai_client.search_all_resources(
             request={
                 "scope": scope_uri,

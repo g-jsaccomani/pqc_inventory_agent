@@ -19,5 +19,7 @@ build/
 !**/mock_*.json
 !exports/**/*.json
 
-# OS files
+# OS files & local SQLite session databases
 .DS_Store
+data/*.db*
+

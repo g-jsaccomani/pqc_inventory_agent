@@ -31,6 +31,7 @@ from tools.gcp_inventory import (
     _CACHE_TTL_SECONDS,
     _SCAN_CACHE,
     _compact_json,
+    _get_client_kwargs,
     _resolve_scope,
 )
 
@@ -62,7 +63,7 @@ def _discover_org_key_rings_via_cai(scope_uri: str) -> List[Dict[str, str]]:
     """Discovers all Cloud KMS KeyRings within an Organization, Folder, or Project scope via Cloud Asset Inventory."""
     keyrings: List[Dict[str, str]] = []
     try:
-        cai_client = asset_v1.AssetServiceClient()
+        cai_client = asset_v1.AssetServiceClient(**_get_client_kwargs())
         response = cai_client.search_all_resources(
             request={
                 "scope": scope_uri,
@@ -409,7 +410,7 @@ def scan_ssl_policies(project_id: str = f"organizations/{DEFAULT_ORGANIZATION_ID
 
     # 2. Query Cloud Asset Inventory for compute.googleapis.com/SslPolicy across Organization or Project
     try:
-        cai_client = asset_v1.AssetServiceClient()
+        cai_client = asset_v1.AssetServiceClient(**_get_client_kwargs())
         request = asset_v1.SearchAllResourcesRequest(
             scope=scope_uri,
             asset_types=[
@@ -707,7 +708,7 @@ def scan_import_jobs_pqc(
         return out_json
 
     try:
-        kms_client = kms_v1.KeyManagementServiceClient()
+        kms_client = kms_v1.KeyManagementServiceClient(**_get_client_kwargs())
         key_rings_to_scan: List[Dict[str, str]] = []
 
         if mode in ("ORG", "FOLDER"):

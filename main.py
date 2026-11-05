@@ -25,6 +25,24 @@ from pqc_agent.agent import (
     create_pqc_agent,
     root_agent,
 )
+from pqc_agent.workspace_server import (
+    DatabaseSessionService,
+    ResilientGcsArtifactService,
+    app,
+    artifact_service,
+    create_workspace_app,
+    session_service,
+)
+from tools.calibration_engine import (
+    analyze_uploaded_pqc_artifact,
+    calibrate_assessment_context,
+    get_historical_calibration_profile,
+)
+from tools.gcloud_bridge import (
+    execute_gcloud_command,
+    get_gcp_connection_config,
+    set_gcp_connection_config,
+)
 from tools.gcp_inventory import (
     discover_all_crypto_assets,
     export_cyclonedx_cbom,
@@ -80,6 +98,10 @@ def get_langchain_reasoning_engine_agent():
             generate_application_pqc_refactoring_guide,
             export_cyclonedx_cbom,
             export_pqc_assessment_reports,
+            calibrate_assessment_context,
+            get_historical_calibration_profile,
+            analyze_uploaded_pqc_artifact,
+            execute_gcloud_command,
         ],
         model_kwargs={
             "generation_config": {
@@ -518,17 +540,32 @@ async def run_adk_agent_turn(
     user_id: str = "sec-architect",
     project_id: str = "organizations/31564119954",
     location_id: str = "all",
+    session_id: Optional[str] = None,
 ) -> str:
-    """Executes a complete turn on the ADK Agent locally using InMemoryRunner."""
-    from google.adk.runners import InMemoryRunner
+    """Executes a complete turn on the ADK Agent using persistent DatabaseSessionService and GcsArtifactService."""
+    from google.adk.runners import Runner
     from google.genai import errors as genai_errors
     from google.genai import types
 
-    runner = InMemoryRunner(agent=agent, app_name="pqc_inventory_agent")
-    session = await runner.session_service.create_session(
-        app_name="pqc_inventory_agent",
-        user_id=user_id,
+    runner = Runner(
+        agent=agent,
+        app_name="pqc_agent",
+        session_service=session_service,
+        artifact_service=artifact_service,
     )
+    active_session = None
+    if session_id:
+        active_session = await session_service.get_session(
+            app_name="pqc_agent",
+            user_id=user_id,
+            session_id=session_id,
+        )
+    if not active_session:
+        active_session = await session_service.create_session(
+            app_name="pqc_agent",
+            user_id=user_id,
+            session_id=session_id,
+        )
 
     content = types.Content(
         role="user",
@@ -539,7 +576,7 @@ async def run_adk_agent_turn(
     try:
         async for event in runner.run_async(
             user_id=user_id,
-            session_id=session.id,
+            session_id=active_session.id,
             new_message=content,
         ):
             if event.is_final_response() and event.content and event.content.parts:
@@ -676,9 +713,27 @@ def deploy_to_agent_engine(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="PQC Inventory & Governance Agent CLI (Google ADK + Vertex AI Agent Engine)"
+        description="PQC Inventory & Governance Agent CLI (Google ADK + Vertex AI Agent Engine + Workspace Portal)"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # Subcommand: serve (Gemini Enterprise-style Workspace Portal + /dev-ui/)
+    serve_parser = subparsers.add_parser(
+        "serve",
+        help="Start the Gemini Enterprise-style Workspace Portal & ADK /dev-ui/ FastAPI server",
+    )
+    serve_parser.add_argument(
+        "--host",
+        type=str,
+        default="0.0.0.0",
+        help="Bind host (default: 0.0.0.0)",
+    )
+    serve_parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.getenv("PORT", "8080")),
+        help="Bind port (default: 8080)",
+    )
 
     # Subcommand: test (Local Harness - Phase 4.1)
     test_parser = subparsers.add_parser("test", help="Run the local validation harness for the PQC Agent")
@@ -769,7 +824,11 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if args.command == "test":
+    if args.command == "serve":
+        import uvicorn
+
+        uvicorn.run(app, host=args.host, port=args.port)
+    elif args.command == "test":
         output = run_local_harness(args.input, invoke_llm=args.llm)
         print(json.dumps(output, indent=2, ensure_ascii=False))
     elif args.command == "ask":
@@ -802,4 +861,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 

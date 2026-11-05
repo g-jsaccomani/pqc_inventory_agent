@@ -709,5 +709,321 @@ def test_export_pqc_assessment_reports_executive_and_technical(tmp_path):
                 assert len(cols) <= 5, f"{doc_name} table row exceeds 5 columns ({len(cols)}): {line}"
 
 
+def test_persistent_session_service_and_sessions_api(tmp_path):
+    """Validates Component 1: DatabaseSessionService, GcsArtifactService, and /api/sessions CRUD endpoints."""
+    from fastapi.testclient import TestClient
+    from pqc_agent.workspace_server import (
+        DatabaseSessionService,
+        ResilientGcsArtifactService,
+        create_workspace_app,
+    )
+
+    db_file = tmp_path / "pqc_sessions_test.db"
+    db_url = f"sqlite:///{db_file}"
+    app_instance = create_workspace_app(
+        session_db_url=db_url,
+        artifact_bucket="gs://pqc-inventory-agent-cd06-pqc-agent-staging",
+    )
+
+    assert isinstance(app_instance.state.session_service, DatabaseSessionService)
+    assert isinstance(app_instance.state.artifact_service, ResilientGcsArtifactService)
+    assert app_instance.state.artifact_service.bucket_name == "pqc-inventory-agent-cd06-pqc-agent-staging"
+
+    with TestClient(app_instance) as client:
+        # 1. Create a new session via POST /api/sessions
+        create_resp = client.post(
+            "/api/sessions",
+            json={"user_id": "ciso-architect", "title": "Org 31564119954 Executive PQC Review"},
+        )
+        assert create_resp.status_code == 200
+        created = create_resp.json()
+        session_id = created["session_id"]
+        assert created["user_id"] == "ciso-architect"
+        assert created["title"] == "Org 31564119954 Executive PQC Review"
+
+        # 2. List sessions via GET /api/sessions?user_id=ciso-architect
+        list_resp = client.get("/api/sessions", params={"user_id": "ciso-architect"})
+        assert list_resp.status_code == 200
+        listed = list_resp.json()
+        assert listed["total_sessions"] >= 1
+        found = next((s for s in listed["sessions"] if s["session_id"] == session_id), None)
+        assert found is not None
+        assert found["title"] == "Org 31564119954 Executive PQC Review"
+
+        # 3. Retrieve session details via GET /api/sessions/{session_id}
+        get_resp = client.get(f"/api/sessions/{session_id}", params={"user_id": "ciso-architect"})
+        assert get_resp.status_code == 200
+        detail = get_resp.json()
+        assert detail["session_id"] == session_id
+        assert detail["title"] == "Org 31564119954 Executive PQC Review"
+        assert isinstance(detail["messages"], list)
+
+        # 4. Delete session via DELETE /api/sessions/{session_id}
+        del_resp = client.delete(f"/api/sessions/{session_id}", params={"user_id": "ciso-architect"})
+        assert del_resp.status_code == 200
+        assert del_resp.json()["deleted"] is True
+
+        # Confirm session is removed
+        missing_resp = client.get(f"/api/sessions/{session_id}", params={"user_id": "ciso-architect"})
+        assert missing_resp.status_code == 404
 
 
+def test_multimodal_file_upload_and_artifact_calibration(tmp_path):
+    """Validates Component 2: Multimodal file upload in POST /api/chat and analyze_uploaded_pqc_artifact tool."""
+    from fastapi.testclient import TestClient
+    from pqc_agent.workspace_server import create_workspace_app
+    from tools.calibration_engine import (
+        analyze_uploaded_pqc_artifact,
+        register_uploaded_artifact_for_analysis,
+    )
+
+    questionnaire_md = (
+        "# Customer PQC Discovery Questionnaire\n"
+        "- Customer Name: Banco Atlântico Global\n"
+        "- Industry Sector: Financial Services & Central Banking (BFSI)\n"
+        "- Confidentiality Shelf-Life (X): 15 years\n"
+        "- Migration Timeline (Y): 3.0 years\n"
+        "- Gateway Header Limit: 16 KB\n"
+        "- Regulatory Frameworks: BACEN, PCI-DSS 4.0, CNSA 2.0\n"
+        "- Critical Applications: PIX Core Settlement, OpenFinance Gateway\n"
+    )
+
+    register_uploaded_artifact_for_analysis(
+        filename="discovery_questionnaire_banco_atlantico.md",
+        mime_type="text/markdown",
+        raw_bytes=questionnaire_md.encode("utf-8"),
+    )
+
+    analysis_json = analyze_uploaded_pqc_artifact(
+        artifact_name="discovery_questionnaire_banco_atlantico.md",
+        scope="organizations/31564119954",
+    )
+    analysis = json.loads(analysis_json)
+    assert analysis["status"] == "ARTIFACT_ANALYZED_AND_AUTO_CALIBRATED"
+    assert analysis["detected_artifact_type"] == "DISCOVERY_QUESTIONNAIRE_OR_POLICY_DOC"
+    extracted = analysis["extracted_parameters"]
+    assert extracted["industry_sector"] == "BFSI_BANKING"
+    assert extracted["confidentiality_years_x"] == 15.0
+    assert extracted["migration_years_y"] == 3.0
+    assert extracted["gateway_header_limit_kb"] == 16
+
+    # Also test CSV inventory upload and PEM certificate upload via analyze_uploaded_pqc_artifact
+    csv_inventory = (
+        "key_name,algorithm,purpose,project_id\n"
+        "pix-signing-rsa2048,RSA_SIGN_PSS_2048_SHA256,ASYMMETRIC_SIGN,fin-core-prod\n"
+        "vault-kem-xwing,KEM_XWING,KEY_ENCAPSULATION,fin-core-prod\n"
+        "legacy-ecdsa-p256,EC_SIGN_P256_SHA256,ASYMMETRIC_SIGN,fin-core-prod\n"
+    )
+    register_uploaded_artifact_for_analysis(
+        filename="crypto_inventory.csv",
+        mime_type="text/csv",
+        raw_bytes=csv_inventory.encode("utf-8"),
+    )
+    csv_analysis = json.loads(
+        analyze_uploaded_pqc_artifact("crypto_inventory.csv", scope="organizations/31564119954")
+    )
+    assert csv_analysis["detected_artifact_type"] == "CSV_CRYPTOGRAPHIC_INVENTORY"
+    assert csv_analysis["inventory_analysis_summary"]["total_items_parsed"] == 3
+    assert csv_analysis["inventory_analysis_summary"]["vulnerable_classical_rsa_ecc_count"] == 2
+    assert csv_analysis["inventory_analysis_summary"]["approved_pqc_count"] == 1
+
+    # Test POST /api/chat multipart upload with offline/deterministic fallback
+    db_file = tmp_path / "chat_upload_test.db"
+    app_instance = create_workspace_app(
+        session_db_url=f"sqlite:///{db_file}",
+        artifact_bucket="gs://pqc-inventory-agent-cd06-pqc-agent-staging",
+    )
+
+    with TestClient(app_instance) as client:
+        resp = client.post(
+            "/api/chat",
+            data={
+                "user_id": "sec-architect",
+                "message": "",
+                "project_id": "meu-projeto-gcp",
+                "connection_mode": "adc",
+            },
+            files=[
+                (
+                    "files",
+                    (
+                        "customer_discovery.md",
+                        questionnaire_md.encode("utf-8"),
+                        "text/markdown",
+                    ),
+                )
+            ],
+        )
+        assert resp.status_code == 200
+        payload = resp.json()
+        assert payload["session_id"]
+        assert len(payload["uploaded_artifacts"]) == 1
+        assert payload["uploaded_artifacts"][0]["filename"] == "customer_discovery.md"
+        assert len(payload["tool_traces"]) >= 1
+
+
+def test_gcloud_bridge_connection_modes_and_safe_command_execution():
+    """Validates Component 3: Antigravity-style gcloud CLI execution & Dynamic Credential Bridge."""
+    from tools.gcloud_bridge import (
+        execute_gcloud_command,
+        get_gcp_connection_config,
+        set_gcp_connection_config,
+        validate_gcloud_command,
+    )
+
+    # 1. Test allowed read-only diagnostic commands
+    for safe_cmd in [
+        "gcloud kms keys list --location=global --format=json",
+        "gcloud kms keyrings describe kr-1 --location=global",
+        "gcloud asset search-all-resources --scope=organizations/31564119954",
+        "gcloud asset search-all-iam-policies --scope=organizations/31564119954",
+        "gcloud projects get-iam-policy pqc-inventory-agent-cd06",
+        "gcloud config list",
+        "gcloud version",
+    ]:
+        is_valid, tokens, msg = validate_gcloud_command(safe_cmd)
+        assert is_valid is True, f"Expected '{safe_cmd}' to be valid, got: {msg}"
+
+    # 2. Test blocked destructive commands & shell injection metacharacters
+    for blocked_cmd in [
+        "gcloud kms keys versions destroy 1 --key=k1 --keyring=kr1 --location=global",
+        "gcloud projects delete my-prod-project",
+        "gcloud projects remove-iam-policy-binding pqc-inventory-agent-cd06 --member=user:a@b.com --role=roles/owner",
+        "gcloud kms keys create new-key --keyring=kr1 --location=global",
+        "gcloud version; rm -rf /",
+        "gcloud version && cat /etc/passwd",
+    ]:
+        is_valid, tokens, msg = validate_gcloud_command(blocked_cmd)
+        assert is_valid is False, f"Expected '{blocked_cmd}' to be blocked!"
+        exec_res = json.loads(execute_gcloud_command(blocked_cmd))
+        assert exec_res["status"] == "BLOCKED_DESTRUCTIVE_OR_INVALID_COMMAND"
+
+    # 3. Execute a safe read-only gcloud command (`gcloud version`)
+    ver_res = json.loads(execute_gcloud_command("gcloud version"))
+    assert ver_res["status"] in ("SUCCESS", "GCLOUD_BINARY_NOT_FOUND")
+    if ver_res["status"] == "SUCCESS":
+        assert "Google Cloud SDK" in ver_res["stdout"]
+
+    # 4. Test Dynamic GCP Connection Manager mode switching (adc, impersonation, access_token)
+    imp_state = set_gcp_connection_config(
+        mode="impersonation",
+        project_id="pqc-inventory-agent-cd06",
+        organization_id="31564119954",
+        impersonated_service_account="pqc-reader@customer-project.iam.gserviceaccount.com",
+    )
+    assert imp_state["mode"] == "impersonation"
+    assert imp_state["impersonated_service_account"] == "pqc-reader@customer-project.iam.gserviceaccount.com"
+
+    tok_state = set_gcp_connection_config(
+        mode="access_token",
+        project_id="pqc-inventory-agent-cd06",
+        organization_id="31564119954",
+        access_token="ya29.a0AfH6SMBx_example_short_lived_token",
+    )
+    assert tok_state["mode"] == "access_token"
+    assert tok_state["has_access_token"] is True
+    assert "ya29.a0AfH6SMBx_example_short_lived_token" not in json.dumps(tok_state)
+
+    adc_state = set_gcp_connection_config(
+        mode="adc",
+        project_id="pqc-inventory-agent-cd06",
+        organization_id="31564119954",
+    )
+    assert adc_state["mode"] == "adc"
+    assert get_gcp_connection_config()["mode"] == "adc"
+
+
+def test_gemini_enterprise_workspace_portal_ui_and_dev_ui(tmp_path):
+    """Validates Component 4: Gemini Enterprise-style Workspace Portal at GET / and ADK /dev-ui/ availability."""
+    from fastapi.testclient import TestClient
+    from pqc_agent.workspace_server import create_workspace_app
+
+    db_file = tmp_path / "portal_ui_test.db"
+    app_instance = create_workspace_app(
+        session_db_url=f"sqlite:///{db_file}",
+        artifact_bucket="gs://pqc-inventory-agent-cd06-pqc-agent-staging",
+    )
+
+    with TestClient(app_instance) as client:
+        # 1. Root route (/) serves the Gemini Enterprise-style Workspace Portal HTML
+        root_resp = client.get("/")
+        assert root_resp.status_code == 200
+        html = root_resp.text
+        assert "Agentic PQC Workspace Portal" in html
+        assert "New PQC Assessment" in html
+        assert "GCP / gcloud Connection" in html
+        assert "Download Report (.md)" in html
+        assert "Tool &amp; gcloud Execution Trace" in html or "Tool & gcloud Execution Trace" in html
+        assert "/dev-ui/?app=pqc_agent" in html
+
+        # Verify all 5 Organization-Level Quick-Action Phase Prompts use P1..P5 (without PHASE text)
+        assert "Agentic PQC Workspace" in html
+        assert "Agentic Post-Quantum Cryptography" in html
+        for p_idx in range(1, 6):
+            assert f"PHASE 0{p_idx}" not in html
+            assert f">P{p_idx}<" in html
+        assert "🛡️" not in html
+        assert "await createNewSession(PHASE_TITLES[index]" in html
+        assert "Thinking (" in html
+        assert "model-dropdown-menu" in html
+
+        # 2. Verify /api/models endpoint returns the 12-model catalog
+        models_resp = client.get("/api/models")
+        assert models_resp.status_code == 200
+        models_payload = models_resp.json()
+        assert models_payload["default_model"] == "gemini-3.1-pro"
+        model_ids = [m["id"] for m in models_payload["models"]]
+        assert len(model_ids) == 12
+        assert "gemini-pro-next" in model_ids
+        assert "gemini-4-argon-high" in model_ids
+        assert "gemini-3.1-pro" in model_ids
+        assert "claude-opus-5.5-max" in model_ids
+
+        # 3. Verify conversational follow-up & model selection in POST /api/chat
+        chat_resp = client.post(
+            "/api/chat",
+            json={
+                "user_id": "test_user",
+                "message": "Can you resume more?",
+                "model": "gemini-4-argon-high",
+            },
+        )
+        assert chat_resp.status_code == 200
+        chat_data = chat_resp.json()
+        assert chat_data["model_id"] == "gemini-4-argon-high"
+        assert "Concise Executive Summary" in chat_data["response"] or len(chat_data["response"]) > 20
+
+        # 4. Verify /dev-ui/ route remains available for debugging
+        dev_ui_resp = client.get("/dev-ui/", follow_redirects=True)
+        assert dev_ui_resp.status_code == 200
+
+        # 5. Verify /api/health endpoint
+        health_resp = client.get("/api/health")
+        assert health_resp.status_code == 200
+        health = health_resp.json()
+        assert health["status"] == "HEALTHY"
+        assert health["dev_ui_available"] is True
+
+
+
+def test_dockerfile_and_deployment_persistence_configuration():
+    """Validates Component 5: Dockerfile gcloud installation and Cloud Run GCS volume mount configuration."""
+    import pathlib
+
+    repo_root = pathlib.Path(__file__).resolve().parent.parent
+    dockerfile_text = (repo_root / "Dockerfile").read_text(encoding="utf-8")
+    deploy_cr_text = (repo_root / "scripts" / "deploy_cloud_run.sh").read_text(encoding="utf-8")
+    deploy_vertex_text = (repo_root / "scripts" / "setup_and_deploy_vertex.sh").read_text(encoding="utf-8")
+
+    # Dockerfile checks
+    assert "google-cloud-cli" in dockerfile_text
+    assert "SESSION_DB_URL=sqlite:///data/pqc_sessions.db" in dockerfile_text
+    assert "PQC_ARTIFACT_BUCKET=gs://pqc-inventory-agent-cd06-pqc-agent-staging" in dockerfile_text
+    assert 'CMD ["uvicorn", "main:app"' in dockerfile_text
+
+    # Cloud Run GCS Volume Mount checks
+    for script_text in (deploy_cr_text, deploy_vertex_text):
+        assert "--add-volume" in script_text
+        assert "name=pqc-data,type=cloud-storage,bucket=" in script_text
+        assert "--add-volume-mount" in script_text
+        assert "volume=pqc-data,mount-path=/data" in script_text

@@ -19,8 +19,18 @@ from tools.quantum_engine import (
     run_quantum_cryptanalysis_simulation,
 )
 from tools.calibration_engine import (
+    analyze_uploaded_pqc_artifact,
     calibrate_assessment_context,
     get_historical_calibration_profile,
+    register_uploaded_artifact_for_analysis,
+)
+from tools.gcloud_bridge import (
+    execute_gcloud_command,
+    get_active_gcp_credentials,
+    get_gcp_connection_config,
+    get_recent_gcloud_traces,
+    set_gcp_connection_config,
+    validate_gcloud_command,
 )
 from tools.report_exporter import (
     build_executive_board_report_markdown,
@@ -43,11 +53,20 @@ __all__ = [
     "run_quantum_cryptanalysis_simulation",
     "calibrate_assessment_context",
     "get_historical_calibration_profile",
+    "analyze_uploaded_pqc_artifact",
+    "register_uploaded_artifact_for_analysis",
+    "execute_gcloud_command",
+    "set_gcp_connection_config",
+    "get_gcp_connection_config",
+    "get_active_gcp_credentials",
+    "get_recent_gcloud_traces",
+    "validate_gcloud_command",
     "export_pqc_assessment_reports",
     "build_executive_board_report_markdown",
     "build_technical_engineering_playbook_markdown",
     "render_styled_consulting_html",
 ]
+
 
 
 
