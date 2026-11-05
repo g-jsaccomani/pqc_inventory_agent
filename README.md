@@ -1,5 +1,5 @@
 # Agentic PQC: Plain-Language Guide & Master README
-**Google Cloud Consulting — Simple Introduction, 7-File Guide, 60-Second Pitch & FAQ**
+**Google Cloud Consulting — Simple Introduction, 8-File Guide, 60-Second Pitch & FAQ**
 
 > **Google Drive Official Deliverable:** [Agentic PQC: Plain-Language Guide & Master README](https://docs.google.com/document/d/1HS0yym4MJoigjpzaN7dtBMi4P6S63Cri_U_Cgp4cRy0/edit)
 
@@ -77,7 +77,7 @@ If you are showing the Agentic PQC web interface or Gemini chat live to a custom
 
 - **Prompt 1 — Full Executive & Technical Assessment:** `Run a complete Post-Quantum Cryptography (PQC) readiness assessment across our Google Cloud organization. Show me our readiness scorecard, which encryption keys are at risk first and why (with evidence), which applications depend on them, and a step-by-step upgrade plan.`
 - **Prompt 2 — Calibrate for a Specific Industry (e.g., Banking):** `Calibrate our assessment for a Retail & Investment Bank where financial records must remain confidential for 10 years and regulatory deadlines require migration within 24 months. Recalculate our risk and top priorities.`
-- **Prompt 3 — Generate Safe Upgrade Instructions for Engineers:** `Generate the 5-step zero-downtime upgrade guide for our vulnerable signing and encryption keys in Cloud KMS, including how to test safely and prevent application outages.`
+- **Prompt 3 — Generate Safe Upgrade Instructions for Engineers:** `Using our actual Cloud KMS inventory, write a zero-downtime migration runbook for each vulnerable signing and encryption key, including how to test safely, how to roll back, and how to prevent application outages.`
 
 ## 7. How the AI Agent Works (Architecture in Brief)
 
