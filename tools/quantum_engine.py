@@ -1,21 +1,12 @@
-"""Quantum Physics & Cryptanalysis Simulation Engine for Google Cloud PQC Readiness.
+"""Quantum cryptanalysis reference estimates and an illustrative CRQC scenario model (auditable calculations).
 
-Implements deterministic, peer-reviewed quantum resource estimation and stochastic risk modeling:
-1. **Shor's & Roetteler's Surface-Code Quantum Circuit Estimator**:
-   - Models logical qubits, Toffoli gate counts (T-depth), surface code distance (d), physical superconducting
-     qubits (at p = 10^-3 gate error rate, Google Quantum AI Willow/Sycamore regime), and decryption runtime hours
-     based on Gidney & Ekerå (2021) for RSA and Roetteler et al. (2017) / Häner et al. (2020) for ECDLP (ECDSA/Ed25519).
-   - Proves mathematically why ECDSA P-256 (~2,330 logical qubits) and P-384 (~3,484 logical qubits) are breached
-     BEFORE RSA-2048 (~4,098 logical qubits) on early Fault-Tolerant Quantum Computers (FTQCs).
-2. **Core-SVP & BKZ Lattice Sieving Hardness Estimator (NIST FIPS 203 / 204 / 205)**:
-   - Evaluates classical and quantum Core-SVP bit security (2^b operations) for Module-LWE / Module-SIS lattices
-     (`KEM_XWING`, `ML_KEM_768`, `ML_KEM_1024`, `PQ_SIGN_ML_DSA_65`, `PQ_SIGN_ML_DSA_87`) and hash-based `SLH_DSA`.
-3. **Grover's Amplitude Amplification Depth-Bounded Estimator**:
-   - Evaluates AES-256-GCM and HMAC-SHA256/512 against Grover's algorithm under NIST MAXDEPTH (2^96) serial bounds.
-4. **10,000-Iteration Monte Carlo CRQC Timeline & Quantum Value-at-Risk (Q-VaR 95%) Simulator**:
-   - Simulates Fault-Tolerant Logical Qubit scaling trajectories (2026–2035) against asset confidentiality shelf-life (X)
-     and engineering migration time (Y) to produce annual breach probabilities and financial Q-VaR metrics.
+- Resource estimates come from published literature and are returned WITH citations and caveats.
+- The scenario model is an explicitly illustrative stochastic model whose assumptions are returned in full.
+- No financial figures are produced and nothing here is a forecast or a recommendation.
+- Unknown algorithms are reported as `UNKNOWN_REQUIRES_REVIEW` (fail-closed), never as quantum-safe.
 """
+
+from __future__ import annotations
 
 import functools
 import json
@@ -25,501 +16,225 @@ from typing import Any, Dict, List, Tuple
 
 from tools.gcp_inventory import (
     DEFAULT_ORGANIZATION_ID,
-    DEFAULT_ORGANIZATION_NAME,
-    _compute_metrics_for_keys,
-    _describe_scope_resolution,
-    _resolve_scope,
-    scan_pqc_readiness,
+    SIMULATED_DATA_SOURCE,
+    SIMULATION_NOTICE,
+    _compact_json,
+    _now_iso,
+    collect_kms_inventory,
 )
-from tools.pqc_detectors import scan_import_jobs_pqc, scan_ssl_policies
 
-# Surface-code physical-to-logical qubit profiles grounded in Gidney-Ekerå (2021), Roetteler et al. (2017),
-# Albrecht Lattice Estimator (FIPS 203/204), and Grassl et al. (2016) for Grover's AES-256 oracle.
-QUANTUM_CIRCUIT_PROFILES: Dict[str, Dict[str, Any]] = {
-    "ECDSA_P256_OR_ED25519": {
-        "attack_algorithm": "Shor's ECDLP (Roetteler-Naehrig-Svore-Lauter Windowed Point Addition)",
-        "complexity_class": "Sub-Exponential / Polynomial Quantum O(n^3)",
-        "logical_qubits": 2330,
-        "toffoli_gates": "1.26e11",
-        "surface_code_distance_d": 27,
-        "physical_qubits_superconducting_1e3": 13400000,
-        "estimated_crqc_runtime_hours": 9.5,
-        "classical_security_bits": 128,
-        "quantum_security_bits": 0,
-        "core_svp_quantum_bits": None,
-        "fall_order_rank": 1,
-        "quantum_physics_verdict": "CRITICAL_FALLS_FIRST_ON_EARLY_FTQC (Requires 43% fewer logical qubits than RSA-2048)",
-    },
-    "ECDSA_P384": {
-        "attack_algorithm": "Shor's ECDLP (384-bit Prime Field Reversible Modular Arithmetic)",
-        "complexity_class": "Polynomial Quantum O(n^3)",
-        "logical_qubits": 3484,
-        "toffoli_gates": "4.19e11",
-        "surface_code_distance_d": 29,
-        "physical_qubits_superconducting_1e3": 18200000,
-        "estimated_crqc_runtime_hours": 26.0,
-        "classical_security_bits": 192,
-        "quantum_security_bits": 0,
-        "core_svp_quantum_bits": None,
-        "fall_order_rank": 2,
-        "quantum_physics_verdict": "CRITICAL_FALLS_SECOND_BEFORE_RSA2048 (Requires fewer logical qubits than RSA-2048)",
-    },
+LITERATURE = {
+    "HANER_2017": "Häner, Roetteler & Svore (2017), 'Factoring using 2n+2 qubits with Toffoli based modular multiplication'.",
+    "ROETTELER_2017": "Roetteler, Naehrig, Svore & Lauter (2017), 'Quantum resource estimates for computing elliptic curve discrete logarithms'.",
+    "GIDNEY_EKERA_2021": "Gidney & Ekerå (2021), 'How to factor 2048 bit RSA integers in 8 hours using 20 million noisy qubits', Quantum 5, 433.",
+    "GIDNEY_2025": "Gidney (2025), 'How to factor 2048 bit RSA integers with less than a million noisy qubits', arXiv:2505.15917.",
+}
+
+# Logical-qubit counts follow the cited circuit constructions (RSA: 2n+2; ECC: 9n + 2*ceil(log2 n) + 10).
+QUANTUM_RESOURCE_ESTIMATES: Dict[str, Dict[str, Any]] = {
     "RSA_2048": {
-        "attack_algorithm": "Shor's Period-Finding (Gidney-Ekerå Windowed Modular Exponentiation)",
-        "complexity_class": "Polynomial Quantum O(n^2 log n log log n)",
+        "attack_algorithm": "Shor (integer factorization)",
         "logical_qubits": 4098,
-        "toffoli_gates": "2.70e9",
-        "surface_code_distance_d": 27,
-        "physical_qubits_superconducting_1e3": 20000000,
-        "estimated_crqc_runtime_hours": 8.0,
-        "classical_security_bits": 112,
-        "quantum_security_bits": 0,
-        "core_svp_quantum_bits": None,
-        "fall_order_rank": 3,
-        "quantum_physics_verdict": "CRITICAL_SHOR_FACTORIZATION_TARGET (Breached at ~4,098 logical / 20M physical qubits)",
+        "logical_qubits_basis": "2n+2 with n=2048 [HANER_2017]",
+        "physical_estimates": [
+            {"physical_qubits": "~20 million noisy qubits", "runtime": "~8 hours", "source": "GIDNEY_EKERA_2021"},
+            {"physical_qubits": "< 1 million noisy qubits", "runtime": "< 1 week", "source": "GIDNEY_2025"},
+        ],
     },
     "RSA_3072": {
-        "attack_algorithm": "Shor's Period-Finding (Gidney-Ekerå Surface-Code Lattice Surgery)",
-        "complexity_class": "Polynomial Quantum O(n^2 log n log log n)",
+        "attack_algorithm": "Shor (integer factorization)",
         "logical_qubits": 6146,
-        "toffoli_gates": "9.11e9",
-        "surface_code_distance_d": 29,
-        "physical_qubits_superconducting_1e3": 34500000,
-        "estimated_crqc_runtime_hours": 21.5,
-        "classical_security_bits": 128,
-        "quantum_security_bits": 0,
-        "core_svp_quantum_bits": None,
-        "fall_order_rank": 4,
-        "quantum_physics_verdict": "HIGH_SHOR_FACTORIZATION_TARGET (Breached at ~6,146 logical / 34.5M physical qubits)",
+        "logical_qubits_basis": "2n+2 with n=3072 [HANER_2017]",
+        "physical_estimates": [],
     },
     "RSA_4096": {
-        "attack_algorithm": "Shor's Period-Finding (Gidney-Ekerå Surface-Code Lattice Surgery)",
-        "complexity_class": "Polynomial Quantum O(n^2 log n log log n)",
+        "attack_algorithm": "Shor (integer factorization)",
         "logical_qubits": 8194,
-        "toffoli_gates": "2.16e10",
-        "surface_code_distance_d": 31,
-        "physical_qubits_superconducting_1e3": 52000000,
-        "estimated_crqc_runtime_hours": 49.0,
-        "classical_security_bits": 140,
-        "quantum_security_bits": 0,
-        "core_svp_quantum_bits": None,
-        "fall_order_rank": 5,
-        "quantum_physics_verdict": "HIGH_SHOR_FACTORIZATION_TARGET (Breached at ~8,194 logical / 52M physical qubits)",
+        "logical_qubits_basis": "2n+2 with n=4096 [HANER_2017]",
+        "physical_estimates": [],
     },
-    "KEM_XWING_OR_ML_KEM_768": {
-        "attack_algorithm": "Quantum BKZ Lattice Sieving (Core-SVP Grover-Accelerated Sieve on Module-LWE dim=768, q=3329)",
-        "complexity_class": "Exponential Quantum 2^(0.265 * beta)",
-        "logical_qubits": None,
-        "toffoli_gates": "> 2^167 (Thermodynamically Infeasible)",
-        "surface_code_distance_d": None,
-        "physical_qubits_superconducting_1e3": None,
-        "estimated_crqc_runtime_hours": None,
-        "classical_security_bits": 184,
-        "quantum_security_bits": 167,
-        "core_svp_quantum_bits": 167,
-        "fall_order_rank": 99,
-        "quantum_physics_verdict": "IMMUNE_EXPONENTIAL_LATTICE_HARDNESS (NIST FIPS 203 Category 3 — 167-bit Quantum Core-SVP)",
+    "ECC_P256": {
+        "attack_algorithm": "Shor (elliptic-curve discrete logarithm)",
+        "logical_qubits": 2330,
+        "logical_qubits_basis": "9n + 2*ceil(log2 n) + 10 with n=256 [ROETTELER_2017]",
+        "physical_estimates": [],
     },
-    "ML_KEM_1024": {
-        "attack_algorithm": "Quantum BKZ Lattice Sieving (Core-SVP on Module-LWE dim=1024, q=3329)",
-        "complexity_class": "Exponential Quantum 2^(0.265 * beta)",
-        "logical_qubits": None,
-        "toffoli_gates": "> 2^226 (Thermodynamically Infeasible)",
-        "surface_code_distance_d": None,
-        "physical_qubits_superconducting_1e3": None,
-        "estimated_crqc_runtime_hours": None,
-        "classical_security_bits": 249,
-        "quantum_security_bits": 226,
-        "core_svp_quantum_bits": 226,
-        "fall_order_rank": 100,
-        "quantum_physics_verdict": "IMMUNE_EXPONENTIAL_LATTICE_HARDNESS (NIST FIPS 203 Category 5 / CNSA 2.0 — 226-bit Quantum Core-SVP)",
+    "ECC_P384": {
+        "attack_algorithm": "Shor (elliptic-curve discrete logarithm)",
+        "logical_qubits": 3484,
+        "logical_qubits_basis": "9n + 2*ceil(log2 n) + 10 with n=384 [ROETTELER_2017]",
+        "physical_estimates": [],
     },
-    "ML_DSA_44": {
-        "attack_algorithm": "Quantum BKZ Lattice Sieving (Core-SVP on Module-LWE/SIS dim=1024, q=8380417)",
-        "complexity_class": "Exponential Quantum 2^(0.265 * beta)",
-        "logical_qubits": None,
-        "toffoli_gates": "> 2^118 (Thermodynamically Infeasible)",
-        "surface_code_distance_d": None,
-        "physical_qubits_superconducting_1e3": None,
-        "estimated_crqc_runtime_hours": None,
-        "classical_security_bits": 128,
-        "quantum_security_bits": 118,
-        "core_svp_quantum_bits": 118,
-        "fall_order_rank": 98,
-        "quantum_physics_verdict": "IMMUNE_EXPONENTIAL_LATTICE_HARDNESS (NIST FIPS 204 Category 2 — 118-bit Quantum Core-SVP)",
+    "ED25519": {
+        "attack_algorithm": "Shor (elliptic-curve discrete logarithm)",
+        "logical_qubits": 2321,
+        "logical_qubits_basis": "approximation using 9n + 2*ceil(log2 n) + 10 with n=255 [ROETTELER_2017]",
+        "physical_estimates": [],
     },
-    "ML_DSA_65": {
-        "attack_algorithm": "Quantum BKZ Lattice Sieving (Core-SVP on Module-LWE/SIS dim=1536, q=8380417)",
-        "complexity_class": "Exponential Quantum 2^(0.265 * beta)",
-        "logical_qubits": None,
-        "toffoli_gates": "> 2^174 (Thermodynamically Infeasible)",
-        "surface_code_distance_d": None,
-        "physical_qubits_superconducting_1e3": None,
-        "estimated_crqc_runtime_hours": None,
-        "classical_security_bits": 192,
-        "quantum_security_bits": 174,
-        "core_svp_quantum_bits": 174,
-        "fall_order_rank": 99,
-        "quantum_physics_verdict": "IMMUNE_EXPONENTIAL_LATTICE_HARDNESS (NIST FIPS 204 Category 3 — 174-bit Quantum Core-SVP)",
-    },
-    "ML_DSA_87": {
-        "attack_algorithm": "Quantum BKZ Lattice Sieving (Core-SVP on Module-LWE/SIS dim=2048, q=8380417)",
-        "complexity_class": "Exponential Quantum 2^(0.265 * beta)",
-        "logical_qubits": None,
-        "toffoli_gates": "> 2^232 (Thermodynamically Infeasible)",
-        "surface_code_distance_d": None,
-        "physical_qubits_superconducting_1e3": None,
-        "estimated_crqc_runtime_hours": None,
-        "classical_security_bits": 256,
-        "quantum_security_bits": 232,
-        "core_svp_quantum_bits": 232,
-        "fall_order_rank": 100,
-        "quantum_physics_verdict": "IMMUNE_EXPONENTIAL_LATTICE_HARDNESS (NIST FIPS 204 Category 5 / CNSA 2.0 — 232-bit Quantum Core-SVP)",
-    },
-    "SLH_DSA_128S": {
-        "attack_algorithm": "Grover / BHT Quantum Preimage & Collision Search on SHA-256 Merkle Hypertree",
-        "complexity_class": "Exponential Quantum O(2^(n/2)) — Zero Algebraic Structure",
-        "logical_qubits": 2400,
-        "toffoli_gates": "> 2^128 (Impossible under NIST MAXDEPTH <= 2^96)",
-        "surface_code_distance_d": None,
-        "physical_qubits_superconducting_1e3": None,
-        "estimated_crqc_runtime_hours": None,
-        "classical_security_bits": 128,
-        "quantum_security_bits": 128,
-        "core_svp_quantum_bits": None,
-        "fall_order_rank": 100,
-        "quantum_physics_verdict": "IMMUNE_STATELESS_HASH_BASED (NIST FIPS 205 — Immune to Shor and Lattice Reductions)",
-    },
-    "AES_256_OR_HMAC_SHA256": {
-        "attack_algorithm": "Grover's Amplitude Amplification (Grassl et al. Reversible AES-256 / SHA-256 Oracle)",
-        "complexity_class": "Exponential Serial Depth O(2^128) (Quadratic Speedup Only)",
-        "logical_qubits": 2953,
-        "toffoli_gates": "1.51e43 (Requires 2^128 sequential Grover oracle calls — Physically Impossible)",
-        "surface_code_distance_d": None,
-        "physical_qubits_superconducting_1e3": None,
-        "estimated_crqc_runtime_hours": None,
-        "classical_security_bits": 256,
-        "quantum_security_bits": 128,
-        "core_svp_quantum_bits": None,
-        "fall_order_rank": 99,
-        "quantum_physics_verdict": "IMMUNE_GROVER_RESILIENT_128BIT_PQ (Exceeds NIST MAXDEPTH 2^96 serial limit)",
+    "SECP256K1": {
+        "attack_algorithm": "Shor (elliptic-curve discrete logarithm)",
+        "logical_qubits": 2330,
+        "logical_qubits_basis": "9n + 2*ceil(log2 n) + 10 with n=256 [ROETTELER_2017]",
+        "physical_estimates": [],
     },
 }
 
+ESTIMATE_CAVEATS = [
+    "Logical-qubit counts depend on the circuit construction; different constructions trade qubits for gates/time.",
+    "Physical-qubit and runtime estimates depend on hardware error rates and architecture and have fallen sharply "
+    "over time (RSA-2048: ~20 million noisy qubits in 2021 vs. < 1 million in 2025).",
+    "Statements about which algorithm will be broken first are uncertain and should be presented as such.",
+    "Post-quantum algorithms (ML-KEM, ML-DSA, SLH-DSA) have no known efficient quantum attack; symmetric keys are "
+    "affected by Grover's algorithm, which roughly halves their effective security bits.",
+]
+
+SCENARIO_MODEL_ASSUMPTIONS = {
+    "iterations": 10000,
+    "random_seed": 42,
+    "start_year": 2026,
+    "end_year": 2035,
+    "initial_logical_qubits_median_2026": 140.0,
+    "initial_logical_qubits_lognormal_sigma": 0.22,
+    "annual_growth_rate_mean": 0.55,
+    "annual_growth_rate_stddev": 0.11,
+    "breakthrough_year_choices": [2028, 2029, 2030, 2031, 2032, None, None],
+    "breakthrough_multiplier_range": [1.35, 1.85],
+    "breach_thresholds_logical_qubits": {"ECC_P256": 2330, "ECC_P384": 3484, "RSA_2048": 4098, "RSA_4096": 8194},
+}
+SCENARIO_MODEL_DISCLAIMER = (
+    "Illustrative stochastic scenario model with the assumptions listed. It is NOT a forecast of when a "
+    "cryptographically relevant quantum computer will exist and must be presented with that caveat."
+)
+
+
+def _estimate_key(algorithm: str) -> str:
+    algo = (algorithm or "").upper()
+    if algo.startswith("RSA_"):
+        return "RSA_4096" if "4096" in algo else ("RSA_3072" if "3072" in algo else "RSA_2048")
+    if "P384" in algo:
+        return "ECC_P384"
+    if "P256" in algo:
+        return "ECC_P256"
+    if "ED25519" in algo:
+        return "ED25519"
+    if "SECP256K1" in algo:
+        return "SECP256K1"
+    return ""
+
 
 def map_algorithm_to_quantum_profile(algorithm: str) -> Dict[str, Any]:
-    """Maps a Cloud KMS algorithm string to its exact Quantum Circuit & Cryptanalysis Profile."""
-    algo = (algorithm or "UNKNOWN").upper()
-    if any(t in algo for t in ("EC_SIGN_P256", "ED25519", "SECP256K1")):
-        return dict(QUANTUM_CIRCUIT_PROFILES["ECDSA_P256_OR_ED25519"])
-    if "EC_SIGN_P384" in algo:
-        return dict(QUANTUM_CIRCUIT_PROFILES["ECDSA_P384"])
-    if "RSA_" in algo and "4096" in algo:
-        return dict(QUANTUM_CIRCUIT_PROFILES["RSA_4096"])
-    if "RSA_" in algo and "3072" in algo:
-        return dict(QUANTUM_CIRCUIT_PROFILES["RSA_3072"])
-    if "RSA_" in algo:
-        return dict(QUANTUM_CIRCUIT_PROFILES["RSA_2048"])
-    if "KEM_XWING" in algo or "ML_KEM_768" in algo:
-        return dict(QUANTUM_CIRCUIT_PROFILES["KEM_XWING_OR_ML_KEM_768"])
-    if "ML_KEM_1024" in algo:
-        return dict(QUANTUM_CIRCUIT_PROFILES["ML_KEM_1024"])
-    if "ML_DSA_44" in algo:
-        return dict(QUANTUM_CIRCUIT_PROFILES["ML_DSA_44"])
-    if "ML_DSA_65" in algo:
-        return dict(QUANTUM_CIRCUIT_PROFILES["ML_DSA_65"])
-    if "ML_DSA_87" in algo:
-        return dict(QUANTUM_CIRCUIT_PROFILES["ML_DSA_87"])
-    if "SLH_DSA" in algo:
-        return dict(QUANTUM_CIRCUIT_PROFILES["SLH_DSA_128S"])
-    return dict(QUANTUM_CIRCUIT_PROFILES["AES_256_OR_HMAC_SHA256"])
+    """Returns the literature-based quantum profile of an algorithm, or an explicit non-Shor/unknown profile."""
+    from tools.gcp_inventory import classify_algorithm
 
-
-@functools.lru_cache(maxsize=4)
-def _compute_base_monte_carlo_curve(iterations: int = 10000) -> Tuple[List[Dict[str, Any]], float, float]:
-    """Computes and caches the 10,000-iteration Monte Carlo Fault-Tolerant Logical Qubit scaling curve (2026-2035)."""
-    rng = random.Random(42)
-    years = list(range(2026, 2036))
-
-    trajectories_by_year: Dict[int, List[float]] = {y: [] for y in years}
-    for _ in range(iterations):
-        q0 = rng.lognormvariate(math.log(140.0), 0.22)
-        growth_r = rng.gauss(0.55, 0.11)
-        breakthrough_year = rng.choice([2028, 2029, 2030, 2031, 2032, 9999, 9999])
-        breakthrough_mult = rng.uniform(1.35, 1.85) if breakthrough_year < 9999 else 1.0
-        for y in years:
-            t = y - 2026
-            mult = breakthrough_mult if y >= breakthrough_year else 1.0
-            q_logical = q0 * math.exp(growth_r * t) * mult
-            trajectories_by_year[y].append(q_logical)
-
-    annual_curve: List[Dict[str, Any]] = []
-    for y in years:
-        samples = sorted(trajectories_by_year[y])
-        median_q = int(round(samples[iterations // 2]))
-        p95_q = int(round(samples[int(iterations * 0.95)]))
-
-        prob_ecdsa_p256 = round((sum(1 for q in samples if q >= 2330) / iterations) * 100, 1)
-        prob_ecdsa_p384 = round((sum(1 for q in samples if q >= 3484) / iterations) * 100, 1)
-        prob_rsa_2048 = round((sum(1 for q in samples if q >= 4098) / iterations) * 100, 1)
-        prob_rsa_4096 = round((sum(1 for q in samples if q >= 8194) / iterations) * 100, 1)
-
-        annual_curve.append(
-            {
-                "year": y,
-                "median_logical_qubits": median_q,
-                "p95_logical_qubits": p95_q,
-                "ecdsa_p256_breach_prob_pct": prob_ecdsa_p256,
-                "ecdsa_p384_breach_prob_pct": prob_ecdsa_p384,
-                "rsa_2048_breach_prob_pct": prob_rsa_2048,
-                "rsa_4096_breach_prob_pct": prob_rsa_4096,
-            }
-        )
-
-    samples_2035 = trajectories_by_year[2035]
-    hndl_10yr_breach_prob_rsa2048 = round((sum(1 for q in samples_2035 if q >= 4098) / iterations) * 100, 1)
-    hndl_10yr_breach_prob_ecdsa_tls = round((sum(1 for q in samples_2035 if q >= 2330) / iterations) * 100, 1)
-    return annual_curve, hndl_10yr_breach_prob_ecdsa_tls, hndl_10yr_breach_prob_rsa2048
-
-
-def _run_monte_carlo_crqc_simulation(
-    iterations: int = 10000,
-    vuln_ecdsa_p256_count: int = 0,
-    vuln_ecdsa_p384_count: int = 0,
-    vuln_rsa_2048_count: int = 0,
-    vuln_rsa_3072_4096_count: int = 0,
-    hndl_decrypt_keys_count: int = 0,
-    sndl_ssl_policies_count: int = 0,
-    vuln_byok_jobs_count: int = 0,
-) -> Dict[str, Any]:
-    """Executes a deterministic 10,000-iteration Monte Carlo simulation of Fault-Tolerant Logical Qubit scaling (2026-2035).
-
-    Models logical qubit growth as a stochastic exponential process calibrated to industry fault-tolerant roadmaps
-    (Google Quantum AI Surface Code / Willow error-suppression regime, targeting ~10^3-10^4 logical qubits between 2029-2033).
-    """
-    annual_curve, hndl_10yr_breach_prob_ecdsa_tls, hndl_10yr_breach_prob_rsa2048 = _compute_base_monte_carlo_curve(
-        iterations
-    )
-
-    # Calculate Quantum Value-at-Risk (Q-VaR 95%) in USD based on IBM/Ponemon Regulated Breach Cost & Regulatory Fines
-    base_hndl_exposure_musd = (
-        (hndl_decrypt_keys_count * 4.85)
-        + (sndl_ssl_policies_count * 3.60)
-        + (vuln_byok_jobs_count * 4.20)
-        + ((vuln_ecdsa_p256_count + vuln_ecdsa_p384_count + vuln_rsa_2048_count + vuln_rsa_3072_4096_count) * 1.85)
-    )
-    q_var_95_unmitigated_musd = round(base_hndl_exposure_musd * (hndl_10yr_breach_prob_ecdsa_tls / 100.0), 2)
-    q_var_95_post_remediation_musd = round(q_var_95_unmitigated_musd * 0.015, 2)
-
-    return {
-        "monte_carlo_iterations": iterations,
-        "physical_gate_error_model": "Superconducting Surface Code (p_gate = 1.0e-3, Cycle Time = 1.0 us, Google Willow/Sycamore Regime)",
-        "hndl_10yr_retroactive_decryption_prob_ecdsa_p256_pct": hndl_10yr_breach_prob_ecdsa_tls,
-        "hndl_10yr_retroactive_decryption_prob_rsa_2048_pct": hndl_10yr_breach_prob_rsa2048,
-        "quantum_value_at_risk_qvar_95_unmitigated_usd_millions": q_var_95_unmitigated_musd,
-        "quantum_value_at_risk_qvar_95_post_gcp_bom_remediation_usd_millions": q_var_95_post_remediation_musd,
-        "expected_risk_reduction_pct": 98.5 if q_var_95_unmitigated_musd > 0 else 100.0,
-        "annual_crqc_probability_curve_2026_2035": annual_curve,
+    facts = classify_algorithm(algorithm)
+    status = facts["quantum_status"]
+    profile: Dict[str, Any] = {
+        "algorithm": facts["algorithm"],
+        "quantum_status": status,
+        "quantum_threat_model": facts["quantum_threat_model"],
     }
+    if status == "QUANTUM_VULNERABLE_SHOR":
+        estimate = dict(QUANTUM_RESOURCE_ESTIMATES[_estimate_key(algorithm) or "RSA_2048"])
+        estimate["physical_estimates"] = [
+            {**e, "source": LITERATURE[e["source"]]} for e in estimate.get("physical_estimates", [])
+        ]
+        profile.update(estimate)
+    elif status == "QUANTUM_SAFE_PQC":
+        profile["nist_pqc_security_category"] = facts.get("nist_pqc_security_category")
+        profile["note"] = "No known efficient quantum attack against this NIST post-quantum algorithm."
+    elif status in ("QUANTUM_RESISTANT_SYMMETRIC", "BELOW_PQ_SECURITY_TARGET"):
+        profile["estimated_post_quantum_security_bits"] = facts.get("estimated_post_quantum_security_bits")
+        profile["note"] = "Grover's algorithm gives a quadratic speedup on key search."
+    else:
+        profile["note"] = "Algorithm not recognized; quantum posture requires manual review."
+    return profile
+
+
+@functools.lru_cache(maxsize=2)
+def _scenario_curve() -> Tuple[Dict[str, Any], ...]:
+    a = SCENARIO_MODEL_ASSUMPTIONS
+    rng = random.Random(a["random_seed"])
+    years = list(range(a["start_year"], a["end_year"] + 1))
+    samples_by_year: Dict[int, List[float]] = {y: [] for y in years}
+    for _ in range(a["iterations"]):
+        q0 = rng.lognormvariate(math.log(a["initial_logical_qubits_median_2026"]), a["initial_logical_qubits_lognormal_sigma"])
+        growth = rng.gauss(a["annual_growth_rate_mean"], a["annual_growth_rate_stddev"])
+        breakthrough_year = rng.choice(a["breakthrough_year_choices"])
+        multiplier = rng.uniform(*a["breakthrough_multiplier_range"]) if breakthrough_year else 1.0
+        for y in years:
+            boost = multiplier if (breakthrough_year and y >= breakthrough_year) else 1.0
+            samples_by_year[y].append(q0 * math.exp(growth * (y - a["start_year"])) * boost)
+
+    curve: List[Dict[str, Any]] = []
+    for y in years:
+        samples = sorted(samples_by_year[y])
+        n = len(samples)
+        row: Dict[str, Any] = {
+            "year": y,
+            "median_logical_qubits": int(round(samples[n // 2])),
+            "p95_logical_qubits": int(round(samples[int(n * 0.95)])),
+        }
+        for label, threshold in a["breach_thresholds_logical_qubits"].items():
+            row[f"share_of_scenarios_reaching_{label.lower()}_threshold_pct"] = round(
+                sum(1 for q in samples if q >= threshold) / n * 100.0, 1
+            )
+        curve.append(row)
+    return tuple(curve)
 
 
 def run_quantum_cryptanalysis_simulation(
-    project_id: str = f"organizations/{DEFAULT_ORGANIZATION_ID}",
-    location_id: str = "all",
+    scope: str = f"organizations/{DEFAULT_ORGANIZATION_ID}",
+    location: str = "all",
 ) -> str:
-    """Executes the Quantum Physics & Cryptanalysis Simulation Engine across a GCP Organization or Project.
+    """Profiles every active Cloud KMS key against published quantum-attack resource estimates.
 
-    Computes for every active cryptographic key, SSL Policy, and BYOK ImportJob:
-    1. Exact Logical Qubits, Toffoli Gate count, Surface Code Distance (d), Physical Superconducting Qubits,
-       and CRQC Runtime Hours required to break classical keys (Gidney-Ekerå 2021 & Roetteler et al. 2017).
-    2. Mathematical proof of the Quantum Fall Order: why ECDSA P-256 (2,330 logical qubits) and ECDSA P-384
-       (3,484 logical qubits) will be broken BEFORE RSA-2048 (4,098 logical qubits) on early quantum processors.
-    3. Core-SVP Lattice Sieving bit hardness (2^167 to 2^232 quantum operations) for PQC keys (`KEM_XWING`,
-       `ML_KEM_1024`, `PQ_SIGN_ML_DSA_65`) and Grover depth bounds for AES-256 CMEK keys.
-    4. A 10,000-iteration Monte Carlo CRQC Timeline & Quantum Value-at-Risk (Q-VaR 95%) simulation (2026-2035).
+    Returns, for the keys found by `collect_kms_inventory`: literature-based logical-qubit estimates (with the
+    formula basis and citations), counts by quantum status, an illustrative CRQC scenario model with all of its
+    assumptions, and explicit caveats. It does not prioritize keys or recommend actions.
 
     Args:
-        project_id: Target GCP Organization (`organizations/31564119954`), Folder, or Project ID.
-        location_id: Cloud KMS location (default: `"all"`).
+        scope: 'organizations/<id>', 'folders/<id>', 'projects/<id>' or a bare project ID.
+        location: Cloud KMS location filter or 'all'.
 
     Returns:
-        Compact JSON string with per-asset quantum circuit estimates, vulnerability fall-order ranking,
-        Core-SVP lattice hardness proof, and 10,000-scenario Monte Carlo CRQC & Q-VaR results.
+        JSON with `key_profiles`, `counts_by_quantum_status`, `literature`, `estimate_caveats` and
+        `illustrative_crqc_scenario_model`.
     """
-    mode, scope_uri, clean_id = _resolve_scope(project_id)
-    kms_items = json.loads(scan_pqc_readiness(project_id=project_id, location_id=location_id))
-    if isinstance(kms_items, dict) and "error" in kms_items:
-        return json.dumps(kms_items, separators=(",", ":"), ensure_ascii=False)
+    inventory = json.loads(collect_kms_inventory(scope=scope, location=location))
+    if inventory.get("error") and not inventory.get("keys"):
+        return _compact_json({"scope": inventory.get("scope"), "error": inventory["error"]})
 
-    is_simulated = any("SIMULAT" in str(k.get("data_source", "")).upper() for k in kms_items)
-    data_source_authenticity = (
-        "SIMULATED_BENCHMARK_DATASET" if is_simulated else "LIVE_GCP_TELEMETRY_VERIFIED"
-    )
-    data_validation_manifest = _describe_scope_resolution(project_id, data_source_authenticity)
-    cbom_summary = _compute_metrics_for_keys(kms_items)
+    profiles: List[Dict[str, Any]] = []
+    counts: Dict[str, int] = {}
+    for key in inventory.get("keys", []):
+        if not key.get("is_active"):
+            continue
+        profile = map_algorithm_to_quantum_profile(key["effective_algorithm"])
+        profile.update(
+            {
+                "resource_name": key["resource_name"],
+                "purpose": key["purpose"],
+                "protection_level": key.get("protection_level"),
+            }
+        )
+        profiles.append(profile)
+        counts[profile["quantum_status"]] = counts.get(profile["quantum_status"], 0) + 1
 
-    ssl_report = json.loads(scan_ssl_policies(project_id=project_id))
-    import_jobs_report = json.loads(scan_import_jobs_pqc(project_id=project_id, location_id=location_id))
-
-    validated_executive_scorecard = {
-        "validation_status": "BACKEND_DETERMINISTIC_SCORE_DO_NOT_RECOMPUTE",
-        "data_source_authenticity": data_source_authenticity,
-        "resolved_scope_uri": scope_uri,
-        "weighted_pqc_maturity_score_pct": cbom_summary["weighted_pqc_maturity_score_pct"],
-        "asymmetric_pqc_migration_score_pct": cbom_summary["asymmetric_pqc_migration_score_pct"],
-        "symmetric_grover_resilience_score_pct": cbom_summary["symmetric_grover_resilience_score_pct"],
-        "symmetric_rotation_hygiene_score_pct": cbom_summary["symmetric_rotation_hygiene_score_pct"],
-        "application_pqc_compatibility_score_pct": cbom_summary["application_pqc_compatibility_score_pct"],
-        "ssl_pqc_readiness_score_pct": ssl_report.get("ssl_pqc_readiness_score_pct", 0.0),
-        "byok_pqc_readiness_score_pct": import_jobs_report.get("byok_pqc_readiness_score_pct", 100.0),
-        "overall_algorithmic_quantum_safe_score_pct": cbom_summary["pqc_readiness_score_pct"],
-        "active_kms_keys_count": cbom_summary["active_kms_keys_count"],
-        "approved_pqc_keys_count": cbom_summary["approved_pqc_count"],
-        "vulnerable_classical_asymmetric_keys_count": cbom_summary["vulnerable_classical_rsa_ecc_count"],
-        "secure_symmetric_keys_count": cbom_summary["secure_symmetric_count"],
-        "symmetric_keys_missing_rotation_count": cbom_summary["symmetric_keys_missing_rotation_count"],
-        "score_formula_validation_note": (
-            "CRITICAL: Use these pre-validated backend percentages verbatim in the Executive Scorecard. "
-            "Do NOT divide Approved_PQC_Keys by Total_Keys (which produces an invalid 37.5% figure)."
-        ),
-    }
-
-    active_keys = [k for k in kms_items if k.get("is_active", True)]
-
-    asset_quantum_profiles: List[Dict[str, Any]] = []
-    ecdsa_p256_count = 0
-    ecdsa_p384_count = 0
-    rsa_2048_count = 0
-    rsa_3072_4096_count = 0
-    hndl_decrypt_count = 0
-
-    for k in active_keys:
-        algo = str(k.get("algorithm", "UNKNOWN")).upper()
-        purpose = str(k.get("purpose", "")).upper()
-        q_prof = map_algorithm_to_quantum_profile(algo)
-
-        if q_prof["fall_order_rank"] == 1:
-            ecdsa_p256_count += 1
-        elif q_prof["fall_order_rank"] == 2:
-            ecdsa_p384_count += 1
-        elif q_prof["fall_order_rank"] == 3:
-            rsa_2048_count += 1
-        elif q_prof["fall_order_rank"] in (4, 5):
-            rsa_3072_4096_count += 1
-
-        if "DECRYPT" in purpose and k.get("quantum_status") == "VULNERABLE_CLASSICAL_RSA_ECC":
-            hndl_decrypt_count += 1
-
-        target_algo = str(k.get("recommended_algorithm", algo)).split(" ")[0]
-        target_prof = map_algorithm_to_quantum_profile(target_algo)
-
-        k_proj = k.get("project_id", clean_id)
-        k_loc = k.get("location", "global")
-        k_kr = k.get("key_ring", "default-keyring")
-        k_name = k.get("key_name", "key")
-        first_ver = (k.get("enabled_version_ids") or ["1"])[0]
-        remediation_cmd = None
-        disable_cmd = None
-        if k.get("quantum_status") == "VULNERABLE_CLASSICAL_RSA_ECC":
-            if "DECRYPT" in purpose:
-                remediation_cmd = (
-                    f"gcloud kms keys create {k_name}-pqc-xwing --project={k_proj} --location={k_loc} "
-                    f"--keyring={k_kr} --purpose=key-encapsulation --default-algorithm=kem-xwing --protection-level=hsm"
-                )
-            else:
-                remediation_cmd = (
-                    f"gcloud kms keys create {k_name}-pqc-mldsa65 --project={k_proj} --location={k_loc} "
-                    f"--keyring={k_kr} --purpose=asymmetric-signing --default-algorithm=pq-sign-ml-dsa-65 --protection-level=hsm"
-                )
-            disable_cmd = (
-                f"gcloud kms keys versions disable {first_ver} --key={k_name} "
-                f"--keyring={k_kr} --location={k_loc} --project={k_proj}"
-            )
-
-        raw_profile = {
-            "project_id": k_proj,
-            "kms_key": f"{k_kr}/{k_name} ({k_loc})",
-            "purpose": purpose,
-            "current_algorithm": algo,
-            "protection_level": k.get("protection_level", "SOFTWARE"),
-            "quantum_status": k.get("quantum_status"),
-            "attack_algorithm": q_prof["attack_algorithm"],
-            "logical_qubits_to_break": q_prof["logical_qubits"],
-            "toffoli_gate_count": q_prof["toffoli_gates"],
-            "surface_code_distance_d": q_prof["surface_code_distance_d"],
-            "physical_superconducting_qubits_to_break": q_prof["physical_qubits_superconducting_1e3"],
-            "estimated_crqc_decryption_or_forgery_hours": q_prof["estimated_crqc_runtime_hours"],
-            "classical_security_bits": q_prof["classical_security_bits"],
-            "post_quantum_security_bits": q_prof["quantum_security_bits"],
-            "core_svp_lattice_quantum_bits": q_prof["core_svp_quantum_bits"],
-            "quantum_fall_order_rank": q_prof["fall_order_rank"],
-            "quantum_physics_verdict": q_prof["quantum_physics_verdict"],
-            "target_pqc_algorithm": k.get("recommended_algorithm"),
-            "target_post_quantum_security_bits": target_prof["quantum_security_bits"],
-            "consuming_applications": [
-                a.get("application_name") for a in k.get("consuming_applications", [])
-            ],
-            "gcloud_remediation_command": remediation_cmd,
-            "post_migration_disable_legacy_command": disable_cmd,
-        }
-        asset_quantum_profiles.append({k_field: v_val for k_field, v_val in raw_profile.items() if v_val is not None})
-
-    # Sort vulnerable keys first by Quantum Fall Order Rank (1 = ECDSA P-256 first, then P-384, then RSA-2048...)
-    asset_quantum_profiles.sort(key=lambda x: (x["quantum_fall_order_rank"], x["project_id"], x["kms_key"]))
-
-    vulnerable_quantum_ranking = [
-        a for a in asset_quantum_profiles if a["quantum_fall_order_rank"] <= 10
-    ]
-
-    sndl_ssl_count = ssl_report.get("vulnerable_to_sndl_attacks_count", 0)
-    vuln_byok_count = import_jobs_report.get("vulnerable_key_import_transport_count", 0)
-
-    monte_carlo_results = _run_monte_carlo_crqc_simulation(
-        iterations=10000,
-        vuln_ecdsa_p256_count=ecdsa_p256_count,
-        vuln_ecdsa_p384_count=ecdsa_p384_count,
-        vuln_rsa_2048_count=rsa_2048_count,
-        vuln_rsa_3072_4096_count=rsa_3072_4096_count,
-        hndl_decrypt_keys_count=hndl_decrypt_count,
-        sndl_ssl_policies_count=sndl_ssl_count,
-        vuln_byok_jobs_count=vuln_byok_count,
-    )
-
-    result = {
-        "scope": scope_uri,
-        "scope_mode": mode,
-        "organization_id": DEFAULT_ORGANIZATION_ID if mode == "ORG" else None,
-        "organization_domain": DEFAULT_ORGANIZATION_NAME if mode == "ORG" else None,
-        "data_validation_manifest": data_validation_manifest,
-        "validated_executive_scorecard": validated_executive_scorecard,
-        "quantum_engine_version": "2.0.0-GidneyEkera-Roetteler-CoreSVP-Validated",
-        "executive_quantum_physics_insights": {
-            "total_active_keys_analyzed": len(active_keys),
-            "shor_vulnerable_keys_count": len(vulnerable_quantum_ranking),
-            "ecdsa_p256_ed25519_keys_falling_first_count": ecdsa_p256_count,
-            "ecdsa_p384_keys_falling_second_count": ecdsa_p384_count,
-            "rsa_2048_keys_falling_third_count": rsa_2048_count,
-            "rsa_3072_4096_keys_count": rsa_3072_4096_count,
-            "critical_ciso_Finding_ecdsa_vs_rsa": (
-                "COUNTER-INTUITIVE QUANTUM PHYSICS FINDING: Under Shor's Elliptic Curve Discrete Logarithm algorithm "
-                "(Roetteler et al.), ECDSA P-256 and Ed25519 keys require only 2,330 Logical Qubits (~13.4M physical "
-                "superconducting qubits at d=27), whereas RSA-2048 requires 4,098 Logical Qubits (~20.0M physical qubits, "
-                "Gidney & Ekerå). Therefore, ECDSA P-256 and P-384 keys in this environment will be broken BEFORE RSA-2048 "
-                "as Fault-Tolerant Quantum Computers scale."
-            ),
-            "lattice_core_svp_immunity_proof": (
-                "Migrating asymmetric keys to KEM_XWING / ML-KEM-768 (FIPS 203) and PQ_SIGN_ML_DSA_65 (FIPS 204) "
-                "replaces polynomial Shor vulnerability O(n^3) with Module-LWE / Module-SIS lattice problems requiring "
-                "2^167 to 2^174 quantum BKZ Core-SVP sieving operations—physically impossible within the age of the universe."
-            ),
-            "grover_symmetric_maxdepth_proof": (
-                "All AES-256-GCM CMEK and HMAC-SHA256/512 keys require 2^128 sequential Grover oracle evaluations "
-                "(~1.51e43 Toffoli gates), exceeding the NIST MAXDEPTH <= 2^96 quantum circuit depth limit."
-            ),
+    result: Dict[str, Any] = {
+        "scope": inventory.get("scope"),
+        "data_source": inventory.get("data_source"),
+        "generated_at": _now_iso(),
+        "active_keys_profiled": len(profiles),
+        "counts_by_quantum_status": counts,
+        "key_profiles": profiles,
+        "literature": LITERATURE,
+        "estimate_caveats": ESTIMATE_CAVEATS,
+        "illustrative_crqc_scenario_model": {
+            "disclaimer": SCENARIO_MODEL_DISCLAIMER,
+            "assumptions": SCENARIO_MODEL_ASSUMPTIONS,
+            "annual_curve": list(_scenario_curve()),
         },
-        "monte_carlo_crqc_and_qvar_simulation": monte_carlo_results,
-        "priority_shor_fall_order_ranking": vulnerable_quantum_ranking,
-        "all_assets_quantum_circuit_profiles": asset_quantum_profiles,
     }
-
-    return json.dumps(result, separators=(",", ":"), ensure_ascii=False)
+    if inventory.get("data_source") == SIMULATED_DATA_SOURCE:
+        result["simulation_notice"] = SIMULATION_NOTICE
+    return _compact_json(result)

@@ -1,27 +1,12 @@
-"""Post-Quantum Cryptography (PQC) Discovery, Detection & Governance Tools for Google Cloud."""
+"""Post-Quantum Cryptography (PQC) evidence-collection and calculation tools for Google Cloud.
 
+Tools only collect facts and compute auditable numbers; the Gemini agents perform all reasoning.
+"""
 
-from tools.gcp_inventory import (
-    classify_crypto_key,
-    discover_all_crypto_assets,
-    export_cyclonedx_cbom,
-    generate_application_pqc_refactoring_guide,
-    generate_pqc_migration_plan,
-    scan_organization_pqc_readiness,
-    scan_pqc_readiness,
-)
-from tools.pqc_detectors import (
-    scan_import_jobs_pqc,
-    scan_ssl_policies,
-)
-from tools.quantum_engine import (
-    map_algorithm_to_quantum_profile,
-    run_quantum_cryptanalysis_simulation,
-)
 from tools.calibration_engine import (
-    analyze_uploaded_pqc_artifact,
     calibrate_assessment_context,
     get_historical_calibration_profile,
+    read_uploaded_artifact,
     register_uploaded_artifact_for_analysis,
 )
 from tools.gcloud_bridge import (
@@ -32,41 +17,39 @@ from tools.gcloud_bridge import (
     set_gcp_connection_config,
     validate_gcloud_command,
 )
-from tools.report_exporter import (
-    build_executive_board_report_markdown,
-    build_technical_engineering_playbook_markdown,
-    export_pqc_assessment_reports,
-    render_styled_consulting_html,
+from tools.gcp_inventory import (
+    classify_algorithm,
+    collect_kms_inventory,
+    collect_workload_evidence,
+    compute_pqc_scorecard,
+    discover_all_crypto_assets,
+    export_cyclonedx_cbom,
 )
+from tools.pqc_detectors import collect_kms_import_jobs, collect_tls_policies
+from tools.quantum_engine import map_algorithm_to_quantum_profile, run_quantum_cryptanalysis_simulation
+from tools.report_exporter import render_styled_consulting_html, save_assessment_report
 
 __all__ = [
-    "classify_crypto_key",
-    "scan_pqc_readiness",
-    "scan_organization_pqc_readiness",
-    "discover_all_crypto_assets",
-    "generate_pqc_migration_plan",
-    "generate_application_pqc_refactoring_guide",
-    "export_cyclonedx_cbom",
-    "scan_ssl_policies",
-    "scan_import_jobs_pqc",
-    "map_algorithm_to_quantum_profile",
-    "run_quantum_cryptanalysis_simulation",
     "calibrate_assessment_context",
-    "get_historical_calibration_profile",
-    "analyze_uploaded_pqc_artifact",
-    "register_uploaded_artifact_for_analysis",
+    "classify_algorithm",
+    "collect_kms_import_jobs",
+    "collect_kms_inventory",
+    "collect_tls_policies",
+    "collect_workload_evidence",
+    "compute_pqc_scorecard",
+    "discover_all_crypto_assets",
     "execute_gcloud_command",
-    "set_gcp_connection_config",
-    "get_gcp_connection_config",
+    "export_cyclonedx_cbom",
     "get_active_gcp_credentials",
+    "get_gcp_connection_config",
+    "get_historical_calibration_profile",
     "get_recent_gcloud_traces",
-    "validate_gcloud_command",
-    "export_pqc_assessment_reports",
-    "build_executive_board_report_markdown",
-    "build_technical_engineering_playbook_markdown",
+    "map_algorithm_to_quantum_profile",
+    "read_uploaded_artifact",
+    "register_uploaded_artifact_for_analysis",
     "render_styled_consulting_html",
+    "run_quantum_cryptanalysis_simulation",
+    "save_assessment_report",
+    "set_gcp_connection_config",
+    "validate_gcloud_command",
 ]
-
-
-
-

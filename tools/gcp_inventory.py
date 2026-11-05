@@ -1,14 +1,18 @@
-"""Post-Quantum Cryptography (PQC) Discovery, Application Compatibility & Governance Tools for Google Cloud.
+"""Evidence collection and auditable calculations for the Google Cloud cryptographic inventory.
 
-Implements strict verification aligned with official industry and government standards:
-- **NIST FIPS 203** (ML-KEM: `ML_KEM_768`, `ML_KEM_1024`) & **Google Cloud Hybrid KEM** (`KEM_XWING` = X25519 + ML-KEM-768)
-- **NIST FIPS 204** (ML-DSA: `PQ_SIGN_ML_DSA_44`, `PQ_SIGN_ML_DSA_65`, `PQ_SIGN_ML_DSA_87` and `_EXTERNAL_MU` variants)
-- **NIST FIPS 205** (SLH-DSA: `PQ_SIGN_SLH_DSA_SHA2_128S`, `PQ_SIGN_HASH_SLH_DSA_SHA2_128S_SHA256`)
-- **NIST SP 800-208** (Stateful Hash-Based Signatures: LMS / XMSS)
-- **NSA CNSA 2.0** (Security Category 5 requirement: ML-KEM-1024, ML-DSA-87, AES-256, SHA-384/512)
-- **NIST SP 800-57 & CIS GCP Benchmark 1.10** (Cryptoperiod governance, automatic key rotation <= 90 days, and active vs. destroyed `CryptoKeyVersion` inspection)
-- **Application-to-Key Dependency & PQC Model Compatibility Analysis** (Evaluates KMS API changes `AsymmetricDecrypt -> Decapsulate`, `AsymmetricSign(digest) -> AsymmetricSign(data/external_mu)`, JWS/TLS/PKI library readiness, and HTTP header/MTU payload impact).
+Design principle (LLM-first):
+- These tools only COLLECT facts from Google Cloud APIs (Cloud KMS, Cloud Asset Inventory) and COMPUTE
+  verifiable numbers (counts, ratios with explicit numerators/denominators).
+- They never correlate workloads to keys heuristically, never prioritize, never recommend and never write
+  narrative. That reasoning is performed by the Gemini agents on Vertex AI, which must cite this evidence.
+
+Simulation policy:
+- Demo data is returned ONLY when `PQC_SIMULATION_MODE=TRUE` or when the scope is an explicit demo identifier
+  listed in `SIMULATION_PROJECT_IDS`. It is never a silent fallback for API errors. Every simulated payload is
+  labeled `data_source=SIMULATED_DEMO_DATASET` and carries a `simulation_notice`.
 """
+
+from __future__ import annotations
 
 import concurrent.futures
 import datetime
@@ -20,41 +24,32 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from google.api_core import exceptions as gcp_exceptions
 from google.cloud import asset_v1, kms_v1
 
-from tools.mock_data import get_simulated_cai_assets, get_simulated_kms_raw_keys
+from tools import mock_data
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_ORGANIZATION_ID = os.getenv("GCP_ORGANIZATION_ID", "31564119954")
 DEFAULT_ORGANIZATION_NAME = os.getenv("GCP_ORGANIZATION_NAME", "jsaccomani.altostrat.com")
 
-# Thread-safe in-memory TTL cache to prevent redundant KMS/CAI API calls across multi-tool turns
+LIVE_DATA_SOURCE = "LIVE_GCP_API"
+SIMULATED_DATA_SOURCE = "SIMULATED_DEMO_DATASET"
+SIMULATION_NOTICE = (
+    "DEMO DATA: this payload comes from the built-in demo dataset, not from the customer's Google Cloud "
+    "environment. It must never be presented as customer findings."
+)
+REQUIRED_READ_ROLES = [
+    "roles/cloudkms.viewer",
+    "roles/cloudasset.viewer",
+    "roles/resourcemanager.organizationViewer",
+]
+
+# In-memory TTL cache so specialist agents can re-read the same evidence without repeating API calls.
 _SCAN_CACHE: Dict[str, Tuple[float, str]] = {}
-_CACHE_TTL_SECONDS = float(os.getenv("PQC_SCAN_CACHE_TTL_SECONDS", "120"))
+_CACHE_TTL_SECONDS = float(os.getenv("PQC_SCAN_CACHE_TTL_SECONDS", "300"))
 
-
-def _compact_json(payload: Any) -> str:
-    """Serializes tool output into compact JSON without whitespace bloat to minimize LLM input token consumption."""
-    return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
-
-
-def _get_client_kwargs() -> Dict[str, Any]:
-    """Returns {'credentials': creds} if a non-default connection mode (impersonation / access_token) is active."""
-    try:
-        from tools.gcloud_bridge import get_active_gcp_credentials
-
-        creds = get_active_gcp_credentials()
-        if creds is not None:
-            return {"credentials": creds}
-    except Exception:
-        pass
-    return {}
-
-
-
-# Local harness test/simulation project identifiers
+# Explicit demo identifiers. Requesting one of these scopes returns the demo dataset (clearly labeled).
 SIMULATION_PROJECT_IDS = {
     "meu-projeto-gcp",
     "my-gcp-project",
@@ -69,1091 +64,448 @@ ORG_MODE_TOKENS = {
     "organization",
     "organizacao",
     "organização",
-    "modo org",
     "org mode",
     "org-wide",
     "current",
-    "current environment",
-    "environment",
     "default",
     "all",
     "*",
-    "ambiente",
-    "ambiente-atual",
-    "ambiente atual",
     DEFAULT_ORGANIZATION_ID.lower(),
     f"organizations/{DEFAULT_ORGANIZATION_ID}".lower(),
     DEFAULT_ORGANIZATION_NAME.lower(),
 }
 
-# Official PQC & Classical Algorithm Metadata Catalog
+# Reference facts for NIST-standardized and Cloud KMS-supported post-quantum algorithms.
 ALGORITHM_SPECIFICATIONS: Dict[str, Dict[str, Any]] = {
     "KEM_XWING": {
         "family": "HYBRID_PQC_KEM",
-        "nist_standard": "NIST FIPS 203 (ML-KEM-768) + RFC 7748 (X25519) Hybrid X-Wing",
-        "nist_security_category": "Category 3 (192-bit equivalent / Hybrid Classical + Quantum)",
-        "cnsa_2_0_status": "APPROVED_HYBRID_TRANSITION (CNSA 2.0 pure target: ML_KEM_1024)",
+        "nist_standard": "NIST FIPS 203 (ML-KEM-768) + X25519 hybrid (X-Wing)",
+        "nist_pqc_security_category": 3,
         "public_key_bytes": 1216,
         "ciphertext_or_signature_bytes": 1120,
     },
     "ML_KEM_768": {
-        "family": "PURE_PQC_KEM",
+        "family": "PQC_KEM",
         "nist_standard": "NIST FIPS 203 (ML-KEM-768)",
-        "nist_security_category": "Category 3 (AES-192 equivalent)",
-        "cnsa_2_0_status": "FIPS_203_APPROVED (CNSA 2.0 NSS requires ML_KEM_1024)",
+        "nist_pqc_security_category": 3,
         "public_key_bytes": 1184,
         "ciphertext_or_signature_bytes": 1088,
     },
     "ML_KEM_1024": {
-        "family": "PURE_PQC_KEM",
+        "family": "PQC_KEM",
         "nist_standard": "NIST FIPS 203 (ML-KEM-1024)",
-        "nist_security_category": "Category 5 (AES-256 equivalent)",
-        "cnsa_2_0_status": "CNSA_2_0_MANDATORY_COMPLIANT",
+        "nist_pqc_security_category": 5,
         "public_key_bytes": 1568,
         "ciphertext_or_signature_bytes": 1568,
     },
     "PQ_SIGN_ML_DSA_44": {
-        "family": "PQC_LATTICE_SIGNATURE",
+        "family": "PQC_SIGNATURE",
         "nist_standard": "NIST FIPS 204 (ML-DSA-44)",
-        "nist_security_category": "Category 2 (AES-128 / SHA-256 equivalent)",
-        "cnsa_2_0_status": "FIPS_204_APPROVED (Below CNSA 2.0 Category 5)",
+        "nist_pqc_security_category": 2,
         "public_key_bytes": 1312,
         "ciphertext_or_signature_bytes": 2420,
     },
     "PQ_SIGN_ML_DSA_65": {
-        "family": "PQC_LATTICE_SIGNATURE",
+        "family": "PQC_SIGNATURE",
         "nist_standard": "NIST FIPS 204 (ML-DSA-65)",
-        "nist_security_category": "Category 3 (AES-192 / SHA-384 equivalent)",
-        "cnsa_2_0_status": "FIPS_204_RECOMMENDED_ENTERPRISE (CNSA 2.0 NSS requires ML-DSA-87)",
+        "nist_pqc_security_category": 3,
         "public_key_bytes": 1952,
         "ciphertext_or_signature_bytes": 3309,
     },
     "PQ_SIGN_ML_DSA_87": {
-        "family": "PQC_LATTICE_SIGNATURE",
+        "family": "PQC_SIGNATURE",
         "nist_standard": "NIST FIPS 204 (ML-DSA-87)",
-        "nist_security_category": "Category 5 (AES-256 / SHA-512 equivalent)",
-        "cnsa_2_0_status": "CNSA_2_0_MANDATORY_COMPLIANT",
+        "nist_pqc_security_category": 5,
         "public_key_bytes": 2592,
         "ciphertext_or_signature_bytes": 4627,
     },
     "PQ_SIGN_SLH_DSA_SHA2_128S": {
-        "family": "PQC_HASH_BASED_SIGNATURE",
-        "nist_standard": "NIST FIPS 205 (SLH-DSA-SHA2-128s / SPHINCS+)",
-        "nist_security_category": "Category 1 (128-bit Stateless Hash-Based)",
-        "cnsa_2_0_status": "FIPS_205_APPROVED_TRUST_ANCHORS",
+        "family": "PQC_SIGNATURE",
+        "nist_standard": "NIST FIPS 205 (SLH-DSA-SHA2-128s)",
+        "nist_pqc_security_category": 1,
         "public_key_bytes": 32,
         "ciphertext_or_signature_bytes": 7856,
     },
     "PQ_SIGN_HASH_SLH_DSA_SHA2_128S_SHA256": {
-        "family": "PQC_HASH_BASED_SIGNATURE",
-        "nist_standard": "NIST FIPS 205 (Hash-SLH-DSA-SHA2-128s with SHA-256 pre-hash)",
-        "nist_security_category": "Category 1 (128-bit Stateless Hash-Based Pre-Hash)",
-        "cnsa_2_0_status": "FIPS_205_APPROVED_TRUST_ANCHORS",
+        "family": "PQC_SIGNATURE",
+        "nist_standard": "NIST FIPS 205 (HashSLH-DSA-SHA2-128s with SHA-256 pre-hash)",
+        "nist_pqc_security_category": 1,
         "public_key_bytes": 32,
         "ciphertext_or_signature_bytes": 7856,
     },
 }
 
-# Known Organization Workload & Application Catalog discovered via Cloud Asset Inventory & IAM
-KNOWN_WORKLOAD_BINDINGS: Dict[str, List[Dict[str, str]]] = {
-    # Project: api-sec-poc-1582
-    "api-sec-poc-1582/hsm-keyring/etcd-encryption-key": [
-        {
-            "application_name": "Hardened GKE Cluster — etcd Application-Layer Secrets Encryption",
-            "workload_resource": "//container.googleapis.com/projects/api-sec-poc-1582/zones/us-central1-a/clusters/hardened-gke-cluster",
-            "workload_type": "Google Kubernetes Engine (GKE Cluster)",
-            "service_account": "gke-node-sa@api-sec-poc-1582.iam.gserviceaccount.com",
-            "crypto_usage_pattern": "GKE Control Plane CMEK Envelope Encryption (KMS Encrypt/Decrypt API)",
-        },
-        {
-            "application_name": "GKE Security Telemetry Warehouse",
-            "workload_resource": "//bigquery.googleapis.com/projects/api-sec-poc-1582/datasets/gke_security_audit_logs",
-            "workload_type": "BigQuery Dataset",
-            "service_account": "sa-orchestrator@api-sec-poc-1582.iam.gserviceaccount.com",
-            "crypto_usage_pattern": "BigQuery CMEK Data-at-Rest Encryption (AES-256-GCM)",
-        },
-    ],
-    "api-sec-poc-1582/hsm-keyring/registry-encryption-key": [
-        {
-            "application_name": "Cloud Security Agentic Web UI & Collector",
-            "workload_resource": "//run.googleapis.com/projects/api-sec-poc-1582/locations/us-central1/services/cs-agentic-web-ui",
-            "workload_type": "Cloud Run Service & Artifact Registry",
-            "service_account": "apispr-prereq-cloudrun-sa@api-sec-poc-1582.iam.gserviceaccount.com",
-            "crypto_usage_pattern": "Container Image & Cloud Build Artifact CMEK Encryption (AES-256-GCM)",
-        },
-        {
-            "application_name": "ApiSPR Telemetry & WAAP Analytics Pipeline",
-            "workload_resource": "//bigquery.googleapis.com/projects/api-sec-poc-1582/datasets/apispr_inventory",
-            "workload_type": "BigQuery Analytics Datasets (apispr_inventory, apispr_waap, raw_telemetry_lake)",
-            "service_account": "sa-orchestrator@api-sec-poc-1582.iam.gserviceaccount.com",
-            "crypto_usage_pattern": "BigQuery & Cloud Storage CMEK Encryption (AES-256-GCM)",
-        },
-    ],
-    # Project: fnlab-apps-8fa913
-    "fnlab-apps-8fa913/kr-iso-legacy-apps/jwt-signing-rsa2048": [
-        {
-            "application_name": "ApexFin Payment API Microservice",
-            "workload_resource": "//compute.googleapis.com/projects/fnlab-apps-8fa913/zones/us-central1-a/instances/vm-payment-api",
-            "workload_type": "Compute Engine VM Microservice (OAuth 2.0 / OIDC JWT Issuer)",
-            "service_account": "sa-api-payment-svc@fnlab-apps-8fa913.iam.gserviceaccount.com",
-            "crypto_usage_pattern": "Direct KMS AsymmetricSign API (JWS RS256 Bearer Token Signing with SHA-256 pre-hash digest)",
-        },
-        {
-            "application_name": "ApexFin Legacy CRM & Sync Agent",
-            "workload_resource": "//compute.googleapis.com/projects/fnlab-apps-8fa913/zones/us-central1-a/instances/vm-legacy-crm",
-            "workload_type": "Compute Engine Legacy Application (JWT Verifier & API Consumer)",
-            "service_account": "sa-legacy-sync-agent@fnlab-apps-8fa913.iam.gserviceaccount.com",
-            "crypto_usage_pattern": "JWS RS256 Signature Verification via Public Key & HTTP Authorization Header Parsing",
-        },
-    ],
-    "fnlab-apps-8fa913/kr-iso-legacy-apps/kms-key-legacy-insecure": [
-        {
-            "application_name": "ApexFin Legacy CRM Storage & Disk Layer",
-            "workload_resource": "//storage.googleapis.com/bkt-iso-noncompliant-legacy-a3540b",
-            "workload_type": "Cloud Storage Bucket & Compute Engine Persistent Disk (vm-legacy-crm)",
-            "service_account": "sa-legacy-sync-agent@fnlab-apps-8fa913.iam.gserviceaccount.com",
-            "crypto_usage_pattern": "GCS & Persistent Disk CMEK Encryption (AES-256-GCM)",
-        }
-    ],
-    "fnlab-apps-8fa913/poc-keyring-apps/poc-key-app-data": [
-        {
-            "application_name": "ApexFin Core Application Data Service",
-            "workload_resource": "//storage.googleapis.com/poc-bucket-app-apps-8fa913",
-            "workload_type": "Cloud Storage Bucket & Payment Microservice (vm-payment-api)",
-            "service_account": "sa-api-payment-svc@fnlab-apps-8fa913.iam.gserviceaccount.com",
-            "crypto_usage_pattern": "Application Object Storage CMEK Encryption (AES-256-GCM)",
-        }
-    ],
-    "fnlab-apps-8fa913/poc-keyring-apps/poc-key-backup-long": [
-        {
-            "application_name": "ApexFin Archival & Disaster Recovery Backup Service",
-            "workload_resource": "//storage.googleapis.com/bkt-fnlab-app-backups-e375a6",
-            "workload_type": "Cloud Storage Archival Buckets (bkt-fnlab-app-backups-e375a6, poc-bucket-backup-apps-8fa913)",
-            "service_account": "sa-backend-deployer@fnlab-apps-8fa913.iam.gserviceaccount.com",
-            "crypto_usage_pattern": "Long-Term Backup CMEK Encryption (AES-256-GCM)",
-        }
-    ],
-    "fnlab-apps-8fa913/poc-keyring-apps/poc-key-tokens-stale": [
-        {
-            "application_name": "ApexFin Session & Token Cache Service",
-            "workload_resource": "//compute.googleapis.com/projects/fnlab-apps-8fa913/zones/us-central1-a/instances/vm-payment-api",
-            "workload_type": "Compute Engine Token Store Workload",
-            "service_account": "poc-sa-reader@fnlab-apps-8fa913.iam.gserviceaccount.com",
-            "crypto_usage_pattern": "Symmetric Token Payload Encryption via KMS Encrypt/Decrypt API (AES-256-GCM)",
-        }
-    ],
-    # Project: fnlab-sec-mgmt-8fa913
-    "fnlab-sec-mgmt-8fa913/kr-security-mgmt/key-root-database-encryption": [
-        {
-            "application_name": "Central Security Analytics & Bastion Host",
-            "workload_resource": "//bigquery.googleapis.com/projects/fnlab-sec-mgmt-8fa913/datasets/ds_central_security_audit",
-            "workload_type": "BigQuery Dataset & Compute Engine Bastion (vm-mgmt-bastion)",
-            "service_account": "1002674382623-compute@developer.gserviceaccount.com",
-            "crypto_usage_pattern": "BigQuery Dataset & VM Disk CMEK Encryption (AES-256-GCM)",
-        }
-    ],
-    "fnlab-sec-mgmt-8fa913/kr-iso-compliance-mgmt/kms-key-fintech-compliant": [
-        {
-            "application_name": "Enterprise SIEM Log Ingestion Forwarder",
-            "workload_resource": "//iam.googleapis.com/projects/fnlab-sec-mgmt-8fa913/serviceAccounts/sa-siem-forwarder@fnlab-sec-mgmt-8fa913.iam.gserviceaccount.com",
-            "workload_type": "Log Sink & Security Telemetry Pipeline",
-            "service_account": "sa-siem-forwarder@fnlab-sec-mgmt-8fa913.iam.gserviceaccount.com",
-            "crypto_usage_pattern": "HSM-Backed Symmetric CMEK Encryption (AES-256-GCM)",
-        }
-    ],
-    "fnlab-sec-mgmt-8fa913/poc-keyring-sec/poc-key-payments-hsm": [
-        {
-            "application_name": "SecMgmt Payment Vault Storage",
-            "workload_resource": "//storage.googleapis.com/poc-bucket-payments-sec-8fa913",
-            "workload_type": "Cloud Storage HSM-Protected Bucket",
-            "service_account": "sa-iso-compliant-auditor@fnlab-sec-mgmt-8fa913.iam.gserviceaccount.com",
-            "crypto_usage_pattern": "HSM-Backed GCS CMEK Encryption (AES-256-GCM)",
-        }
-    ],
-    "fnlab-sec-mgmt-8fa913/poc-keyring-sec/poc-key-database-hsm": [
-        {
-            "application_name": "SecMgmt Security Event Warehouse",
-            "workload_resource": "//storage.googleapis.com/poc-bucket-app-sec-8fa913",
-            "workload_type": "Cloud Storage Bucket & BigQuery Activity Tables",
-            "service_account": "sa-iso-compliant-auditor@fnlab-sec-mgmt-8fa913.iam.gserviceaccount.com",
-            "crypto_usage_pattern": "HSM-Backed Database & Storage CMEK Encryption (AES-256-GCM)",
-        }
-    ],
-    "fnlab-sec-mgmt-8fa913/poc-keyring-sec/poc-key-audit-software": [
-        {
-            "application_name": "AISPR Security Posture Collector",
-            "workload_resource": "//iam.googleapis.com/projects/fnlab-sec-mgmt-8fa913/serviceAccounts/sa-aispr-auditor@fnlab-sec-mgmt-8fa913.iam.gserviceaccount.com",
-            "workload_type": "Automated Security Posture Service",
-            "service_account": "sa-aispr-auditor@fnlab-sec-mgmt-8fa913.iam.gserviceaccount.com",
-            "crypto_usage_pattern": "Software-Backed Report CMEK Encryption (AES-256-GCM)",
-        }
-    ],
-    # Project: pqc-inventory-agent-cd06
-    "pqc-inventory-agent-cd06/kr-pqc-enterprise-prod/legacy-rsa-oaep-decrypt": [
-        {
-            "application_name": "Legacy Partner Payload & DEK Unwrapper Service",
-            "workload_resource": "//run.googleapis.com/projects/pqc-inventory-agent-cd06/locations/us-central1/services/pqc-inventory-agent",
-            "workload_type": "Cloud Run Microservice (Partner Envelope Decryption Module)",
-            "service_account": "110254026096-compute@developer.gserviceaccount.com",
-            "crypto_usage_pattern": "Direct KMS AsymmetricDecrypt API (RSA-OAEP-2048-SHA256 direct ciphertext decryption)",
-        }
-    ],
-    "pqc-inventory-agent-cd06/kr-pqc-enterprise-prod/legacy-ecdsa-p256-sign": [
-        {
-            "application_name": "Legacy Webhook & Artifact Attestation Signer",
-            "workload_resource": "//run.googleapis.com/projects/pqc-inventory-agent-cd06/locations/us-central1/services/pqc-inventory-agent",
-            "workload_type": "Cloud Run Microservice (Webhook & CI/CD Attestation Module)",
-            "service_account": "110254026096-compute@developer.gserviceaccount.com",
-            "crypto_usage_pattern": "Direct KMS AsymmetricSign API (ECDSA P-256 pre-hashed SHA-256 digest signing, 64-byte signature)",
-        }
-    ],
-    "pqc-inventory-agent-cd06/kr-pqc-enterprise-prod/pqc-kem-xwing-hybrid": [
-        {
-            "application_name": "PQC Zero-Trust Key Encapsulation Gateway",
-            "workload_resource": "//run.googleapis.com/projects/pqc-inventory-agent-cd06/locations/us-central1/services/pqc-inventory-agent",
-            "workload_type": "Cloud Run Microservice & Vertex AI Agent Engine",
-            "service_account": "110254026096-compute@developer.gserviceaccount.com",
-            "crypto_usage_pattern": "Direct KMS Encapsulate/Decapsulate API (KEM_XWING Hybrid X25519 + ML-KEM-768 + HKDF-SHA256)",
-        }
-    ],
-    "pqc-inventory-agent-cd06/kr-pqc-enterprise-prod/pqc-sign-mldsa65": [
-        {
-            "application_name": "PQC Artifact & CBOM Attestation Service",
-            "workload_resource": "//run.googleapis.com/projects/pqc-inventory-agent-cd06/locations/us-central1/services/pqc-inventory-agent",
-            "workload_type": "Cloud Run Microservice & Vertex AI Agent Engine",
-            "service_account": "110254026096-compute@developer.gserviceaccount.com",
-            "crypto_usage_pattern": "Direct KMS AsymmetricSign API (NIST FIPS 204 PQ_SIGN_ML_DSA_65 raw message signing, 3,309-byte signature)",
-        }
-    ],
-    "pqc-inventory-agent-cd06/kr-pqc-enterprise-prod/cmek-aes256-datalake": [
-        {
-            "application_name": "Vertex AI Agent Engine Staging & Artifact Store",
-            "workload_resource": "//storage.googleapis.com/pqc-inventory-agent-cd06-pqc-agent-staging",
-            "workload_type": "Cloud Storage Bucket & Vertex AI Reasoning Engine",
-            "service_account": "110254026096-compute@developer.gserviceaccount.com",
-            "crypto_usage_pattern": "GCS & Vertex AI CMEK Data-at-Rest Encryption (AES-256-GCM)",
-        }
-    ],
+# Reference facts for classical algorithms (classical security per NIST SP 800-57 Part 1).
+CLASSICAL_ALGORITHM_FACTS: Dict[str, Dict[str, Any]] = {
+    "RSA_2048": {"classical_security_bits": 112, "signature_or_ciphertext_bytes": 256},
+    "RSA_3072": {"classical_security_bits": 128, "signature_or_ciphertext_bytes": 384},
+    "RSA_4096": {"classical_security_bits": 140, "signature_or_ciphertext_bytes": 512},
+    "EC_P256": {"classical_security_bits": 128, "signature_or_ciphertext_bytes": 64},
+    "EC_P384": {"classical_security_bits": 192, "signature_or_ciphertext_bytes": 96},
+    "ED25519": {"classical_security_bits": 128, "signature_or_ciphertext_bytes": 64},
+    "SECP256K1": {"classical_security_bits": 128, "signature_or_ciphertext_bytes": 64},
 }
+
+QUANTUM_STATUS_RANK = {
+    "QUANTUM_VULNERABLE_SHOR": 0,
+    "UNKNOWN_REQUIRES_REVIEW": 1,
+    "BELOW_PQ_SECURITY_TARGET": 2,
+    "QUANTUM_RESISTANT_SYMMETRIC": 3,
+    "QUANTUM_SAFE_PQC": 4,
+}
+
+ASYMMETRIC_FAMILIES = {"CLASSICAL_RSA", "CLASSICAL_ECC", "PQC_KEM", "HYBRID_PQC_KEM", "PQC_SIGNATURE"}
+SYMMETRIC_FAMILIES = {"SYMMETRIC_AES_256", "SYMMETRIC_AES_128", "MAC_HMAC"}
+
+WORKLOAD_ASSET_TYPES = [
+    "run.googleapis.com/Service",
+    "compute.googleapis.com/Instance",
+    "compute.googleapis.com/Disk",
+    "container.googleapis.com/Cluster",
+    "storage.googleapis.com/Bucket",
+    "bigquery.googleapis.com/Dataset",
+    "sqladmin.googleapis.com/Instance",
+    "secretmanager.googleapis.com/Secret",
+    "pubsub.googleapis.com/Topic",
+    "artifactregistry.googleapis.com/Repository",
+    "iam.googleapis.com/ServiceAccount",
+]
+MAX_WORKLOADS_RETURNED = int(os.getenv("PQC_MAX_WORKLOADS_RETURNED", "600"))
+
+
+# ---------------------------------------------------------------------------
+# Generic helpers
+# ---------------------------------------------------------------------------
+
+
+def _compact_json(payload: Any) -> str:
+    """Serializes tool output into compact JSON to reduce LLM input tokens."""
+    return json.dumps(payload, separators=(",", ":"), ensure_ascii=False, default=str)
+
+
+def _now_iso() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _get_client_kwargs() -> Dict[str, Any]:
+    """Returns {'credentials': creds} when the portal is using impersonation or a user access token."""
+    try:
+        from tools.gcloud_bridge import get_active_gcp_credentials
+
+        creds = get_active_gcp_credentials()
+        if creds is not None:
+            return {"credentials": creds}
+    except Exception:
+        pass
+    return {}
+
+
+def _cache_get(key: str) -> Optional[str]:
+    cached = _SCAN_CACHE.get(key)
+    if cached and (time.monotonic() - cached[0]) < _CACHE_TTL_SECONDS:
+        return cached[1]
+    return None
+
+
+def _cache_put(key: str, value: str) -> str:
+    _SCAN_CACHE[key] = (time.monotonic(), value)
+    return value
+
+
+def excluded_key_rings() -> Set[str]:
+    """Key rings explicitly excluded by configuration (`PQC_EXCLUDED_KEY_RINGS`, comma-separated). Default: none."""
+    raw = os.getenv("PQC_EXCLUDED_KEY_RINGS", "")
+    return {token.strip() for token in raw.split(",") if token.strip()}
+
+
+def simulation_requested(clean_id: str) -> bool:
+    """True only for explicit simulation (`PQC_SIMULATION_MODE=TRUE`) or an explicit demo scope identifier."""
+    if os.getenv("PQC_SIMULATION_MODE", "FALSE").strip().upper() == "TRUE":
+        return True
+    return (clean_id or "").strip().lower() in SIMULATION_PROJECT_IDS
 
 
 def _is_internal_runtime_tenant_project(proj_id: str) -> bool:
-    """Detects internal Google-managed Vertex AI Agent Engine / Reasoning Engine runtime tenant projects.
-
-    Examples: `project-cb232322-97f9-4f78-97f`, `*-tp` (tenant project suffix).
-    When an LLM running inside Vertex AI Agent Engine inspects its own runtime environment metadata and passes
-    the internal tenant project ID into tools, redirecting to the customer's GCP Organization prevents
-    permission failures and simulated fallback contamination.
-    """
+    """Detects internal Google-managed Vertex AI Agent Engine runtime tenant projects (e.g. `*-tp`)."""
     clean = (proj_id or "").strip().lower()
     if not clean or clean in SIMULATION_PROJECT_IDS:
         return False
-    if clean.endswith("-tp") or clean in (
-        "vertex-ai-tenant",
-        "agent-engine-tenant",
-        "reasoning-engine-tenant",
-    ):
+    if clean.endswith("-tp") or clean in ("vertex-ai-tenant", "agent-engine-tenant", "reasoning-engine-tenant"):
         return True
-    if re.match(r"^project-[0-9a-f]{6,}-[0-9a-f]{4}-", clean):
-        return True
-    return False
+    return bool(re.match(r"^project-[0-9a-f]{6,}-[0-9a-f]{4}-", clean))
 
 
 def _resolve_scope(target: Optional[str] = None) -> Tuple[str, str, str]:
-    """Resolves the target input into (mode, scope_uri, clean_id), redirecting internal runtime tenant projects to ORG."""
+    """Resolves the requested scope into (mode, scope_uri, clean_id)."""
     raw = (target or "").strip()
     lower = raw.lower()
 
     if lower in ORG_MODE_TOKENS:
-        org_id = DEFAULT_ORGANIZATION_ID
-        return ("ORG", f"organizations/{org_id}", org_id)
-
+        return ("ORG", f"organizations/{DEFAULT_ORGANIZATION_ID}", DEFAULT_ORGANIZATION_ID)
     if lower.startswith("organizations/"):
         org_id = raw.split("/", 1)[1].strip() or DEFAULT_ORGANIZATION_ID
         return ("ORG", f"organizations/{org_id}", org_id)
-
     if raw.isdigit() and len(raw) >= 8:
         return ("ORG", f"organizations/{raw}", raw)
-
     if lower.startswith("folders/"):
         folder_id = raw.split("/", 1)[1].strip()
         return ("FOLDER", f"folders/{folder_id}", folder_id)
 
-    if lower.startswith("projects/"):
-        proj_id = raw.split("/", 1)[1].strip()
-        if _is_internal_runtime_tenant_project(proj_id):
-            org_id = DEFAULT_ORGANIZATION_ID
-            logger.info(
-                "Redirecting internal runtime tenant project '%s' to customer Organization 'organizations/%s'.",
-                proj_id,
-                org_id,
-            )
-            return ("ORG", f"organizations/{org_id}", org_id)
-        return ("PROJECT", f"projects/{proj_id}", proj_id)
-
-    if _is_internal_runtime_tenant_project(raw):
-        org_id = DEFAULT_ORGANIZATION_ID
-        logger.info(
-            "Redirecting internal runtime tenant project '%s' to customer Organization 'organizations/%s'.",
-            raw,
-            org_id,
-        )
-        return ("ORG", f"organizations/{org_id}", org_id)
-
-    return ("PROJECT", f"projects/{raw}", raw)
+    proj_id = raw.split("/", 1)[1].strip() if lower.startswith("projects/") else raw
+    if _is_internal_runtime_tenant_project(proj_id):
+        logger.info("Redirecting internal runtime tenant project '%s' to the configured organization.", proj_id)
+        return ("ORG", f"organizations/{DEFAULT_ORGANIZATION_ID}", DEFAULT_ORGANIZATION_ID)
+    return ("PROJECT", f"projects/{proj_id}", proj_id)
 
 
-def _describe_scope_resolution(
-    requested_target: Optional[str],
-    data_source_authenticity: str = "LIVE_GCP_TELEMETRY_VERIFIED",
-) -> Dict[str, Any]:
-    """Builds a deterministic data & scope validation manifest to prevent LLM scope or metric hallucinations."""
-    raw = (requested_target or "").strip()
-    candidate_proj = raw.split("/", 1)[1].strip() if raw.lower().startswith("projects/") else raw
-    was_redirected = _is_internal_runtime_tenant_project(candidate_proj)
-    mode, scope_uri, clean_id = _resolve_scope(requested_target)
-    manifest: Dict[str, Any] = {
-        "requested_scope_input": raw or f"organizations/{DEFAULT_ORGANIZATION_ID}",
-        "resolved_scope_uri": scope_uri,
-        "resolved_scope_mode": mode,
-        "resolved_clean_id": clean_id,
-        "organization_domain": DEFAULT_ORGANIZATION_NAME if mode == "ORG" else None,
-        "tenant_project_auto_redirected": was_redirected,
-        "data_source_authenticity": data_source_authenticity,
-        "metrics_validation_status": "DETERMINISTIC_BACKEND_VALIDATED_DO_NOT_RECALCULATE",
+def _project_from_cai_name(resource_name: str, fallback: str = "") -> str:
+    parts = (resource_name or "").split("/")
+    if len(parts) >= 5 and parts[3] == "projects":
+        return parts[4]
+    if "projects/" in (resource_name or ""):
+        return resource_name.split("projects/", 1)[1].split("/", 1)[0]
+    return (fallback or "").split("/")[-1]
+
+
+def _ratio_metric(numerator: int, denominator: int, definition: str) -> Dict[str, Any]:
+    value = round((numerator / denominator) * 100.0, 1) if denominator else None
+    return {
+        "value_pct": value,
+        "numerator": numerator,
+        "denominator": denominator,
+        "definition": definition,
+        "note": None if denominator else "Not applicable: denominator is zero in this scope.",
     }
-    if was_redirected:
-        manifest["redirection_explanation"] = (
-            f"Internal Vertex AI Agent Engine runtime tenant project '{candidate_proj}' was automatically "
-            f"redirected to customer Organization '{scope_uri}' ({DEFAULT_ORGANIZATION_NAME}) to guarantee "
-            "evaluation of real customer GCP assets rather than an empty runtime container."
-        )
-    return manifest
 
 
-# Cache of live workloads discovered via Cloud Asset Inventory per scope
-_WORKLOAD_CACHE: Dict[str, Dict[str, Any]] = {}
+# ---------------------------------------------------------------------------
+# Factual algorithm classification
+# ---------------------------------------------------------------------------
 
 
-def _discover_live_workloads_via_cai(scope_uri: str) -> Dict[str, Any]:
-    """Queries Cloud Asset Inventory for all active compute, container, data, storage, and IAM workloads.
-
-    Builds two live indexes:
-    1. `direct_cmek_by_key`: Maps full or partial `CryptoKey` resource name -> list of CAI resources with `kms_key`/`kms_keys` bound (including cross-project CMEK consumers!).
-    2. `by_project`: Maps `project_id` -> list of live workloads (`Cloud Run`, `GKE`, `Compute VM`, `GCS Bucket`, `BigQuery Dataset`, `ServiceAccount`).
-    """
-    if scope_uri in _WORKLOAD_CACHE:
-        return _WORKLOAD_CACHE[scope_uri]
-
-    direct_cmek_by_key: Dict[str, List[Dict[str, str]]] = {}
-    by_project: Dict[str, List[Dict[str, str]]] = {}
-
-    workload_asset_types = [
-        "run.googleapis.com/Service",
-        "compute.googleapis.com/Instance",
-        "compute.googleapis.com/Disk",
-        "container.googleapis.com/Cluster",
-        "storage.googleapis.com/Bucket",
-        "bigquery.googleapis.com/Dataset",
-        "sqladmin.googleapis.com/Instance",
-        "secretmanager.googleapis.com/Secret",
-        "iam.googleapis.com/ServiceAccount",
-    ]
-
-    try:
-        cai_client = asset_v1.AssetServiceClient(**_get_client_kwargs())
-        response = cai_client.search_all_resources(
-            request={
-                "scope": scope_uri,
-                "asset_types": workload_asset_types,
-                "page_size": 500,
-            }
-        )
-        for r in response:
-            proj_id = ""
-            parts = r.name.split("/")
-            if len(parts) >= 5 and parts[3] == "projects":
-                proj_id = parts[4]
-            elif r.project:
-                proj_id = r.project.split("/")[-1]
-
-            entry = {
-                "asset_type": r.asset_type,
-                "display_name": r.display_name or r.name.split("/")[-1],
-                "name": r.name,
-                "project_id": proj_id,
-                "location": r.location or "global",
-                "labels": dict(r.labels) if r.labels else {},
-            }
-            if proj_id:
-                by_project.setdefault(proj_id, []).append(entry)
-
-            kms_refs: List[str] = []
-            if getattr(r, "kms_key", ""):
-                kms_refs.append(r.kms_key)
-            if getattr(r, "kms_keys", None):
-                for k_ref in r.kms_keys:
-                    if k_ref not in kms_refs:
-                        kms_refs.append(k_ref)
-
-            for k_ref in kms_refs:
-                # Normalize key reference to "project/keyring/key" as well as full URI
-                clean_ref = k_ref.split("/cryptoKeyVersions/")[0]
-                k_parts = clean_ref.split("/")
-                if len(k_parts) >= 8 and k_parts[0] == "projects":
-                    short_lookup = f"{k_parts[1]}/{k_parts[5]}/{k_parts[7]}"
-                else:
-                    short_lookup = clean_ref
-                cmek_consumer = {
-                    "application_name": f"{entry['display_name']} (Live CMEK Resource in {proj_id or 'GCP'})",
-                    "workload_resource": r.name,
-                    "workload_type": f"{r.asset_type} (Direct CMEK Binding)",
-                    "service_account": f"gcp-cmek-service-agent@{proj_id or 'gcp'}.iam.gserviceaccount.com",
-                    "crypto_usage_pattern": f"Live CAI Direct CMEK Encryption ({r.asset_type})",
-                    "discovery_method": "LIVE_CAI_DIRECT_CMEK_REFERENCE",
-                }
-                direct_cmek_by_key.setdefault(short_lookup, []).append(cmek_consumer)
-    except Exception as exc:
-        logger.debug("Live CAI workload discovery fallback (%s): %s", scope_uri, exc)
-
-    result = {"direct_cmek_by_key": direct_cmek_by_key, "by_project": by_project}
-    _WORKLOAD_CACHE[scope_uri] = result
-    return result
+def _classical_fact_key(algo: str) -> Optional[str]:
+    if algo.startswith("RSA_"):
+        if "4096" in algo:
+            return "RSA_4096"
+        if "3072" in algo:
+            return "RSA_3072"
+        return "RSA_2048"
+    if "P384" in algo:
+        return "EC_P384"
+    if "P256" in algo:
+        return "EC_P256"
+    if "ED25519" in algo:
+        return "ED25519"
+    if "SECP256K1" in algo:
+        return "SECP256K1"
+    return None
 
 
-def _evaluate_application_pqc_compatibility(
-    project_id: Optional[str],
-    key_ring: str,
-    key_name: str,
-    purpose_upper: str,
-    algo_upper: str,
-    quantum_status: str,
-    is_active: bool,
-    labels: Optional[Dict[str, str]] = None,
-    iam_principals: Optional[List[str]] = None,
-    live_workload_index: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Determines which applications/workloads consume the key (via 4-vector live discovery) and evaluates PQC model compatibility."""
-    lookup_key = f"{project_id}/{key_ring}/{key_name}" if project_id else f"{key_ring}/{key_name}"
-    labels_dict = labels or {}
-
-    if not is_active:
+def _cloud_kms_pqc_alternatives(purpose: str, status: str, family: str) -> List[Dict[str, Any]]:
+    """Factual list of Cloud KMS algorithms that provide post-quantum security for the same function."""
+    def _opt(name: str, api_note: str) -> Dict[str, Any]:
+        spec = ALGORITHM_SPECIFICATIONS.get(name, {})
         return {
-            "consuming_applications": [],
-            "pqc_compatibility_verdict": "DECOMMISSIONED_NO_ACTIVE_WORKLOAD",
-            "is_application_pqc_compatible": True,
-            "api_migration_required": "NONE (Key is inactive / scheduled for destruction)",
-            "protocol_and_payload_impact": "None — key has 0 ENABLED versions and is not used by active workloads.",
-            "compatibility_blockers": [],
-            "application_refactoring_steps": [
-                "Verify no legacy configuration references this decommissioned key URI."
-            ],
+            "algorithm": name,
+            "nist_standard": spec.get("nist_standard"),
+            "nist_pqc_security_category": spec.get("nist_pqc_security_category"),
+            "public_key_bytes": spec.get("public_key_bytes"),
+            "ciphertext_or_signature_bytes": spec.get("ciphertext_or_signature_bytes"),
+            "cloud_kms_api_contract": api_note,
         }
 
-    apps: List[Dict[str, str]] = []
-    seen_resources: Set[str] = set()
-
-    # Vector 1: Direct Cloud Asset Inventory CMEK Reference (including cross-project CMEK bindings!)
-    if live_workload_index and lookup_key in live_workload_index.get("direct_cmek_by_key", {}):
-        for direct_app in live_workload_index["direct_cmek_by_key"][lookup_key]:
-            res_uri = direct_app.get("workload_resource", "")
-            if res_uri not in seen_resources:
-                seen_resources.add(res_uri)
-                apps.append(dict(direct_app))
-
-    # Vector 2: Curated Organization Workload Topology + Live CAI Verification
-    if lookup_key in KNOWN_WORKLOAD_BINDINGS:
-        for known_app in KNOWN_WORKLOAD_BINDINGS[lookup_key]:
-            res_uri = known_app.get("workload_resource", "")
-            if res_uri not in seen_resources:
-                seen_resources.add(res_uri)
-                enriched = dict(known_app)
-                enriched.setdefault("discovery_method", "LIVE_CAI_WORKLOAD_AND_IAM_CORRELATION")
-                apps.append(enriched)
-
-    # Vector 3: Dynamic Per-Project CAI Workload & Label / Token Correlation (for newly created keys/projects)
-    if not apps and live_workload_index and project_id:
-        proj_workloads = live_workload_index.get("by_project", {}).get(project_id, [])
-        key_tokens = set((key_name + "-" + key_ring).lower().replace("_", "-").split("-"))
-        for w in proj_workloads:
-            if w["asset_type"] == "iam.googleapis.com/ServiceAccount":
-                continue
-            w_tokens = set(w["display_name"].lower().replace("_", "-").split("-"))
-            if key_tokens.intersection(w_tokens - {"poc", "key", "kr", "kms", "prod", "sec", "apps"}):
-                res_uri = w["name"]
-                if res_uri not in seen_resources:
-                    seen_resources.add(res_uri)
-                    apps.append(
-                        {
-                            "application_name": f"{w['display_name']} ({w['asset_type'].split('/')[-1]})",
-                            "workload_resource": res_uri,
-                            "workload_type": w["asset_type"],
-                            "service_account": (
-                                iam_principals[0]
-                                if iam_principals
-                                else f"default-compute@{project_id}.iam.gserviceaccount.com"
-                            ),
-                            "crypto_usage_pattern": (
-                                f"Direct KMS {purpose_upper} API"
-                                if "ASYMMETRIC" in purpose_upper or "ENCAPSULATION" in purpose_upper
-                                else f"GCP CMEK / {purpose_upper} Integration"
-                            ),
-                            "discovery_method": "DYNAMIC_CAI_TOKEN_CORRELATION",
-                        }
-                    )
-
-    # Vector 4: Key Labels (`app`, `system`, `service`, `workload`) & IAM Principal Fallback
-    if not apps:
-        sys_label = (
-            labels_dict.get("app")
-            or labels_dict.get("system")
-            or labels_dict.get("service")
-            or labels_dict.get("workload")
+    if status == "QUANTUM_VULNERABLE_SHOR" and ("DECRYPT" in purpose or family == "CLASSICAL_RSA" and "SIGN" not in purpose):
+        note = (
+            "KEY_ENCAPSULATION purpose: Encapsulate/Decapsulate a shared secret (KEM). "
+            "AsymmetricDecrypt is not available on KEM keys."
         )
-        w_type = labels_dict.get("workload_type", "GCP Application Workload")
-        if sys_label:
-            apps.append(
-                {
-                    "application_name": f"{sys_label} ({key_name})",
-                    "workload_resource": f"//projects/{project_id or 'gcp'}/workloads/{sys_label}",
-                    "workload_type": w_type,
-                    "service_account": (
-                        iam_principals[0]
-                        if iam_principals
-                        else f"sa-{sys_label}@{project_id or 'gcp'}.iam.gserviceaccount.com"
-                    ),
-                    "crypto_usage_pattern": (
-                        "Direct KMS Asymmetric API"
-                        if "ASYMMETRIC" in purpose_upper or "ENCAPSULATION" in purpose_upper
-                        else "CMEK / Symmetric KMS API"
-                    ),
-                    "discovery_method": "KMS_KEY_LABEL_METADATA",
-                }
-            )
-        else:
-            apps.append(
-                {
-                    "application_name": f"Workload Consuming {key_ring}/{key_name}",
-                    "workload_resource": f"//projects/{project_id or 'gcp'}/locations/global/keyRings/{key_ring}/cryptoKeys/{key_name}",
-                    "workload_type": "Cloud KMS Integrated Service",
-                    "service_account": (
-                        iam_principals[0]
-                        if iam_principals
-                        else f"default-compute@{project_id or 'gcp'}.iam.gserviceaccount.com"
-                    ),
-                    "crypto_usage_pattern": f"Cloud KMS {purpose_upper} API",
-                    "discovery_method": "KMS_IAM_POLICY_FALLBACK",
-                }
-            )
-
-    if iam_principals:
-        for app in apps:
-            app["iam_bound_principals"] = ", ".join(iam_principals[:4])
-
-    # Evaluate PQC Model Compatibility based on algorithm, purpose, and application integration pattern
-    if quantum_status == "APPROVED_PQC":
-        return {
-            "consuming_applications": apps,
-            "pqc_compatibility_verdict": "COMPATIBLE_PQC_NATIVE",
-            "is_application_pqc_compatible": True,
-            "api_migration_required": "NONE (Already using NIST PQC Cloud KMS API)",
-            "protocol_and_payload_impact": (
-                "Application is already engineered for PQC artifact sizes "
-                "(1,120–1,568B KEM ciphertexts or 3,309–7,856B PQC signatures) and PQC KMS APIs."
-            ),
-            "compatibility_blockers": [],
-            "application_refactoring_steps": [
-                "No refactoring required. Application is already operating in the Post-Quantum Cryptography (PQC) model."
-            ],
-        }
-
-    if quantum_status == "SECURE_SYMMETRIC":
-        return {
-            "consuming_applications": apps,
-            "pqc_compatibility_verdict": "COMPATIBLE_ZERO_REFACTORING_CMEK",
-            "is_application_pqc_compatible": True,
-            "api_migration_required": "NONE (Transparent AES-256-GCM CMEK / KMS Encrypt-Decrypt API)",
-            "protocol_and_payload_impact": (
-                "100% PQC-Compatible: AES-256 / SHA-256+ maintains 128 bits of effective post-quantum security "
-                "against Grover's Algorithm. Managed GCP services (BigQuery, Cloud Storage, GKE etcd, Compute Engine, "
-                "Cloud Run) handle CMEK wrapping transparently with zero payload expansion or code changes."
-            ),
-            "compatibility_blockers": [],
-            "application_refactoring_steps": [
-                "No application code changes required. Maintain automatic key rotation <= 90 days (NIST SP 800-57)."
-            ],
-        }
-
-    if quantum_status == "VULNERABLE_CLASSICAL_RSA_ECC" and "DECRYPT" in purpose_upper:
-        return {
-            "consuming_applications": apps,
-            "pqc_compatibility_verdict": "INCOMPATIBLE_REQUIRES_API_AND_HPKE_REFACTORING",
-            "is_application_pqc_compatible": False,
-            "api_migration_required": "BREAKING CHANGE: kms.AsymmetricDecrypt(ciphertext) -> kms.Decapsulate(ciphertext) + HKDF-SHA256 + AES-256-GCM",
-            "protocol_and_payload_impact": (
-                "HIGH ARCHITECTURAL IMPACT: Classical RSA-OAEP encrypts arbitrary small payloads or DEKs directly "
-                "(256-byte ciphertext for RSA-2048). NIST FIPS 203 PQC algorithms (KEM_XWING / ML_KEM_1024) are Key "
-                "Encapsulation Mechanisms (KEM), NOT public-key encryption ciphers. Ciphertext expands from 256 bytes "
-                "to 1,120 bytes (KEM_XWING) or 1,568 bytes (ML_KEM_1024), and the API returns a 32-byte shared_secret "
-                "instead of decrypted plaintext."
-            ),
-            "compatibility_blockers": [
-                "Cloud KMS API Blocker: Existing AsymmetricDecrypt(name, ciphertext) calls fail on KEY_ENCAPSULATION keys; code must invoke Decapsulate(name, ciphertext).",
-                "Cryptographic Data-Flow Blocker: Application can no longer encrypt plaintext directly with the public key; it must implement RFC 9180 HPKE or Envelope Encryption (Encapsulate -> 32B shared_secret -> HKDF-SHA256 -> AES-256-GCM DEK).",
-                "Database/Storage Schema Impact: Encapsulated key ciphertext column/field must accommodate 1,120 bytes (KEM_XWING) or 1,568 bytes (ML_KEM_1024) instead of 256 bytes (RSA-2048).",
-            ],
-            "application_refactoring_steps": [
-                "1. Provision the replacement PQC key with purpose=KEY_ENCAPSULATION and algorithm=KEM_XWING (or ML_KEM_1024).",
-                "2. Update the sender/producer service to encapsulate a 32-byte shared_secret using the KEM public key, derive an AES-256-GCM key via HKDF-SHA256, and encrypt the payload.",
-                "3. Refactor the consumer service from kms_client.asymmetric_decrypt() to kms_client.decapsulate() and unwrap the AES-256-GCM payload.",
-                "4. Expand database/header fields storing wrapped keys from 256B to >= 1,568B.",
-            ],
-        }
-
-    if quantum_status == "VULNERABLE_CLASSICAL_RSA_ECC":
-        is_jwt_or_token = "jwt" in key_name.lower() or "auth" in key_name.lower() or any(
-            "jwt" in a.get("crypto_usage_pattern", "").lower() for a in apps
+        return [_opt("KEM_XWING", note), _opt("ML_KEM_768", note), _opt("ML_KEM_1024", note)]
+    if status == "QUANTUM_VULNERABLE_SHOR":
+        ml_dsa_note = (
+            "ASYMMETRIC_SIGN purpose: pure ML-DSA signs the message data (not a pre-computed digest); "
+            "the *_EXTERNAL_MU variants accept a client-computed message representative."
         )
-        old_sig_bytes = 64 if "EC_" in algo_upper else (512 if "4096" in algo_upper else 256)
-        expansion_factor = round(3309 / old_sig_bytes, 1)
-        blockers = [
-            "Cloud KMS Signing API Blocker (`digest` vs. `data`): Classical RSA/ECDSA AsymmetricSign calls pass a pre-hashed `digest={'sha256': ...}`. Pure `PQ_SIGN_ML_DSA_65` in Cloud KMS hashes internally via SHAKE256 and requires passing `data=raw_message_bytes` (or switching to `PQ_SIGN_ML_DSA_65_EXTERNAL_MU` with a 64-byte SHAKE256 `mu` representative).",
-            f"Signature & Public Key Bloat ({expansion_factor}x larger): Signature grows from {old_sig_bytes} bytes ({algo_upper}) to 3,309 bytes (PQ_SIGN_ML_DSA_65, ~4.4 KB Base64) or 4,627 bytes (PQ_SIGN_ML_DSA_87), and public key grows to 1,952 bytes.",
-            "Cryptographic SDK / Verifier Compatibility: Downstream verifiers using legacy OpenSSL 1.1 / standard JOSE RS256/ES256 libraries cannot verify ML-DSA-65 (FIPS 204) signatures without upgrading to OpenSSL 3.5+ / BoringSSL / Tink PQC.",
+        slh_note = "ASYMMETRIC_SIGN purpose: stateless hash-based signature (large signatures, small public keys)."
+        return [
+            _opt("PQ_SIGN_ML_DSA_44", ml_dsa_note),
+            _opt("PQ_SIGN_ML_DSA_65", ml_dsa_note),
+            _opt("PQ_SIGN_ML_DSA_87", ml_dsa_note),
+            _opt("PQ_SIGN_SLH_DSA_SHA2_128S", slh_note),
         ]
-        if is_jwt_or_token:
-            blockers.insert(
-                0,
-                "HTTP Authorization Header Overflow (JWT Bloat): Replacing RS256/ES256 in Bearer JWTs increases token size by ~4.4 KB per request, exceeding default 4 KB–8 KB HTTP header limits on NGINX, Envoy, Apigee, and Cloud Load Balancers.",
-            )
-
-        return {
-            "consuming_applications": apps,
-            "pqc_compatibility_verdict": "INCOMPATIBLE_REQUIRES_SIGNING_API_SDK_AND_MTU_UPGRADE",
-            "is_application_pqc_compatible": False,
-            "api_migration_required": "BREAKING CHANGE: kms.AsymmetricSign(digest={'sha256': ...}) -> kms.AsymmetricSign(data=raw_bytes) [or SHAKE256 external_mu]",
-            "protocol_and_payload_impact": (
-                f"BREAKING PROTOCOL & PAYLOAD IMPACT: Migrating from {algo_upper} ({old_sig_bytes}-byte signature) "
-                f"to NIST FIPS 204 PQ_SIGN_ML_DSA_65 (3,309-byte signature, 1,952-byte public key) increases signature "
-                f"payload size by {expansion_factor}x and changes the Cloud KMS signing input contract."
-            ),
-            "compatibility_blockers": blockers,
-            "application_refactoring_steps": [
-                "1. Refactor Cloud KMS signing calls from `AsymmetricSignRequest(name=..., digest={'sha256': ...})` to `AsymmetricSignRequest(name=..., data=message_bytes)` (or compute 64-byte SHAKE256 `mu` client-side with `PQ_SIGN_ML_DSA_65_EXTERNAL_MU`).",
-                "2. Upgrade JWT / PKI verification libraries on all consuming microservices to support NIST FIPS 204 (`ML-DSA-65` / `ML-DSA-87`).",
-                "3. Increase `max_header_size` / `large_client_header_buffers` to >= 16 KB on API Gateways, Envoy proxies, and Load Balancers (or switch from fat Bearer JWTs to opaque reference tokens).",
-            ],
-        }
-
-    return {
-        "consuming_applications": apps,
-        "pqc_compatibility_verdict": "INCOMPATIBLE_WEAK_SYMMETRIC_PRIMITIVE",
-        "is_application_pqc_compatible": False,
-        "api_migration_required": "Upgrade key algorithm to GOOGLE_SYMMETRIC_ENCRYPTION (AES-256) or HMAC_SHA256+",
-        "protocol_and_payload_impact": "Grover's Algorithm reduces effective key strength below 128 bits.",
-        "compatibility_blockers": ["Legacy <256-bit key or SHA-1 MAC is non-compliant with NIST SP 800-131A and CNSA 2.0."],
-        "application_refactoring_steps": ["Provision a 256-bit AES or HMAC-SHA256+ key and update the key reference."],
-    }
+    if status == "BELOW_PQ_SECURITY_TARGET":
+        return [
+            {"algorithm": "GOOGLE_SYMMETRIC_ENCRYPTION", "cloud_kms_api_contract": "ENCRYPT_DECRYPT (AES-256-GCM)"},
+            {"algorithm": "HMAC_SHA256", "cloud_kms_api_contract": "MAC (MacSign/MacVerify)"},
+        ]
+    return []
 
 
-def _evaluate_mosca_theorem_risk(
-    key_name: str,
-    purpose_upper: str,
-    algo_upper: str,
-    quantum_status: str,
-    is_active: bool,
-) -> Dict[str, Any]:
-    """Quantifies Post-Quantum risk using Dr. Michele Mosca's Theorem (X + Y > Z) and authoritative 2026 regulatory horizons:
-    - NIST IR 8547 Final (Published Oct 27, 2026, DOI 10.6028/NIST.IR.8547): 2030 Deprecation / 2035 Disallowance.
-    - White House Executive Order 14412 (Issued June 22, 2026) & OMB M-26-15: PQC Key Establishment (FIPS 203) by Dec 31, 2030;
-      PQC Digital Signatures (FIPS 204/205) by Dec 31, 2031; FAR Contractor Compliance & VDP by Dec 31, 2030.
-    - UK NCSC PQC Migration Roadmap: 2028 Discovery & CBOM Plan / 2031 High-Priority Migration / 2035 Full Migration.
+def classify_algorithm(algorithm: str, purpose: str = "") -> Dict[str, Any]:
+    """Returns factual classification of a Cloud KMS algorithm (no recommendations or prose).
 
-    Parameters:
-    - X (shelf_life_years): Required confidentiality or trust validity duration of the protected assets.
-    - Y (migration_time_years): Estimated engineering lead time to refactor KMS APIs, SDKs, and infrastructure.
-    - Z_nist_2030 (4.0 years): Years remaining until NIST IR 8547 & EO 14412 classical deprecation (2030).
-    - Z_crqc_2035 (9.0 years): Years remaining until NIST IR 8547 & UK NCSC classical disallowance / CRQC horizon (2035).
+    Unknown or unrecognized algorithms are classified as `UNKNOWN_REQUIRES_REVIEW` (fail-closed), never as safe.
     """
-    if not is_active:
-        return {
-            "mosca_status": "INACTIVE_KEY_EXEMPT",
-            "x_shelf_life_years": 0.0,
-            "y_migration_refactoring_years": 0.0,
-            "x_plus_y_total_years": 0.0,
-            "z_nist_2030_deprecation_horizon_years": 4.0,
-            "z_crqc_2035_disallowance_horizon_years": 9.0,
-            "mosca_inequality_breached": False,
-            "nist_ir_8547_status": "EXEMPT_INACTIVE_KEY",
-            "eo_14412_and_omb_m_26_15_mandate": "EXEMPT_NO_ENABLED_VERSIONS",
-            "uk_ncsc_milestone_alignment": "EXEMPT_DECOMMISSIONED",
-            "urgency_explanation": "Key is inactive/decommissioned (0 ENABLED versions).",
-        }
+    algo = (algorithm or "").strip().upper()
+    purp = (purpose or "").strip().upper()
+    spec_key = algo.replace("_EXTERNAL_MU", "")
+    flags: List[str] = []
+    if "SHA1" in algo:
+        flags.append("SHA1_DEPRECATED_HASH")
+    if "RAW_PKCS1" in algo:
+        flags.append("RAW_PKCS1_SIGNATURE_WITHOUT_HASH_ENCODING")
 
-    if quantum_status in ("APPROVED_PQC", "SECURE_SYMMETRIC"):
-        return {
-            "mosca_status": "QUANTUM_SAFE_MOSCA_IMMUNE",
-            "x_shelf_life_years": 10.0,
-            "y_migration_refactoring_years": 0.0,
-            "x_plus_y_total_years": 10.0,
-            "z_nist_2030_deprecation_horizon_years": 4.0,
-            "z_crqc_2035_disallowance_horizon_years": 9.0,
-            "mosca_inequality_breached": False,
-            "nist_ir_8547_status": "COMPLIANT_NIST_IR_8547_FINAL_OCT_2026",
-            "eo_14412_and_omb_m_26_15_mandate": "COMPLIANT_EO_14412_AND_OMB_M_26_15",
-            "uk_ncsc_milestone_alignment": "COMPLIANT_UK_NCSC_2028_2031_2035",
-            "urgency_explanation": (
-                f"Algorithm ({algo_upper}) is already quantum-resistant (immune to Shor's Algorithm and >= 128-bit Grover-resilient); "
-                "Y = 0 years migration needed."
-            ),
-        }
+    pq_bits: Optional[int] = None
+    nist_reference: Optional[str] = None
+    if not algo or algo in ("UNKNOWN", "UNKNOWN_ALGORITHM", "CRYPTO_KEY_VERSION_ALGORITHM_UNSPECIFIED"):
+        family, status, threat = "UNKNOWN", "UNKNOWN_REQUIRES_REVIEW", "UNKNOWN"
+    elif any(t in algo for t in ("ML_KEM", "KEM_XWING", "XWING")):
+        family = "HYBRID_PQC_KEM" if "XWING" in algo else "PQC_KEM"
+        status, threat = "QUANTUM_SAFE_PQC", "NO_KNOWN_EFFICIENT_QUANTUM_ATTACK"
+        nist_reference = "NIST FIPS 203"
+    elif any(t in algo for t in ("ML_DSA", "SLH_DSA", "PQ_SIGN")):
+        family, status, threat = "PQC_SIGNATURE", "QUANTUM_SAFE_PQC", "NO_KNOWN_EFFICIENT_QUANTUM_ATTACK"
+        nist_reference = "NIST FIPS 205" if "SLH_DSA" in algo else "NIST FIPS 204"
+    elif algo.startswith("RSA_"):
+        family, status, threat = "CLASSICAL_RSA", "QUANTUM_VULNERABLE_SHOR", "SHOR_INTEGER_FACTORIZATION"
+        pq_bits = 0
+    elif algo.startswith("EC_SIGN") or "ED25519" in algo or "SECP256K1" in algo:
+        family, status, threat = "CLASSICAL_ECC", "QUANTUM_VULNERABLE_SHOR", "SHOR_ELLIPTIC_CURVE_DISCRETE_LOG"
+        pq_bits = 0
+    elif algo == "GOOGLE_SYMMETRIC_ENCRYPTION" or algo.startswith("AES_256"):
+        family, status, threat = "SYMMETRIC_AES_256", "QUANTUM_RESISTANT_SYMMETRIC", "GROVER_QUADRATIC_SPEEDUP"
+        pq_bits = 128
+    elif algo.startswith("AES_128"):
+        family, status, threat = "SYMMETRIC_AES_128", "BELOW_PQ_SECURITY_TARGET", "GROVER_QUADRATIC_SPEEDUP"
+        pq_bits = 64
+    elif algo.startswith("HMAC_"):
+        family, threat = "MAC_HMAC", "GROVER_QUADRATIC_SPEEDUP"
+        key_bits = {"HMAC_SHA1": 160, "HMAC_SHA224": 224, "HMAC_SHA256": 256, "HMAC_SHA384": 384, "HMAC_SHA512": 512}
+        bits = key_bits.get(algo)
+        pq_bits = min(bits // 2, 256) if bits else None
+        status = "QUANTUM_RESISTANT_SYMMETRIC" if (pq_bits or 0) >= 128 else "BELOW_PQ_SECURITY_TARGET"
+        if bits is None:
+            status = "UNKNOWN_REQUIRES_REVIEW"
+    elif algo == "EXTERNAL_SYMMETRIC_ENCRYPTION":
+        family, status, threat = "EXTERNAL_KEY_MANAGER", "UNKNOWN_REQUIRES_REVIEW", "DEPENDS_ON_EXTERNAL_KEY_MANAGER"
+        flags.append("KEY_MATERIAL_MANAGED_OUTSIDE_GOOGLE_CLOUD")
+    else:
+        family, status, threat = "UNRECOGNIZED", "UNKNOWN_REQUIRES_REVIEW", "UNKNOWN"
 
-    z_2030 = 4.0
-    z_2035 = 9.0
-
-    if "DECRYPT" in purpose_upper:
-        x_years = 10.0
-        y_years = 2.0
-        total_xy = round(x_years + y_years, 1)
-        overrun_2035 = round(total_xy - z_2035, 1)
-        return {
-            "mosca_status": "CRITICAL_MOSCA_BREACH_ACTIVE_HNDL",
-            "x_shelf_life_years": x_years,
-            "y_migration_refactoring_years": y_years,
-            "x_plus_y_total_years": total_xy,
-            "z_nist_2030_deprecation_horizon_years": z_2030,
-            "z_crqc_2035_disallowance_horizon_years": z_2035,
-            "mosca_inequality_breached": True,
-            "nist_ir_8547_status": "NON_COMPLIANT_DEPRECATED_2030_DISALLOWED_2035 (NIST IR 8547 Final, Oct 2026)",
-            "eo_14412_and_omb_m_26_15_mandate": (
-                "EO 14412 Sec. 4(b)(ii) & OMB M-26-15: Mandatory transition to PQC Key Establishment (FIPS 203) by Dec 31, 2030"
-            ),
-            "uk_ncsc_milestone_alignment": "UK NCSC 2028 (Discovery/CBOM) & 2031 (High-Priority HNDL Migration)",
-            "urgency_explanation": (
-                f"MOSCA INEQUALITY BREACHED (X={x_years}y confidentiality + Y={y_years}y API/HPKE refactoring = {total_xy}y > Z_2035={z_2035}y): "
-                f"Ciphertexts captured today remain confidential-sensitive {overrun_2035} years past the 2035 CRQC disallowance horizon "
-                "('Harvest Now, Decrypt Later' breach is active TODAY under NIST IR 8547 Final & EO 14412 Sec. 4(b)(ii))."
-            ),
-        }
-
-    # Classical signing keys (RSA / ECDSA / Ed25519)
-    is_long_lived = any(t in key_name.lower() for t in ("root", "ca", "firmware", "contract", "archive", "doc"))
-    x_years = 10.0 if is_long_lived else 3.0
-    y_years = 1.5
-    total_xy = round(x_years + y_years, 1)
-    overrun_2030 = round(total_xy - z_2030, 1)
-    return {
-        "mosca_status": "HIGH_MOSCA_BREACH_NIST_2030_DEADLINE",
-        "x_shelf_life_years": x_years,
-        "y_migration_refactoring_years": y_years,
-        "x_plus_y_total_years": total_xy,
-        "z_nist_2030_deprecation_horizon_years": z_2030,
-        "z_crqc_2035_disallowance_horizon_years": z_2035,
-        "mosca_inequality_breached": total_xy > z_2030,
-        "nist_ir_8547_status": "NON_COMPLIANT_DEPRECATED_2030_DISALLOWED_2035 (NIST IR 8547 Final, Oct 2026)",
-        "eo_14412_and_omb_m_26_15_mandate": (
-            "EO 14412 Sec. 4(b)(iii) & OMB M-26-15: Mandatory transition to PQC Digital Signatures (FIPS 204/205) by Dec 31, 2031 (NIST 2030 Deprecation)"
-        ),
-        "uk_ncsc_milestone_alignment": "UK NCSC 2028 (Discovery/CBOM), 2031 (High-Priority PKI/Auth) & 2035 (Full Disallowance)",
-        "urgency_explanation": (
-            f"MOSCA DEADLINE BREACHED AGAINST NIST IR 8547 FINAL & EO 14412 (X={x_years}y trust validity + Y={y_years}y KMS API/MTU refactoring = {total_xy}y > Z_2030={z_2030}y): "
-            f"Exceeds the 2030 NIST IR 8547 classical signature deprecation deadline by +{overrun_2030} years."
-        ),
+    facts: Dict[str, Any] = {
+        "algorithm": algo or "UNKNOWN",
+        "algorithm_family": family,
+        "quantum_status": status,
+        "quantum_threat_model": threat,
+        "estimated_post_quantum_security_bits": pq_bits,
+        "nist_reference": nist_reference,
+        "deprecated_primitive_flags": flags,
     }
+    spec = ALGORITHM_SPECIFICATIONS.get(spec_key)
+    if spec:
+        facts["nist_reference"] = spec["nist_standard"]
+        facts["nist_pqc_security_category"] = spec["nist_pqc_security_category"]
+        facts["artifact_sizes_bytes"] = {
+            "public_key": spec["public_key_bytes"],
+            "ciphertext_or_signature": spec["ciphertext_or_signature_bytes"],
+        }
+    classical_key = _classical_fact_key(algo) if family in ("CLASSICAL_RSA", "CLASSICAL_ECC") else None
+    if classical_key:
+        cfacts = CLASSICAL_ALGORITHM_FACTS[classical_key]
+        facts["classical_security_bits"] = cfacts["classical_security_bits"]
+        facts["artifact_sizes_bytes"] = {"ciphertext_or_signature": cfacts["signature_or_ciphertext_bytes"]}
+    facts["cloud_kms_pqc_alternatives"] = _cloud_kms_pqc_alternatives(purp, status, family)
+    return facts
 
 
-def classify_crypto_key(
+# ---------------------------------------------------------------------------
+# Cloud KMS key records (facts only)
+# ---------------------------------------------------------------------------
+
+
+def build_key_record(
+    *,
+    project_id: str,
+    location: str,
     key_ring: str,
     key_name: str,
     purpose: str,
     algorithm: str,
-    location: str = "global",
     protection_level: str = "SOFTWARE",
     rotation_period_days: Optional[int] = None,
     labels: Optional[Dict[str, str]] = None,
-    project_id: Optional[str] = None,
     primary_state: Optional[str] = "ENABLED",
-    enabled_versions_count: int = 1,
     enabled_version_ids: Optional[List[str]] = None,
-    version_algorithms_mismatch: bool = False,
-    iam_principals: Optional[List[str]] = None,
-    live_workload_index: Optional[Dict[str, Any]] = None,
+    enabled_version_algorithms: Optional[List[str]] = None,
+    iam_bindings: Optional[List[Dict[str, Any]]] = None,
+    next_rotation_time: Optional[str] = None,
+    create_time: Optional[str] = None,
+    versions_listing_error: Optional[str] = None,
+    iam_listing_error: Optional[str] = None,
+    data_source: str = LIVE_DATA_SOURCE,
 ) -> Dict[str, Any]:
-    """Strictly classifies a Cloud KMS key and evaluates consuming application PQC compatibility."""
-    algo_upper = (algorithm or "UNKNOWN").upper()
+    """Builds a factual Cloud KMS key record used by every downstream tool."""
     purpose_upper = (purpose or "UNKNOWN").upper()
-    prot_upper = (protection_level or "SOFTWARE").upper()
+    template_algo = (algorithm or "UNKNOWN").upper()
+    version_algos = sorted({a.upper() for a in (enabled_version_algorithms or []) if a})
+    primary = (primary_state or "NO_PRIMARY").upper()
 
-    # 1. Key Lifecycle Verification (Active vs. Destroyed/Disabled keys without ENABLED versions)
-    is_active = enabled_versions_count > 0 and (primary_state or "").upper() not in (
-        "DESTROYED",
-        "DESTROY_SCHEDULED",
-        "DISABLED",
-    )
-    lifecycle_status = "ACTIVE" if is_active else f"INACTIVE_NO_ENABLED_VERSIONS ({primary_state or 'NO_PRIMARY'})"
-
-    # 2. Post-Quantum Algorithm Detection (NIST FIPS 203 / 204 / 205 / SP 800-208)
-    is_pqc = any(
-        token in algo_upper
-        for token in (
-            "PQ_",
-            "ML_KEM",
-            "ML_DSA",
-            "SLH_DSA",
-            "KEM_XWING",
-            "XWING",
-            "KYBER",
-            "DILITHIUM",
-            "SPHINCS",
-            "LMS",
-            "XMSS",
-        )
-    )
-
-    # 3. Classical Asymmetric Algorithm Detection (RSA / ECC / Ed25519 / secp256k1)
-    is_asymmetric = any(
-        token in purpose_upper for token in ("ASYMMETRIC", "KEY_ENCAPSULATION")
-    ) or any(
-        token in algo_upper for token in ("RSA_", "EC_", "ECDSA", "ED25519", "SECP256K1")
-    )
-
-    # 4. Deprecated Classical Primitives Detection (SHA-1, Raw PKCS#1 v1.5, 128-bit, SHA-224)
-    uses_deprecated_sha1 = "SHA1" in algo_upper
-    uses_raw_pkcs1 = "RAW_PKCS1" in algo_upper
-    uses_weak_grover_bits = any(t in algo_upper for t in ("128", "SHA1", "SHA224"))
-
-    spec_key = algo_upper.replace("_EXTERNAL_MU", "")
-    algo_spec = ALGORITHM_SPECIFICATIONS.get(spec_key, {})
-
-    hygiene_status = "COMPLIANT"
-    hygiene_findings: List[str] = []
-    engineering_notes: List[str] = []
-
-    if not is_active:
-        hygiene_status = "INACTIVE_KEY_DECOMMISSIONED"
-        hygiene_findings.append(
-            f"Key has no active ENABLED versions (primary state: {primary_state}). Excluded from active PQC Readiness Score calculation."
-        )
-
-    if version_algorithms_mismatch:
-        hygiene_status = "WARNING_MIXED_VERSION_ALGORITHMS"
-        hygiene_findings.append(
-            "Downgrade Risk: Multiple ENABLED versions with mismatched algorithms exist on the same CryptoKey."
-        )
-
-    if is_pqc:
-        status = "APPROVED_PQC"
-        threat_vector = "NONE_QUANTUM_RESISTANT"
-        priority = "LOW"
-        nist_standard = algo_spec.get("nist_standard", "NIST FIPS 203/204/205 PQC Approved")
-        nist_category = algo_spec.get("nist_security_category", "Category 3+")
-        cnsa_compliance = algo_spec.get("cnsa_2_0_status", "FIPS_PQC_APPROVED")
-        recommended_target = algo_upper
-        remediation_guidance = (
-            f"No algorithm migration required. Key already uses an approved Post-Quantum algorithm ({nist_standard})."
-        )
-        if "EXTERNAL_MU" in algo_upper:
-            engineering_notes.append(
-                "External-Mu mode enabled: the 64-byte message representative (mu) must be pre-computed client-side using SHAKE256 prior to invoking AsymmetricSign."
-            )
-    elif is_asymmetric and not is_pqc:
-        status = "VULNERABLE_CLASSICAL_RSA_ECC"
-        threat_vector = "SHOR_ALGORITHM_POLYNOMIAL_BREAK"
-        nist_category = "0 bits (Completely broken by a Cryptographically Relevant Quantum Computer - CRQC)"
-        cnsa_compliance = "NON_COMPLIANT_SHOR_VULNERABLE"
-
-        if "DECRYPT" in purpose_upper:
-            priority = "CRITICAL"
-            nist_standard = "NIST FIPS 203 (ML-KEM-768 / ML-KEM-1024) & Hybrid KEM_XWING"
-            recommended_target = "KEM_XWING (or ML_KEM_1024 for CNSA 2.0)"
-            extra_warn = ""
-            if uses_deprecated_sha1:
-                extra_warn = " [DUAL ALERT: Uses SHA-1 hash deprecated by NIST SP 800-131A!]"
-            remediation_guidance = (
-                f"CRITICAL 'Harvest Now, Decrypt Later' (HNDL) risk.{extra_warn} Classical asymmetric decryption "
-                f"({algo_upper}) is broken in polynomial time by Shor's Algorithm, exposing confidential ciphertexts "
-                "captured today to retroactive decryption. Migrate immediately to KEM_XWING (Hybrid X25519 + ML-KEM-768) "
-                "or ML_KEM_1024 (FIPS 203 Category 5 / CNSA 2.0)."
-            )
-            engineering_notes.extend(
-                [
-                    "Mandatory API & Purpose Architecture Change: In Cloud KMS, RSA decryption keys (purpose=ASYMMETRIC_DECRYPT, API AsymmetricDecrypt) CANNOT be converted in-place to KEM. You must provision a new key with purpose=KEY_ENCAPSULATION and refactor the application to call the Decapsulate API.",
-                    "HPKE / Envelope Encryption Pattern: KEM algorithms (KEM_XWING / ML-KEM) encapsulate a 32-byte shared secret rather than encrypting arbitrary plaintext payloads directly. Pass the shared_secret through HKDF-SHA256 to derive an AES-256-GCM Data Encryption Key (DEK).",
-                    "Downgrade Prevention: After completing data re-encapsulation, disable and schedule destruction of the legacy RSA key version (gcloud kms keys versions disable 1).",
-                ]
-            )
-        else:
-            priority = "HIGH"
-            nist_standard = "NIST FIPS 204 (ML-DSA-65 / ML-DSA-87) or FIPS 205 (SLH-DSA)"
-            recommended_target = "PQ_SIGN_ML_DSA_65 (or PQ_SIGN_ML_DSA_87 for CNSA 2.0)"
-            extra_warn = ""
-            if uses_raw_pkcs1:
-                extra_warn = " [IMMEDIATE CLASSICAL RISK: RSA_SIGN_RAW_PKCS1 without hash/PSS padding is vulnerable to classical Bleichenbacher forgery attacks!]"
-            remediation_guidance = (
-                f"HIGH risk of digital signature forgery and PKI identity compromise ({algo_upper} is broken by "
-                f"Shor's Algorithm).{extra_warn} Migrate to PQ_SIGN_ML_DSA_65 (FIPS 204 Category 3), "
-                "PQ_SIGN_ML_DSA_87 (FIPS 204 Category 5 / CNSA 2.0), or PQ_SIGN_SLH_DSA_SHA2_128S (FIPS 205 for Root CAs/firmware)."
-            )
-            engineering_notes.extend(
-                [
-                    "Signature & Public Key Size Impact (MTU / HTTP Headers / JWT): Whereas ECDSA P-256 produces 64-byte signatures and RSA-2048 produces 256-byte signatures, PQ_SIGN_ML_DSA_65 produces 3,309-byte signatures (~4.4 KB in Base64) and 1,952-byte public keys.",
-                    "API Gateway & Proxy Header Limit Verification: If this key signs JWT/OAuth tokens (e.g., jwt-signing), verify HTTP header size limits (max_header_size >= 16 KB) on Cloud Armor, Apigee, Envoy, and Cloud Load Balancers before production cutover.",
-                ]
-            )
-            if prot_upper == "HSM":
-                engineering_notes.append(
-                    "HSM Protection Level Compatibility: This legacy key uses protection_level=HSM. Verify regional Cloud HSM support for PQC algorithms or use protection_level=software according to your FIPS 140-3 compliance matrix."
-                )
-    elif uses_weak_grover_bits:
-        status = "WEAK_SYMMETRIC_GROVER_RISK"
-        threat_vector = "GROVER_ALGORITHM_QUADRATIC_SPEEDUP"
-        priority = "HIGH" if uses_deprecated_sha1 else "MEDIUM"
-        nist_standard = "NSA CNSA 2.0 & NIST SP 800-131A (AES-256 / HMAC-SHA256+)"
-        nist_category = "< 128 bits of effective post-quantum security (Insufficient against Grover's Algorithm)"
-        cnsa_compliance = "NON_COMPLIANT_KEY_SIZE_OR_HASH"
-        recommended_target = "GOOGLE_SYMMETRIC_ENCRYPTION (AES-256) / HMAC_SHA256+"
-        remediation_guidance = (
-            f"Grover's Algorithm halves effective symmetric/hash bit security ({algo_upper} drops below the 128-bit "
-            "post-quantum threshold, or relies on deprecated SHA-1). Migrate immediately to AES-256 "
-            "(GOOGLE_SYMMETRIC_ENCRYPTION) or HMAC_SHA256 / HMAC_SHA384 / HMAC_SHA512."
-        )
+    if versions_listing_error:
+        # Version listing failed: derive activity from the primary version state and say so explicitly.
+        is_active = primary == "ENABLED"
     else:
-        status = "SECURE_SYMMETRIC"
-        threat_vector = "GROVER_RESILIENT_256BIT"
-        priority = "LOW"
-        nist_standard = "NSA CNSA 2.0 Compliant (AES-256-GCM / SHA-256+)"
-        nist_category = "128 bits of effective post-quantum security (256 classical bits / 2 via Grover)"
-        cnsa_compliance = "CNSA_2_0_COMPLIANT_ALGORITHM"
-        recommended_target = algo_upper
+        is_active = bool(enabled_version_ids) and primary not in ("DESTROYED", "DESTROY_SCHEDULED", "DISABLED")
 
-        # Cryptographic Hygiene & Key Rotation Check (NIST SP 800-57 & CIS GCP Benchmark 1.10)
-        if "ENCRYPT" in purpose_upper and is_active:
-            if rotation_period_days is None:
-                hygiene_status = "NON_COMPLIANT_NO_ROTATION"
-                hygiene_findings.append(
-                    "No automatic key rotation configured (rotation_period=None). Violates CIS GCP Benchmark 1.10 and NIST SP 800-57 (recommended <= 90 days to bound cryptoperiod and data volume per key version)."
-                )
-                remediation_guidance = (
-                    "AES-256 (GOOGLE_SYMMETRIC_ENCRYPTION) is mathematically resistant to Grover's Algorithm (128 effective bits), "
-                    "HOWEVER this key has NO automatic rotation schedule configured! Configure periodic rotation "
-                    "(<= 90 days) to enforce cryptoperiod bounds per NIST SP 800-57."
-                )
-            elif rotation_period_days > 90:
-                hygiene_status = "WARNING_ROTATION_EXCEEDS_90D"
-                hygiene_findings.append(
-                    f"Current rotation period ({rotation_period_days} days) exceeds the 90-day best-practice threshold (CIS GCP 1.10)."
-                )
-                remediation_guidance = (
-                    f"AES-256 algorithm is Grover-resilient, but reducing the rotation period from {rotation_period_days}d to <= 90d is recommended."
-                )
-            else:
-                hygiene_status = "COMPLIANT_ROTATION_90D"
-                remediation_guidance = (
-                    f"AES-256 symmetric key is fully post-quantum compliant (Grover-resilient) with active automatic rotation ({rotation_period_days} days)."
-                )
-        else:
-            remediation_guidance = (
-                "Symmetric/MAC key is quantum-resistant (maintains >= 128 bits of effective security against Grover's Algorithm)."
-            )
+    # Classify the weakest algorithm among the template and enabled versions (downgrade-aware).
+    candidates = [template_algo] + [a for a in version_algos if a != template_algo]
+    classified = [classify_algorithm(a, purpose_upper) for a in candidates]
+    effective = min(classified, key=lambda f: QUANTUM_STATUS_RANK.get(f["quantum_status"], 1))
 
-    app_compat = _evaluate_application_pqc_compatibility(
-        project_id=project_id,
-        key_ring=key_ring,
-        key_name=key_name,
-        purpose_upper=purpose_upper,
-        algo_upper=algo_upper,
-        quantum_status=status,
-        is_active=is_active,
-        labels=labels,
-        iam_principals=iam_principals,
-        live_workload_index=live_workload_index,
-    )
+    hygiene_flags: Dict[str, Any] = {}
+    if effective["algorithm_family"] in SYMMETRIC_FAMILIES and purpose_upper == "ENCRYPT_DECRYPT":
+        hygiene_flags = {
+            "rotation_configured": rotation_period_days is not None,
+            "rotation_period_days": rotation_period_days,
+            "rotation_within_90_days": (rotation_period_days is not None and rotation_period_days <= 90),
+        }
 
-    mosca_analysis = _evaluate_mosca_theorem_risk(
-        key_name=key_name,
-        purpose_upper=purpose_upper,
-        algo_upper=algo_upper,
-        quantum_status=status,
-        is_active=is_active,
-    )
-
-    item: Dict[str, Any] = {
+    record: Dict[str, Any] = {
+        "project_id": project_id,
+        "location": location,
         "key_ring": key_ring,
         "key_name": key_name,
-        "location": location,
+        "resource_name": f"projects/{project_id}/locations/{location}/keyRings/{key_ring}/cryptoKeys/{key_name}",
         "purpose": purpose_upper,
-        "algorithm": algo_upper,
-        "protection_level": prot_upper,
-        "lifecycle_status": lifecycle_status,
+        "template_algorithm": template_algo,
+        "enabled_version_algorithms": version_algos,
+        "version_algorithms_mismatch": len(set(candidates)) > 1 and bool(version_algos),
+        "effective_algorithm": effective["algorithm"],
+        "algorithm_facts": effective,
+        "protection_level": (protection_level or "SOFTWARE").upper(),
+        "primary_state": primary,
+        "enabled_version_ids": list(enabled_version_ids or []),
         "is_active": is_active,
-        "enabled_versions_count": enabled_versions_count,
-        "enabled_version_ids": enabled_version_ids if enabled_version_ids is not None else (["1"] if is_active else []),
         "rotation_period_days": rotation_period_days,
-        "hygiene_status": hygiene_status,
-        "hygiene_findings": hygiene_findings,
-        "quantum_status": status,
-        "priority": priority,
-        "threat_vector": threat_vector,
-        "nist_standard_target": nist_standard,
-        "nist_security_category": nist_category,
-        "cnsa_2_0_compliance": cnsa_compliance,
-        "recommended_algorithm": recommended_target,
-        "remediation_guidance": remediation_guidance,
-        "engineering_notes": engineering_notes,
-        "mosca_risk_analysis": mosca_analysis,
-        "consuming_applications": app_compat["consuming_applications"],
-        "pqc_application_compatibility": {
-            "verdict": app_compat["pqc_compatibility_verdict"],
-            "is_compatible_with_pqc_model": app_compat["is_application_pqc_compatible"],
-            "api_migration_required": app_compat["api_migration_required"],
-            "protocol_and_payload_impact": app_compat["protocol_and_payload_impact"],
-            "compatibility_blockers": app_compat["compatibility_blockers"],
-            "application_refactoring_steps": app_compat["application_refactoring_steps"],
-        },
-        "labels": labels or {},
+        "next_rotation_time": next_rotation_time,
+        "create_time": create_time,
+        "hygiene_flags": hygiene_flags,
+        "labels": dict(labels or {}),
+        "iam_bindings": list(iam_bindings or []),
+        "data_source": data_source,
     }
-    if algo_spec:
-        item["pqc_artifact_sizes_bytes"] = {
-            "public_key_bytes": algo_spec.get("public_key_bytes"),
-            "ciphertext_or_signature_bytes": algo_spec.get("ciphertext_or_signature_bytes"),
-        }
-    if project_id:
-        item["project_id"] = project_id
-    return item
+    if versions_listing_error:
+        record["versions_listing_error"] = versions_listing_error
+    if iam_listing_error:
+        record["iam_listing_error"] = iam_listing_error
+    return record
 
 
-def _discover_kms_targets_via_cai(scope_uri: str) -> List[Tuple[str, str]]:
-    """Discovers all (project_id, location_id) pairs containing KeyRings/CryptoKeys within an Org, Folder, or Project scope."""
-    targets: Set[Tuple[str, str]] = set()
+def _ts_to_iso(ts: Any) -> Optional[str]:
+    if not ts:
+        return None
     try:
-        cai_client = asset_v1.AssetServiceClient(**_get_client_kwargs())
-        response = cai_client.search_all_resources(
-            request={
-                "scope": scope_uri,
-                "asset_types": [
-                    "cloudkms.googleapis.com/KeyRing",
-                    "cloudkms.googleapis.com/CryptoKey",
-                ],
-                "page_size": 500,
-            }
-        )
-        for resource in response:
-            parts = resource.name.split("/")
-            if len(parts) >= 7 and parts[3] == "projects" and parts[5] == "locations":
-                proj_id = parts[4]
-                loc_id = parts[6]
-                targets.add((proj_id, loc_id))
-            elif scope_uri.startswith("projects/") and resource.location:
-                proj_id = scope_uri.split("/", 1)[1]
-                targets.add((proj_id, resource.location))
-    except Exception as exc:
-        logger.debug("Cloud Asset Inventory KMS target discovery fallback (%s): %s", scope_uri, exc)
-
-    if not targets and scope_uri.startswith("projects/"):
-        proj_id = scope_uri.split("/", 1)[1]
-        targets.add((proj_id, "global"))
-
-    return sorted(targets)
+        return ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
+    except Exception:
+        return None
 
 
 def _inspect_single_kms_key(
@@ -1162,87 +514,67 @@ def _inspect_single_kms_key(
     location_id: str,
     kr_short_name: str,
     key: Any,
-    live_workload_index: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Inspects a single Cloud KMS CryptoKey (versions + IAM policy) and classifies its PQC posture and app compatibility."""
+    """Reads one CryptoKey (template, versions, rotation, labels, IAM bindings) and returns a factual record."""
     purpose = key.purpose.name if hasattr(key.purpose, "name") else str(key.purpose)
-    template_algo = (
-        key.version_template.algorithm.name
-        if key.version_template and hasattr(key.version_template.algorithm, "name")
-        else "UNKNOWN_ALGORITHM"
-    )
-    protection_level = (
-        key.version_template.protection_level.name
-        if key.version_template and hasattr(key.version_template.protection_level, "name")
-        else "SOFTWARE"
-    )
-    rotation_days = None
+    template = key.version_template
+    template_algo = template.algorithm.name if template and hasattr(template.algorithm, "name") else "UNKNOWN_ALGORITHM"
+    protection = template.protection_level.name if template and hasattr(template.protection_level, "name") else "UNKNOWN"
+
+    rotation_days: Optional[int] = None
     if key.rotation_period:
-        total_secs = (
+        secs = (
             key.rotation_period.total_seconds()
             if hasattr(key.rotation_period, "total_seconds")
             else getattr(key.rotation_period, "seconds", 0)
         )
-        if total_secs and total_secs > 0:
-            rotation_days = int(total_secs // 86400)
+        if secs and secs > 0:
+            rotation_days = int(secs // 86400)
 
-    primary_state = (
-        key.primary.state.name
-        if key.primary and hasattr(key.primary.state, "name")
-        else "NO_PRIMARY"
-    )
+    primary_state = key.primary.state.name if key.primary and hasattr(key.primary.state, "name") else "NO_PRIMARY"
 
-    enabled_version_ids: List[str] = []
-    enabled_algos: Set[str] = set()
+    enabled_ids: List[str] = []
+    enabled_algos: List[str] = []
+    versions_error: Optional[str] = None
     try:
-        versions = client.list_crypto_key_versions(request={"parent": key.name})
-        for ver in versions:
-            v_state = ver.state.name if hasattr(ver.state, "name") else str(ver.state)
-            if v_state == "ENABLED":
-                enabled_version_ids.append(ver.name.split("/")[-1])
-                v_algo = ver.algorithm.name if hasattr(ver.algorithm, "name") else str(ver.algorithm)
-                if v_algo:
-                    enabled_algos.add(v_algo)
-    except Exception as ver_exc:
-        logger.debug("Version listing fallback for %s: %s", key.name, ver_exc)
-        if primary_state == "ENABLED":
-            enabled_version_ids = ["1"]
+        for ver in client.list_crypto_key_versions(request={"parent": key.name}):
+            state = ver.state.name if hasattr(ver.state, "name") else str(ver.state)
+            if state == "ENABLED":
+                enabled_ids.append(ver.name.split("/")[-1])
+                algo = ver.algorithm.name if hasattr(ver.algorithm, "name") else str(ver.algorithm)
+                if algo:
+                    enabled_algos.append(algo)
+    except Exception as exc:
+        versions_error = f"{type(exc).__name__}: {str(exc)[:200]}"
 
-    iam_principals: List[str] = []
+    bindings: List[Dict[str, Any]] = []
+    iam_error: Optional[str] = None
     try:
         policy = client.get_iam_policy(request={"resource": key.name})
         for binding in policy.bindings:
-            for member in binding.members:
-                if member not in iam_principals:
-                    iam_principals.append(member)
-    except Exception:
-        pass
+            members = list(binding.members)
+            bindings.append({"role": binding.role, "members": members[:25], "member_count": len(members)})
+    except Exception as exc:
+        iam_error = f"{type(exc).__name__}: {str(exc)[:200]}"
 
-    effective_algorithm = template_algo
-    version_mismatch = False
-    if len(enabled_algos) > 1 or (enabled_algos and template_algo not in enabled_algos):
-        version_mismatch = True
-        for ea in enabled_algos:
-            if any(t in ea.upper() for t in ("RSA_", "EC_", "SHA1", "128")):
-                effective_algorithm = ea
-                break
-
-    return classify_crypto_key(
+    return build_key_record(
         project_id=project_id,
+        location=location_id,
         key_ring=kr_short_name,
         key_name=key.name.split("/")[-1],
         purpose=purpose,
-        algorithm=effective_algorithm,
-        location=location_id,
-        protection_level=protection_level,
+        algorithm=template_algo,
+        protection_level=protection,
         rotation_period_days=rotation_days,
         labels=dict(key.labels) if key.labels else {},
         primary_state=primary_state,
-        enabled_versions_count=len(enabled_version_ids),
-        enabled_version_ids=enabled_version_ids,
-        version_algorithms_mismatch=version_mismatch,
-        iam_principals=iam_principals,
-        live_workload_index=live_workload_index,
+        enabled_version_ids=enabled_ids,
+        enabled_version_algorithms=enabled_algos,
+        iam_bindings=bindings,
+        next_rotation_time=_ts_to_iso(getattr(key, "next_rotation_time", None)),
+        create_time=_ts_to_iso(getattr(key, "create_time", None)),
+        versions_listing_error=versions_error,
+        iam_listing_error=iam_error,
     )
 
 
@@ -1250,1600 +582,725 @@ def _scan_kms_location(
     client: kms_v1.KeyManagementServiceClient,
     project_id: str,
     location_id: str,
-    live_workload_index: Optional[Dict[str, Any]] = None,
+    skipped_key_rings: List[str],
 ) -> List[Dict[str, Any]]:
-    """Lists and classifies all Cloud KMS keys, active `CryptoKeyVersions`, and consuming applications in a project/region in parallel."""
+    """Lists every CryptoKey in a project/location and inspects them in parallel."""
     parent = f"projects/{project_id}/locations/{location_id}"
+    excluded = excluded_key_rings()
     key_tasks: List[Tuple[str, Any]] = []
-
-    key_rings = client.list_key_rings(request={"parent": parent})
-    for key_ring in key_rings:
-        kr_short_name = key_ring.name.split("/")[-1]
-        if kr_short_name == "kr-pqc-audit-lab":
+    for key_ring in client.list_key_rings(request={"parent": parent}):
+        kr_short = key_ring.name.split("/")[-1]
+        if kr_short in excluded:
+            skipped_key_rings.append(f"{project_id}/{location_id}/{kr_short}")
             continue
-        crypto_keys = client.list_crypto_keys(request={"parent": key_ring.name})
-        for key in crypto_keys:
-            key_tasks.append((kr_short_name, key))
+        for key in client.list_crypto_keys(request={"parent": key_ring.name}):
+            key_tasks.append((kr_short, key))
 
     if not key_tasks:
         return []
-
-    findings: List[Dict[str, Any]] = []
-    max_workers = min(8, len(key_tasks))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(key_tasks))) as executor:
         futures = [
-            executor.submit(
-                _inspect_single_kms_key,
-                client,
-                project_id,
-                location_id,
-                kr_short,
-                key_obj,
-                live_workload_index,
-            )
-            for kr_short, key_obj in key_tasks
+            executor.submit(_inspect_single_kms_key, client, project_id, location_id, kr, key)
+            for kr, key in key_tasks
         ]
-        for fut in futures:
-            findings.append(fut.result())
-
-    return findings
+        return [f.result() for f in futures]
 
 
-def scan_pqc_readiness(
-    project_id: str = f"organizations/{DEFAULT_ORGANIZATION_ID}",
-    location_id: str = "all",
-) -> str:
-    """Scans Cloud KMS across a GCP Organization (default) or Project to classify cryptographic keys and application PQC compatibility.
-
-    Inspects algorithms (`KEM_XWING`, `ML_KEM_768`, `ML_KEM_1024`, `PQ_SIGN_ML_DSA_65`, `PQ_SIGN_SLH_DSA_SHA2_128S`,
-    RSA, ECDSA, Ed25519, AES-256, HMAC), active `CryptoKeyVersion` states, protection levels (`HSM` vs `SOFTWARE`),
-    automatic rotation schedules (`NIST SP 800-57 <= 90 days`), and maps all consuming applications/workloads
-    with their PQC model compatibility verdict.
-
-    Args:
-        project_id: Target assessment scope: `"organizations/31564119954"`, `"org"`, `"current"`, or a specific Project ID.
-        location_id: Cloud KMS location (`"all"` or `"global"` automatically discovers all active regions).
-
-    Returns:
-        Formatted JSON string containing the list of classified keys, consuming applications, and PQC compatibility status.
-    """
-    sim_mode = os.getenv("PQC_SIMULATION_MODE", "AUTO").upper()
-    mode, scope_uri, clean_id = _resolve_scope(project_id)
-    cache_key = f"kms:{sim_mode}:{scope_uri}:{(location_id or 'all').lower()}"
-    now_ts = time.monotonic()
-    cached = _SCAN_CACHE.get(cache_key)
-    if cached and (now_ts - cached[0]) < _CACHE_TTL_SECONDS:
-        return cached[1]
-
-    if sim_mode == "TRUE" or clean_id.lower() in SIMULATION_PROJECT_IDS:
-        raw_keys = get_simulated_kms_raw_keys(clean_id, location_id)
-        report = [classify_crypto_key(project_id=clean_id, **k) for k in raw_keys]
-        for item in report:
-            item["data_source"] = "SIMULATED_BENCHMARK_DATASET"
-        out_json = _compact_json(report)
-        _SCAN_CACHE[cache_key] = (now_ts, out_json)
-        return out_json
-
-    report: List[Dict[str, Any]] = []
-    try:
-        client = kms_v1.KeyManagementServiceClient(**_get_client_kwargs())
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as cai_exec:
-            wl_future = cai_exec.submit(_discover_live_workloads_via_cai, scope_uri)
-            tgt_future = cai_exec.submit(_discover_kms_targets_via_cai, scope_uri)
-            live_workload_index = wl_future.result()
-            discovered_targets = tgt_future.result()
-
-        if mode in ("ORG", "FOLDER"):
-            targets = discovered_targets
-            if location_id and location_id.lower() not in ("all", "*", "global"):
-                targets = [(p, l) for (p, l) in targets if l == location_id]
-        else:
-            if location_id.lower() in ("all", "*"):
-                targets = discovered_targets
-            elif location_id.lower() == "global":
-                targets = sorted(set([(clean_id, "global")] + discovered_targets))
-            else:
-                targets = [(clean_id, location_id)]
-
-        if targets:
-            max_loc_workers = min(8, len(targets))
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_loc_workers) as loc_exec:
-                loc_futures = {
-                    loc_exec.submit(_scan_kms_location, client, proj, loc, live_workload_index): (proj, loc)
-                    for proj, loc in targets
-                }
-                for fut in concurrent.futures.as_completed(loc_futures):
-                    proj, loc = loc_futures[fut]
-                    try:
-                        report.extend(fut.result())
-                    except gcp_exceptions.GoogleAPICallError as loc_err:
-                        logger.warning("Warning scanning Cloud KMS in %s/%s: %s", proj, loc, loc_err)
-
-            report.sort(
-                key=lambda k: (
-                    k.get("project_id", ""),
-                    k.get("location", ""),
-                    k.get("key_ring", ""),
-                    k.get("key_name", ""),
-                )
-            )
-            for item in report:
-                item["data_source"] = "LIVE_GCP_TELEMETRY_VERIFIED"
-
-        if not report and sim_mode == "AUTO":
-            raw_keys = get_simulated_kms_raw_keys(clean_id, location_id)
-            report = [classify_crypto_key(project_id=clean_id, **k) for k in raw_keys]
-            for item in report:
-                item["data_source"] = "SIMULATION_FALLBACK_NO_LIVE_KEYS_FOUND"
-
-    except Exception as exc:
-        if sim_mode == "AUTO":
-            raw_keys = get_simulated_kms_raw_keys(clean_id, location_id)
-            report = [classify_crypto_key(project_id=clean_id, **k) for k in raw_keys]
-            for item in report:
-                item["data_source"] = f"SIMULATION_FALLBACK ({type(exc).__name__})"
-        else:
-            return _compact_json(
-                {
-                    "error": f"Failed to query Cloud KMS in scope '{scope_uri}': {str(exc)}",
-                    "required_roles": [
-                        "roles/resourcemanager.organizationViewer",
-                        "roles/cloudkms.viewer",
-                        "roles/cloudasset.viewer",
-                    ],
-                }
-            )
-
-    out_json = _compact_json(report)
-    _SCAN_CACHE[cache_key] = (now_ts, out_json)
-    return out_json
-
-
-def _classify_cai_crypto_asset(
-    asset_type: str,
-    display_name: str,
-    project_id: str,
-    location: str,
-    state: str,
-    resource_data: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Deeply evaluates the post-quantum posture of Cloud Asset Inventory PKI, TLS, and KMS resources."""
-    res = resource_data or {}
-
-    if asset_type == "compute.googleapis.com/SslPolicy":
-        min_tls = str(res.get("minTlsVersion", "TLS_1_0")).upper()
-        profile = str(res.get("profile", "COMPATIBLE")).upper()
-        if min_tls == "TLS_1_3":
-            return {
-                "algorithm_details": f"minTlsVersion={min_tls}, profile={profile} (Supports X25519MLKEM768 Hybrid PQC Key Exchange)",
-                "quantum_status": "APPROVED_PQC_HYBRID_TRANSIT_CAPABLE",
-                "transit_hndl_risk": "LOW (Protected by Hybrid X25519 + ML-KEM-768 Key Exchange on Cloud Load Balancing)",
-                "remediation": "Maintain minTlsVersion=TLS_1_3 and profile=RESTRICTED.",
-            }
-        return {
-            "algorithm_details": f"minTlsVersion={min_tls}, profile={profile} (Classical ECDHE/RSA Key Exchange Only)",
-            "quantum_status": "VULNERABLE_TRANSIT_HNDL_PRE_TLS13",
-            "transit_hndl_risk": "CRITICAL (TLS 1.0/1.1/1.2 handshakes lack X25519MLKEM768 hybrid PQC key exchange and are exposed to passive network HNDL packet capture)",
-            "remediation": f"gcloud compute ssl-policies update {display_name} --project={project_id} --min-tls-version=1.3 --profile=RESTRICTED",
-        }
-
-    if asset_type in ("compute.googleapis.com/SslCertificate", "certificatemanager.googleapis.com/Certificate"):
-        cert_type = str(res.get("type", "MANAGED")).upper()
-        expire_time = str(res.get("expireTime", "Active"))
-        return {
-            "algorithm_details": f"X.509 TLS Certificate ({cert_type}, expires={expire_time}) — Classical RSA-2048 / ECDSA P-256 Auth",
-            "quantum_status": "CLASSICAL_X509_PKI_SHOR_EXPOSED",
-            "transit_hndl_risk": (
-                "MEDIUM (Online CRQC MitM Risk Only: TLS leaf certificate signatures authenticate handshakes in real time "
-                "and are NOT retroactively breakable via passive HNDL capture if TLS 1.3 X25519MLKEM768 key exchange is enabled)"
-            ),
-            "remediation": (
-                "Enforce TLS 1.3 (X25519MLKEM768) immediately for HNDL confidentiality; schedule X.509 certificate migration "
-                "to IETF LAMPS Composite / Pure ML-DSA-65 (FIPS 204) certificates as CA/Browser Forum profiles finalize."
-            ),
-        }
-
-    if asset_type == "privateca.googleapis.com/CertificateAuthority":
-        ca_type = str(res.get("type", "SELF_SIGNED")).upper()
-        key_spec = res.get("keySpec", {})
-        ca_algo = str(key_spec.get("algorithm", "RSA_PSS_4096_SHA256")).upper()
-        is_pqc_ca = any(t in ca_algo for t in ("ML_DSA", "SLH_DSA", "PQ_"))
-        if is_pqc_ca:
-            return {
-                "algorithm_details": f"Private CA ({ca_type}) — {ca_algo}",
-                "quantum_status": "APPROVED_PQC_PKI_CA",
-                "transit_hndl_risk": "NONE (Quantum-Resistant Root/Subordinate Trust Anchor)",
-                "remediation": "Compliant with NIST FIPS 204 / FIPS 205.",
-            }
-        return {
-            "algorithm_details": f"Private CA ({ca_type}) — {ca_algo} (Long-Lived Trust Anchor)",
-            "quantum_status": "VULNERABLE_LONG_LIVED_PKI_CA_SHOR",
-            "transit_hndl_risk": (
-                "HIGH (Root/Subordinate CA certificates have 10–20 year validity horizons [Mosca X >= 10y], "
-                "requiring early dual-hierarchy PKI migration to ML-DSA-87 or SLH-DSA-SHA2-128s)"
-            ),
-            "remediation": (
-                "Establish a parallel Post-Quantum Subordinate/Root CA hierarchy backed by Cloud KMS "
-                "`PQ_SIGN_ML_DSA_87` (FIPS 204 Category 5) or `PQ_SIGN_SLH_DSA_SHA2_128S` (FIPS 205)."
-            ),
-        }
-
-    if asset_type == "cloudkms.googleapis.com/CryptoKey":
-        vt = res.get("versionTemplate", {})
-        k_algo = str(vt.get("algorithm", state or "INSPECT_VIA_KMS_SCANNER")).upper()
-        prot = str(vt.get("protectionLevel", "SOFTWARE")).upper()
-        is_pqc = any(t in k_algo for t in ("PQ_", "ML_KEM", "ML_DSA", "SLH_DSA", "KEM_XWING", "XWING"))
-        is_sym = "SYMMETRIC" in k_algo or "HMAC_SHA256" in k_algo or "HMAC_SHA384" in k_algo or "HMAC_SHA512" in k_algo
-        q_stat = "APPROVED_PQC" if is_pqc else ("SECURE_SYMMETRIC" if is_sym else "VULNERABLE_CLASSICAL_RSA_ECC")
-        return {
-            "algorithm_details": f"{k_algo} (Protection={prot})" if k_algo != "INSPECT_VIA_KMS_SCANNER" else f"State={state} (Evaluated in KMS Inventory)",
-            "quantum_status": q_stat if k_algo != "INSPECT_VIA_KMS_SCANNER" else "EVALUATED_IN_KMS_CBOM",
-            "transit_hndl_risk": "See Cloud KMS CBOM & Application Compatibility Matrix",
-            "remediation": "See Cloud KMS Remediation Playbooks",
-        }
-
-    return {
-        "algorithm_details": f"KeyRing Container ({location})",
-        "quantum_status": "KMS_LOGICAL_CONTAINER",
-        "transit_hndl_risk": "N/A (Logical grouping of CryptoKeys)",
-        "remediation": "None",
-    }
-
-
-def discover_all_crypto_assets(
-    project_id: str = f"organizations/{DEFAULT_ORGANIZATION_ID}",
-) -> str:
-    """Scans Cloud Asset Inventory across a GCP Organization (default), Folder, or Project for cryptographic, TLS & PKI assets."""
-    sim_mode = os.getenv("PQC_SIMULATION_MODE", "AUTO").upper()
-    mode, scope_uri, clean_id = _resolve_scope(project_id)
-    cache_key = f"cai:{sim_mode}:{scope_uri}"
-    now_ts = time.monotonic()
-    cached = _SCAN_CACHE.get(cache_key)
-    if cached and (now_ts - cached[0]) < _CACHE_TTL_SECONDS:
-        return cached[1]
-
-    if sim_mode == "TRUE" or clean_id.lower() in SIMULATION_PROJECT_IDS:
-        out_json = _compact_json(
-            {
-                "scope": scope_uri,
-                "scope_mode": mode,
-                "data_source": "SIMULATED_CLOUD_ASSET_INVENTORY",
-                "assets": get_simulated_cai_assets(scope_uri),
-            }
-        )
-        _SCAN_CACHE[cache_key] = (now_ts, out_json)
-        return out_json
-
-    target_asset_types = [
-        "cloudkms.googleapis.com/KeyRing",
-        "cloudkms.googleapis.com/CryptoKey",
-        "compute.googleapis.com/SslCertificate",
-        "compute.googleapis.com/SslPolicy",
-        "certificatemanager.googleapis.com/Certificate",
-        "privateca.googleapis.com/CertificateAuthority",
-    ]
-
-    discovered_assets: List[Dict[str, Any]] = []
+def _discover_kms_targets_via_cai(scope_uri: str, errors: List[str]) -> List[Tuple[str, str]]:
+    """Discovers (project_id, location) pairs that contain KeyRings/CryptoKeys inside the scope."""
+    targets: Set[Tuple[str, str]] = set()
     try:
         cai_client = asset_v1.AssetServiceClient(**_get_client_kwargs())
         response = cai_client.search_all_resources(
             request={
                 "scope": scope_uri,
-                "asset_types": target_asset_types,
+                "asset_types": ["cloudkms.googleapis.com/KeyRing", "cloudkms.googleapis.com/CryptoKey"],
                 "page_size": 500,
-                "read_mask": "*",
             }
         )
         for resource in response:
-            if "kr-pqc-audit-lab" in resource.name:
-                continue
-            proj_from_name = ""
             parts = resource.name.split("/")
-            if len(parts) >= 5 and parts[3] == "projects":
-                proj_from_name = parts[4]
-            effective_proj = proj_from_name or resource.project
-
-            ver_dict: Dict[str, Any] = {}
-            if getattr(resource, "versioned_resources", None):
-                try:
-                    first_ver = resource.versioned_resources[0]
-                    if hasattr(first_ver, "resource") and first_ver.resource:
-                        ver_dict = dict(first_ver.resource)
-                except Exception:
-                    ver_dict = {}
-
-            deep_eval = _classify_cai_crypto_asset(
-                asset_type=resource.asset_type,
-                display_name=resource.display_name or resource.name.split("/")[-1],
-                project_id=effective_proj,
-                location=resource.location or "global",
-                state=resource.state or "ACTIVE",
-                resource_data=ver_dict,
-            )
-
-            discovered_assets.append(
-                {
-                    "asset_type": resource.asset_type,
-                    "project_id": effective_proj,
-                    "name": resource.name,
-                    "display_name": resource.display_name,
-                    "location": resource.location,
-                    "state": resource.state,
-                    "algorithm_details": deep_eval["algorithm_details"],
-                    "quantum_status": deep_eval["quantum_status"],
-                    "transit_hndl_risk": deep_eval["transit_hndl_risk"],
-                    "remediation": deep_eval["remediation"],
-                    "labels": dict(resource.labels) if resource.labels else {},
-                }
-            )
-
-        if not discovered_assets and sim_mode == "AUTO":
-            out_json = _compact_json(
-                {
-                    "scope": scope_uri,
-                    "scope_mode": mode,
-                    "data_source": "SIMULATION_FALLBACK_NO_LIVE_CAI_ASSETS",
-                    "assets": get_simulated_cai_assets(scope_uri),
-                }
-            )
-            _SCAN_CACHE[cache_key] = (now_ts, out_json)
-            return out_json
-
-        out_json = _compact_json(
-            {
-                "scope": scope_uri,
-                "scope_mode": mode,
-                "organization_domain": DEFAULT_ORGANIZATION_NAME if mode == "ORG" else None,
-                "data_source": "LIVE_CLOUD_ASSET_INVENTORY",
-                "total_assets": len(discovered_assets),
-                "assets": discovered_assets,
-            }
-        )
-        _SCAN_CACHE[cache_key] = (now_ts, out_json)
-        return out_json
+            if len(parts) >= 7 and parts[3] == "projects" and parts[5] == "locations":
+                targets.add((parts[4], parts[6]))
     except Exception as exc:
-        if sim_mode == "AUTO":
-            out_json = _compact_json(
-                {
-                    "scope": scope_uri,
-                    "scope_mode": mode,
-                    "data_source": f"SIMULATION_FALLBACK ({type(exc).__name__})",
-                    "assets": get_simulated_cai_assets(scope_uri),
+        errors.append(f"Cloud Asset Inventory KMS discovery failed for {scope_uri}: {type(exc).__name__}: {str(exc)[:200]}")
+    if not targets and scope_uri.startswith("projects/"):
+        targets.add((scope_uri.split("/", 1)[1], "global"))
+    return sorted(targets)
+
+
+def _attach_alternatives_reference(keys: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Replaces per-key `cloud_kms_pqc_alternatives` lists with a reference id into one shared table."""
+    reference: Dict[str, Any] = {}
+    compacted: List[Dict[str, Any]] = []
+    for key in keys:
+        facts = dict(key.get("algorithm_facts", {}))
+        alternatives = facts.pop("cloud_kms_pqc_alternatives", None)
+        if alternatives:
+            ref_id = "+".join(sorted(a["algorithm"] for a in alternatives))
+            reference.setdefault(ref_id, alternatives)
+            facts["cloud_kms_pqc_alternatives_ref"] = ref_id
+        compacted.append({**key, "algorithm_facts": facts})
+    return compacted, reference
+
+
+def _inventory_summary(keys: List[Dict[str, Any]]) -> Dict[str, Any]:
+    by_status: Dict[str, int] = {}
+    by_project: Dict[str, int] = {}
+    by_purpose: Dict[str, int] = {}
+    active = 0
+    for k in keys:
+        if k.get("is_active"):
+            active += 1
+            status = k["algorithm_facts"]["quantum_status"]
+            by_status[status] = by_status.get(status, 0) + 1
+        by_project[k["project_id"]] = by_project.get(k["project_id"], 0) + 1
+        by_purpose[k["purpose"]] = by_purpose.get(k["purpose"], 0) + 1
+    return {
+        "key_count": len(keys),
+        "active_key_count": active,
+        "inactive_key_count": len(keys) - active,
+        "active_keys_by_quantum_status": by_status,
+        "keys_by_project": by_project,
+        "keys_by_purpose": by_purpose,
+    }
+
+
+def collect_kms_inventory(
+    scope: str = f"organizations/{DEFAULT_ORGANIZATION_ID}",
+    location: str = "all",
+) -> str:
+    """Collects the Cloud KMS key inventory for an organization, folder or project (facts only).
+
+    Returns every CryptoKey with purpose, template and enabled-version algorithms, protection level, primary
+    state, rotation settings, labels, IAM bindings (role -> members) and a factual algorithm classification
+    (family, quantum threat model, NIST reference, artifact sizes, Cloud KMS post-quantum alternatives).
+    It performs no correlation, prioritization or recommendation.
+
+    Args:
+        scope: 'organizations/<id>', 'folders/<id>', 'projects/<id>' or a bare project ID.
+        location: Cloud KMS location filter, or 'all' to cover every location that has key rings.
+
+    Returns:
+        JSON with `data_source`, summary counts, `keys`, `collection_errors` and `excluded_key_rings`,
+        or an `error` object with the IAM roles required when the inventory cannot be read.
+    """
+    mode, scope_uri, clean_id = _resolve_scope(scope)
+    loc = (location or "all").strip()
+    simulated = simulation_requested(clean_id)
+    cache_key = f"kms:{scope_uri}:{loc.lower()}:{simulated}"
+    cached = _cache_get(cache_key)
+    if cached:
+        return cached
+
+    if simulated:
+        keys = [
+            build_key_record(project_id=clean_id, enabled_version_ids=["1"], data_source=SIMULATED_DATA_SOURCE, **raw)
+            for raw in mock_data.get_simulated_kms_raw_keys(clean_id, loc)
+        ]
+        compact_keys, alternatives_reference = _attach_alternatives_reference(keys)
+        payload = {
+            "scope": scope_uri,
+            "scope_mode": mode,
+            "data_source": SIMULATED_DATA_SOURCE,
+            "simulation_notice": SIMULATION_NOTICE,
+            "generated_at": _now_iso(),
+            **_inventory_summary(keys),
+            "keys": compact_keys,
+            "cloud_kms_pqc_alternatives_reference": alternatives_reference,
+            "collection_errors": [],
+            "excluded_key_rings": [],
+        }
+        return _cache_put(cache_key, _compact_json(payload))
+
+    errors: List[str] = []
+    skipped: List[str] = []
+    keys: List[Dict[str, Any]] = []
+    try:
+        client = kms_v1.KeyManagementServiceClient(**_get_client_kwargs())
+        targets = _discover_kms_targets_via_cai(scope_uri, errors)
+        if loc.lower() not in ("all", "*", ""):
+            if mode == "PROJECT":
+                targets = [(clean_id, loc)]
+            else:
+                targets = [(p, l) for (p, l) in targets if l == loc]
+
+        if targets:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(targets))) as executor:
+                futures = {
+                    executor.submit(_scan_kms_location, client, proj, l, skipped): (proj, l) for proj, l in targets
                 }
-            )
-            _SCAN_CACHE[cache_key] = (now_ts, out_json)
-            return out_json
+                for fut in concurrent.futures.as_completed(futures):
+                    proj, l = futures[fut]
+                    try:
+                        keys.extend(fut.result())
+                    except Exception as exc:
+                        errors.append(f"Cloud KMS listing failed for {proj}/{l}: {type(exc).__name__}: {str(exc)[:200]}")
+    except Exception as exc:
         return _compact_json(
             {
                 "scope": scope_uri,
                 "scope_mode": mode,
-                "error": f"Failed to query Cloud Asset Inventory in '{scope_uri}': {str(exc)}",
-                "required_roles": ["roles/cloudasset.viewer", "roles/resourcemanager.organizationViewer"],
+                "data_source": LIVE_DATA_SOURCE,
+                "error": f"Cloud KMS inventory could not be read: {type(exc).__name__}: {str(exc)[:300]}",
+                "required_roles": REQUIRED_READ_ROLES,
             }
         )
 
-
-def _compute_metrics_for_keys(keys: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Computes strict, multidimensional PQC metrics (Asymmetric Shor, Symmetric Grover, Rotation Hygiene & Application Compatibility)."""
-    active_keys = [k for k in keys if k.get("is_active", True)]
-    inactive_keys = [k for k in keys if not k.get("is_active", True)]
-
-    vuln_asym = [k for k in active_keys if k.get("quantum_status") == "VULNERABLE_CLASSICAL_RSA_ECC"]
-    critical_hndl = [k for k in vuln_asym if k.get("priority") == "CRITICAL"]
-    approved_pqc = [k for k in active_keys if k.get("quantum_status") == "APPROVED_PQC"]
-    secure_sym = [k for k in active_keys if k.get("quantum_status") == "SECURE_SYMMETRIC"]
-    weak_sym = [k for k in active_keys if k.get("quantum_status") == "WEAK_SYMMETRIC_GROVER_RISK"]
-
-    # Rotation hygiene across active symmetric ENCRYPT_DECRYPT keys
-    sym_encrypt_keys = [k for k in secure_sym if "ENCRYPT" in k.get("purpose", "")]
-    sym_rotated_ok = [k for k in sym_encrypt_keys if k.get("hygiene_status") == "COMPLIANT_ROTATION_90D"]
-    sym_unrotated = [k for k in sym_encrypt_keys if k.get("hygiene_status") != "COMPLIANT_ROTATION_90D"]
-
-    # Application PQC compatibility across active keys
-    total_apps = 0
-    compat_apps = 0
-    incompat_apps = 0
-    mosca_immediate_breach_keys = 0
-    mosca_deadline_risk_keys = 0
-    for k in active_keys:
-        apps = k.get("consuming_applications", [])
-        is_compat = k.get("pqc_application_compatibility", {}).get("is_compatible_with_pqc_model", True)
-        mosca_status = k.get("mosca_risk_analysis", {}).get("mosca_status", "QUANTUM_SAFE_MOSCA_IMMUNE")
-        if mosca_status == "CRITICAL_MOSCA_BREACH_ACTIVE_HNDL":
-            mosca_immediate_breach_keys += 1
-        elif mosca_status == "HIGH_MOSCA_BREACH_NIST_2030_DEADLINE":
-            mosca_deadline_risk_keys += 1
-        count_for_key = len(apps) if apps else 1
-        total_apps += count_for_key
-        if is_compat:
-            compat_apps += count_for_key
-        else:
-            incompat_apps += count_for_key
-
-    app_compat_score_pct = round((compat_apps / total_apps) * 100, 1) if total_apps > 0 else 100.0
-
-    total_asym = len(approved_pqc) + len(vuln_asym)
-    total_sym = len(secure_sym) + len(weak_sym)
-    total_active = len(active_keys)
-
-    # 1. Asymmetric PQC Migration Score (Resistance to Shor's Algorithm)
-    if total_asym > 0:
-        asymmetric_pqc_score_pct: Optional[float] = round((len(approved_pqc) / total_asym) * 100, 1)
-    else:
-        asymmetric_pqc_score_pct = None
-
-    # 2. Symmetric Grover Resilience Score (>= 256-bit keys)
-    symmetric_grover_score_pct = round((len(secure_sym) / total_sym) * 100, 1) if total_sym > 0 else 100.0
-
-    # 3. Symmetric Key Rotation Hygiene Score (<= 90 days - NIST SP 800-57)
-    rotation_hygiene_score_pct = (
-        round((len(sym_rotated_ok) / len(sym_encrypt_keys)) * 100, 1) if sym_encrypt_keys else 100.0
-    )
-
-    # 4. Overall Algorithmic Quantum Resistance Score (Shor + Grover across active keys)
-    algorithmic_quantum_safe_pct = (
-        round(((len(approved_pqc) + len(secure_sym)) / total_active) * 100, 1) if total_active > 0 else 100.0
-    )
-
-    # 5. Weighted PQC Maturity Score (60% Asymmetric PQC + 25% Symmetric Grover + 15% Rotation Hygiene)
-    if total_asym > 0:
-        weighted_score = round(
-            (0.60 * (asymmetric_pqc_score_pct or 0.0))
-            + (0.25 * symmetric_grover_score_pct)
-            + (0.15 * rotation_hygiene_score_pct),
-            1,
-        )
-    else:
-        weighted_score = round(
-            (0.70 * symmetric_grover_score_pct) + (0.30 * rotation_hygiene_score_pct),
-            1,
-        )
-
-    return {
-        "total_kms_keys_scanned": len(keys),
-        "active_kms_keys_count": total_active,
-        "inactive_or_destroyed_keys_count": len(inactive_keys),
-        "pqc_readiness_score_pct": algorithmic_quantum_safe_pct,
-        "weighted_pqc_maturity_score_pct": weighted_score,
-        "asymmetric_pqc_migration_score_pct": (
-            asymmetric_pqc_score_pct if asymmetric_pqc_score_pct is not None else "N/A (No asymmetric keys)"
-        ),
-        "symmetric_grover_resilience_score_pct": symmetric_grover_score_pct,
-        "symmetric_rotation_hygiene_score_pct": rotation_hygiene_score_pct,
-        "application_pqc_compatibility_score_pct": app_compat_score_pct,
-        "total_consuming_applications_mapped": total_apps,
-        "pqc_compatible_applications_count": compat_apps,
-        "pqc_incompatible_applications_requiring_refactoring_count": incompat_apps,
-        "mosca_immediate_hndl_breach_keys_count": mosca_immediate_breach_keys,
-        "mosca_migration_deadline_risk_keys_count": mosca_deadline_risk_keys,
-        "vulnerable_classical_rsa_ecc_count": len(vuln_asym),
-        "critical_hndl_decrypt_keys_count": len(critical_hndl),
-        "approved_pqc_count": len(approved_pqc),
-        "secure_symmetric_count": len(secure_sym),
-        "symmetric_keys_missing_rotation_count": len(sym_unrotated),
-        "weak_symmetric_grover_count": len(weak_sym),
-    }
-
-
-def generate_pqc_migration_plan(
-    project_id: str = f"organizations/{DEFAULT_ORGANIZATION_ID}",
-    location_id: str = "all",
-) -> str:
-    """Generates a consolidated CBOM, Application PQC Compatibility Matrix, and Consultative Step-by-Step PQC Execution Guide."""
-    mode, scope_uri, clean_id = _resolve_scope(project_id)
-    raw_kms_json = scan_pqc_readiness(project_id=project_id, location_id=location_id)
-    kms_items = json.loads(raw_kms_json)
-
-    if isinstance(kms_items, dict) and "error" in kms_items:
-        return json.dumps(kms_items, indent=2, ensure_ascii=False)
-
-    is_simulated = any("SIMULAT" in str(k.get("data_source", "")).upper() for k in kms_items)
-    data_source_authenticity = (
-        "SIMULATED_BENCHMARK_DATASET" if is_simulated else "LIVE_GCP_TELEMETRY_VERIFIED"
-    )
-    data_validation_manifest = _describe_scope_resolution(project_id, data_source_authenticity)
-
-    cbom_summary = _compute_metrics_for_keys(kms_items)
-
-    # Per-project breakdown
-    by_project: Dict[str, List[Dict[str, Any]]] = {}
-    for item in kms_items:
-        p_id = item.get("project_id") or clean_id
-        by_project.setdefault(p_id, []).append(item)
-
-    projects_breakdown: List[Dict[str, Any]] = []
-    for p_id, p_keys in sorted(by_project.items()):
-        p_metrics = _compute_metrics_for_keys(p_keys)
-        projects_breakdown.append(
-            {
-                "project_id": p_id,
-                "total_keys": p_metrics["total_kms_keys_scanned"],
-                "active_keys": p_metrics["active_kms_keys_count"],
-                "inactive_or_destroyed_keys": p_metrics["inactive_or_destroyed_keys_count"],
-                "approved_pqc_count": p_metrics["approved_pqc_count"],
-                "secure_symmetric_count": p_metrics["secure_symmetric_count"],
-                "symmetric_missing_rotation_count": p_metrics["symmetric_keys_missing_rotation_count"],
-                "vulnerable_classical_rsa_ecc_count": p_metrics["vulnerable_classical_rsa_ecc_count"],
-                "mosca_immediate_hndl_breach_keys_count": p_metrics["mosca_immediate_hndl_breach_keys_count"],
-                "mosca_migration_deadline_risk_keys_count": p_metrics["mosca_migration_deadline_risk_keys_count"],
-                "consuming_applications_count": p_metrics["total_consuming_applications_mapped"],
-                "pqc_compatible_applications_count": p_metrics["pqc_compatible_applications_count"],
-                "pqc_incompatible_applications_count": p_metrics[
-                    "pqc_incompatible_applications_requiring_refactoring_count"
-                ],
-                "application_pqc_compatibility_score_pct": p_metrics["application_pqc_compatibility_score_pct"],
-                "asymmetric_pqc_migration_score_pct": p_metrics["asymmetric_pqc_migration_score_pct"],
-                "pqc_readiness_score_pct": p_metrics["pqc_readiness_score_pct"],
-                "weighted_pqc_maturity_score_pct": p_metrics["weighted_pqc_maturity_score_pct"],
-            }
-        )
-
-    cbom_summary["total_projects_scanned"] = len(projects_breakdown)
-    cbom_summary["data_source_authenticity"] = data_source_authenticity
-
-    validated_executive_scorecard = {
-        "validation_status": "BACKEND_DETERMINISTIC_SCORE_DO_NOT_RECOMPUTE",
-        "data_source_authenticity": data_source_authenticity,
-        "resolved_scope_uri": scope_uri,
-        "weighted_pqc_maturity_score_pct": cbom_summary["weighted_pqc_maturity_score_pct"],
-        "asymmetric_pqc_migration_score_pct": cbom_summary["asymmetric_pqc_migration_score_pct"],
-        "symmetric_grover_resilience_score_pct": cbom_summary["symmetric_grover_resilience_score_pct"],
-        "symmetric_rotation_hygiene_score_pct": cbom_summary["symmetric_rotation_hygiene_score_pct"],
-        "application_pqc_compatibility_score_pct": cbom_summary["application_pqc_compatibility_score_pct"],
-        "overall_algorithmic_quantum_safe_score_pct": cbom_summary["pqc_readiness_score_pct"],
-        "active_kms_keys_count": cbom_summary["active_kms_keys_count"],
-        "approved_pqc_keys_count": cbom_summary["approved_pqc_count"],
-        "vulnerable_classical_asymmetric_keys_count": cbom_summary["vulnerable_classical_rsa_ecc_count"],
-        "secure_symmetric_keys_count": cbom_summary["secure_symmetric_count"],
-        "symmetric_keys_missing_rotation_count": cbom_summary["symmetric_keys_missing_rotation_count"],
-        "score_formula_validation_note": (
-            "Weighted PQC Maturity = 60% * Asymmetric_PQC_Migration_Score + 25% * Symmetric_Grover_Resilience_Score "
-            "+ 15% * Symmetric_Rotation_Hygiene_Score. Asymmetric PQC Migration Score divides Approved_PQC_Keys by "
-            "Total_Active_Asymmetric_Keys (NOT Total_Keys)."
-        ),
-    }
-
-    # Build the complete Application-to-Key PQC Compatibility Matrix across all active keys
-    application_compatibility_matrix: List[Dict[str, Any]] = []
-    for k in kms_items:
-        if not k.get("is_active", True):
-            continue
-        p_id = k.get("project_id") or clean_id
-        compat_info = k.get("pqc_application_compatibility", {})
-        mosca_info = k.get("mosca_risk_analysis", {})
-        for app in k.get("consuming_applications", []):
-            application_compatibility_matrix.append(
-                {
-                    "project_id": p_id,
-                    "application_name": app.get("application_name"),
-                    "workload_type": app.get("workload_type"),
-                    "workload_resource": app.get("workload_resource"),
-                    "service_account": app.get("service_account"),
-                    "crypto_usage_pattern": app.get("crypto_usage_pattern"),
-                    "discovery_confidence": app.get("discovery_confidence", "HIGH_TOPOLOGY_MAPPED"),
-                    "kms_key": f"{k.get('key_ring')}/{k.get('key_name')} ({k.get('location')})",
-                    "current_algorithm": k.get("algorithm"),
-                    "target_pqc_algorithm": k.get("recommended_algorithm"),
-                    "is_compatible_with_pqc_model": compat_info.get("is_compatible_with_pqc_model", True),
-                    "pqc_compatibility_verdict": compat_info.get("verdict"),
-                    "mosca_status": mosca_info.get("mosca_status"),
-                    "mosca_inequality_breached": mosca_info.get("mosca_inequality_breached"),
-                    "x_plus_y_total_years": mosca_info.get("x_plus_y_total_years"),
-                    "mosca_urgency_explanation": mosca_info.get("urgency_explanation"),
-                    "api_migration_required": compat_info.get("api_migration_required"),
-                    "protocol_and_payload_impact": compat_info.get("protocol_and_payload_impact"),
-                    "compatibility_blockers": compat_info.get("compatibility_blockers", []),
-                    "application_refactoring_steps": compat_info.get("application_refactoring_steps", []),
-                }
-            )
-
-    vulnerable_keys = [
-        k for k in kms_items if k.get("is_active", True) and k.get("quantum_status") == "VULNERABLE_CLASSICAL_RSA_ECC"
-    ]
-    unrotated_sym_keys = [
-        k
-        for k in kms_items
-        if k.get("is_active", True)
-        and k.get("quantum_status") == "SECURE_SYMMETRIC"
-        and k.get("hygiene_status") in ("NON_COMPLIANT_NO_ROTATION", "WARNING_ROTATION_EXCEEDS_90D")
-    ]
-    inactive_keys = [k for k in kms_items if not k.get("is_active", True)]
-
-    remediation_commands: List[Dict[str, Any]] = []
-    for vk in vulnerable_keys:
-        key_proj = vk.get("project_id") or clean_id
-        loc = vk.get("location", "global")
-        kr = vk.get("key_ring", "default-keyring")
-        old_name = vk.get("key_name", "legacy-key")
-        purpose = vk.get("purpose", "")
-        enabled_vers = vk.get("enabled_version_ids") or ["1"]
-        first_ver = enabled_vers[0]
-
-        consuming_apps = vk.get("consuming_applications", [])
-        app_names = [a.get("application_name", "") for a in consuming_apps if a.get("application_name")]
-        service_accounts = [a.get("service_account", "") for a in consuming_apps if a.get("service_account")]
-        primary_sa = service_accounts[0] if service_accounts else f"default-compute@{key_proj}.iam.gserviceaccount.com"
-
-        is_jwt_or_token_key = any(tok in old_name.lower() for tok in ("jwt", "token")) or any(
-            "jwt" in str(a.get("crypto_usage_pattern", "")).lower() for a in consuming_apps
-        )
-        jwt_header_note = (
-            "TECHNICAL NOTE (JWT/Token Header Buffer Expansion): Increase HTTP header buffer limits "
-            "(to 16KB in API Gateways/Envoy, or 32KB max_request_headers_kb) because ML-DSA-65 signatures expand Base64URL JWT tokens by ~4.4KB."
-            if is_jwt_or_token_key
-            else ""
-        )
-
-        if "DECRYPT" in purpose:
-            new_name = f"{old_name}-pqc-xwing"
-            cmd = (
-                f"gcloud kms keys create {new_name} "
-                f"--project={key_proj} "
-                f"--location={loc} "
-                f"--keyring={kr} "
-                f"--purpose=key-encapsulation "
-                f"--default-algorithm=kem-xwing "
-                f"--protection-level=hsm"
-            )
-            cnsa_cmd = (
-                f"gcloud kms keys create {old_name}-pqc-mlkem1024 "
-                f"--project={key_proj} "
-                f"--location={loc} "
-                f"--keyring={kr} "
-                f"--purpose=key-encapsulation "
-                f"--default-algorithm=ml-kem-1024 "
-                f"--protection-level=hsm"
-            )
-            iam_binding_cmd = (
-                f"gcloud kms keys add-iam-policy-binding {new_name} "
-                f"--keyring={kr} --location={loc} --project={key_proj} "
-                f"--member='serviceAccount:{primary_sa}' "
-                f"--role='roles/cloudkms.cryptoKeyDecapsulator'"
-            )
-            disable_legacy_cmd = (
-                f"gcloud kms keys versions disable {first_ver} "
-                f"--key={old_name} --keyring={kr} --location={loc} --project={key_proj}"
-            )
-            validation_cmd = (
-                f"gcloud kms keys describe {new_name} --keyring={kr} --location={loc} --project={key_proj} "
-                f"--format='yaml(name,purpose,versionTemplate,primary)' && "
-                f"gcloud kms keys versions list --key={old_name} --keyring={kr} --location={loc} --project={key_proj}"
-            )
-            rationale = (
-                "Immediate mitigation against 'Harvest Now, Decrypt Later' (HNDL) using hybrid KEM "
-                "X25519 + ML-KEM-768 (NIST FIPS 203 Category 3) or pure ML-KEM-1024 (NSA CNSA 2.0 Category 5) "
-                "backed by Cloud HSM (--protection-level=hsm). "
-                "Requires refactoring consuming applications from AsymmetricDecrypt to Decapsulate (HPKE / Envelope Encryption)."
-            )
-            step_by_step_plan = [
-                f"Step 1 (Pre-Flight & Database Schema Preparation): Verify regional Cloud HSM quota in '{loc}' for project '{key_proj}' and expand wrapped DEK columns in consuming storage/databases from 256 bytes (RSA-2048) to >= 1,568 bytes (VARBINARY(2048)) to accommodate KEM_XWING (1,120 B) or ML_KEM_1024 (1,568 B) ciphertexts.",
-                f"Step 2 (Provision PQC KEM Key in Cloud HSM): Execute `{cmd}` (or `{cnsa_cmd}` for pure CNSA 2.0 Category 5).",
-                f"Step 3 (Grant Least-Privilege IAM Decapsulation Role): Execute `{iam_binding_cmd}` so workload `{', '.join(app_names) or old_name}` can invoke `kms.Decapsulate`.",
-                f"Step 4 (Refactor Consuming Application to RFC 9180 HPKE / Envelope Encryption): Update `{', '.join(app_names) or 'consuming service'}` from `kms_client.asymmetric_decrypt()` to `kms_client.decapsulate()` + `HKDF-SHA256` (32-byte shared_secret -> 256-bit DEK) + `AES-256-GCM` in dual-read mode until existing RSA-OAEP ciphertexts are re-wrapped.",
-                f"Step 5 (Decommission Legacy RSA Key Version & Validate): Execute `{disable_legacy_cmd}` and verify posture via `{validation_cmd}`.",
-            ]
-        else:
-            new_name = f"{old_name}-pqc-mldsa65"
-            cmd = (
-                f"gcloud kms keys create {new_name} "
-                f"--project={key_proj} "
-                f"--location={loc} "
-                f"--keyring={kr} "
-                f"--purpose=asymmetric-signing "
-                f"--default-algorithm=pq-sign-ml-dsa-65 "
-                f"--protection-level=hsm"
-            )
-            cnsa_cmd = (
-                f"gcloud kms keys create {old_name}-pqc-mldsa87 "
-                f"--project={key_proj} "
-                f"--location={loc} "
-                f"--keyring={kr} "
-                f"--purpose=asymmetric-signing "
-                f"--default-algorithm=pq-sign-ml-dsa-87 "
-                f"--protection-level=hsm"
-            )
-            iam_binding_cmd = (
-                f"gcloud kms keys add-iam-policy-binding {new_name} "
-                f"--keyring={kr} --location={loc} --project={key_proj} "
-                f"--member='serviceAccount:{primary_sa}' "
-                f"--role='roles/cloudkms.signerVerifier'"
-            )
-            disable_legacy_cmd = (
-                f"gcloud kms keys versions disable {first_ver} "
-                f"--key={old_name} --keyring={kr} --location={loc} --project={key_proj}"
-            )
-            validation_cmd = (
-                f"gcloud kms keys describe {new_name} --keyring={kr} --location={loc} --project={key_proj} "
-                f"--format='yaml(name,purpose,versionTemplate,primary)' && "
-                f"gcloud kms keys versions list --key={old_name} --keyring={kr} --location={loc} --project={key_proj}"
-            )
-            rationale = (
-                "Migration of classical digital signature (RSA/ECC) vulnerable to Shor's Algorithm "
-                "to ML-DSA-65 (NIST FIPS 204 Category 3) or ML-DSA-87 (NSA CNSA 2.0 Category 5) "
-                "backed by Cloud HSM (--protection-level=hsm). "
-                "Note: Signature size increases to 3,309 bytes (ML-DSA-65) or 4,627 bytes (ML-DSA-87); "
-                "verify HTTP Header / MTU limits and refactor KMS signing calls from `digest` to `data`."
-            )
-            step_by_step_plan = [
-                f"Step 1 (Pre-Flight & Gateway Header Buffer Expansion): Before switching signing keys for `{', '.join(app_names) or old_name}`, increase HTTP header buffer limits (`max_request_headers_kb: 32` in Envoy/Istio, `large_client_header_buffers 4 32k` in NGINX/Apigee) to prevent HTTP 431 errors when signatures expand from 64–256 bytes to 3,309 bytes (~4.4 KB Base64URL).",
-                f"Step 2 (Provision PQC Signing Key in Cloud HSM): Execute `{cmd}` (or `{cnsa_cmd}` for CNSA 2.0 Category 5).",
-                f"Step 3 (Grant Least-Privilege IAM Signer/Verifier Role): Execute `{iam_binding_cmd}` for service account `{primary_sa}`.",
-                f"Step 4 (Refactor KMS Signing API Contract & Verifier SDKs): Update `{', '.join(app_names) or 'consuming service'}` from `kms_client.asymmetric_sign(digest={{'sha256': ...}})` to `kms_client.asymmetric_sign(data=raw_message_bytes)` (or 64-byte SHAKE256 `mu` with `_EXTERNAL_MU`) and distribute the new 1,952-byte ML-DSA-65 public key to downstream verifiers.",
-                f"Step 5 (Decommission Legacy Signing Key Version & Validate): Once all active tokens/artifacts issued by `{old_name}` expire, execute `{disable_legacy_cmd}` and validate with `{validation_cmd}`.",
-            ]
-
-        if jwt_header_note:
-            rationale = f"{rationale} {jwt_header_note}"
-
-        eng_notes = list(vk.get("engineering_notes", []))
-        if jwt_header_note and jwt_header_note not in eng_notes:
-            eng_notes.append(jwt_header_note)
-
-        remediation_commands.append(
-            {
-                "project_id": key_proj,
-                "legacy_key": f"{key_proj}/{kr}/{old_name} ({loc})",
-                "legacy_key_name": old_name,
-                "legacy_algorithm": vk.get("algorithm", ""),
-                "legacy_protection_level": vk.get("protection_level", "SOFTWARE"),
-                "priority": vk.get("priority", "HIGH"),
-                "mosca_risk_analysis": vk.get("mosca_risk_analysis", {}),
-                "affected_applications": app_names,
-                "affected_service_accounts": service_accounts or [primary_sa],
-                "pqc_application_compatibility": vk.get("pqc_application_compatibility", {}),
-                "target_pqc_key": new_name,
-                "target_algorithm": vk.get("recommended_algorithm", ""),
-                "rationale": rationale,
-                "technical_note_jwt_header_buffer": jwt_header_note or None,
-                "engineering_notes": eng_notes,
-                "gcloud_command": cmd,
-                "gcloud_cnsa_2_0_command": cnsa_cmd,
-                "iam_binding_command": iam_binding_cmd,
-                "post_migration_disable_legacy_command": disable_legacy_cmd,
-                "post_change_validation_command": validation_cmd,
-                "consultative_execution_guide": {
-                    "current_state_evaluation": (
-                        f"Key '{key_proj}/{kr}/{old_name}' ({loc}) currently uses classical algorithm '{vk.get('algorithm')}' "
-                        f"with protection_level='{vk.get('protection_level')}' and is consumed by {len(app_names) or 1} workload(s): "
-                        f"{', '.join(app_names) if app_names else 'Cloud KMS consumer'}. "
-                        f"Mosca status: {vk.get('mosca_risk_analysis', {}).get('mosca_status')} "
-                        f"(X+Y = {vk.get('mosca_risk_analysis', {}).get('x_plus_y_total_years')} years)."
-                    ),
-                    "architectural_impact_assessment": vk.get("pqc_application_compatibility", {}).get(
-                        "protocol_and_payload_impact", ""
-                    ),
-                    "step_by_step_execution_plan": step_by_step_plan,
-                },
-            }
-        )
-
-    # Symmetric Key Rotation Hygiene Playbooks (NIST SP 800-57)
-    next_rot_iso = (
-        (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=90))
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-    rotation_playbooks: List[Dict[str, Any]] = []
-    for sk in unrotated_sym_keys:
-        s_proj = sk.get("project_id") or clean_id
-        s_loc = sk.get("location", "global")
-        s_kr = sk.get("key_ring", "default-keyring")
-        s_name = sk.get("key_name", "sym-key")
-        rot_cmd = (
-            f"gcloud kms keys update {s_name} "
-            f"--project={s_proj} "
-            f"--location={s_loc} "
-            f"--keyring={s_kr} "
-            f"--rotation-period=90d "
-            f"--next-rotation-time={next_rot_iso}"
-        )
-        rot_val_cmd = (
-            f"gcloud kms keys describe {s_name} --keyring={s_kr} --location={s_loc} --project={s_proj} "
-            f"--format='yaml(name,rotationPeriod,nextRotationTime,primary)'"
-        )
-        rotation_playbooks.append(
-            {
-                "project_id": s_proj,
-                "key": f"{s_proj}/{s_kr}/{s_name} ({s_loc})",
-                "hygiene_status": sk.get("hygiene_status", "NON_COMPLIANT_NO_ROTATION"),
-                "gcloud_rotation_command": rot_cmd,
-                "post_change_validation_command": rot_val_cmd,
-                "step_by_step_execution_guide": [
-                    f"Step 1 (Evaluate CMEK Impact): AES-256 key '{s_proj}/{s_kr}/{s_name}' is already resistant to Grover's Algorithm (128 effective post-quantum bits), and enabling automatic rotation in Cloud KMS is 100% transparent to BigQuery, Cloud Storage, GKE, and Compute Engine CMEK workloads (zero downtime).",
-                    f"Step 2 (Configure 90-Day Automatic Rotation): Execute `{rot_cmd}`.",
-                    f"Step 3 (Verify Cryptoperiod Schedule): Execute `{rot_val_cmd}` and confirm `rotationPeriod: 7776000s` (90 days).",
-                ],
-            }
-        )
-
-    org_target = DEFAULT_ORGANIZATION_ID if mode != "ORG" else clean_id
-    preventive_org_policy_guardrails = {
-        "purpose": (
-            "Preventive Cryptographic Drift Guardrails via Google Cloud Organization Policy Service — "
-            "blocks creation of new classical RSA/ECC keys vulnerable to Shor's Algorithm and enforces <= 90-day rotation on symmetric keys."
-        ),
-        "custom_constraint_quantum_safe_algorithms_yaml": (
-            f"name: organizations/{org_target}/customConstraints/custom.pqcEnforceQuantumSafeKmsAlgorithms\n"
-            "resourceTypes:\n"
-            "  - cloudkms.googleapis.com/CryptoKey\n"
-            "methodTypes:\n"
-            "  - CREATE\n"
-            "  - UPDATE\n"
-            "condition: >-\n"
-            "  resource.versionTemplate.algorithm in [\n"
-            "    'GOOGLE_SYMMETRIC_ENCRYPTION',\n"
-            "    'KEM_XWING',\n"
-            "    'ML_KEM_768',\n"
-            "    'ML_KEM_1024',\n"
-            "    'PQ_SIGN_ML_DSA_44',\n"
-            "    'PQ_SIGN_ML_DSA_65',\n"
-            "    'PQ_SIGN_ML_DSA_87',\n"
-            "    'PQ_SIGN_ML_DSA_44_EXTERNAL_MU',\n"
-            "    'PQ_SIGN_ML_DSA_65_EXTERNAL_MU',\n"
-            "    'PQ_SIGN_ML_DSA_87_EXTERNAL_MU',\n"
-            "    'PQ_SIGN_SLH_DSA_SHA2_128S',\n"
-            "    'PQ_SIGN_HASH_SLH_DSA_SHA2_128S_SHA256',\n"
-            "    'HMAC_SHA256',\n"
-            "    'HMAC_SHA384',\n"
-            "    'HMAC_SHA512'\n"
-            "  ]\n"
-            "actionType: ALLOW\n"
-            "displayName: Enforce Post-Quantum & Grover-Resilient Cloud KMS Algorithms (NIST FIPS 203/204/205)\n"
-            "description: Blocks creation of classical RSA/ECDSA/Ed25519 keys vulnerable to Shor's Algorithm."
-        ),
-        "custom_constraint_symmetric_rotation_90d_yaml": (
-            f"name: organizations/{org_target}/customConstraints/custom.pqcEnforceSymmetricKeyRotation90d\n"
-            "resourceTypes:\n"
-            "  - cloudkms.googleapis.com/CryptoKey\n"
-            "methodTypes:\n"
-            "  - CREATE\n"
-            "  - UPDATE\n"
-            "condition: >-\n"
-            "  resource.purpose != 'ENCRYPT_DECRYPT' ||\n"
-            "  (has(resource.rotationPeriod) && duration(resource.rotationPeriod) <= duration('7776000s'))\n"
-            "actionType: ALLOW\n"
-            "displayName: Enforce <= 90-Day Automatic Rotation on Symmetric Cloud KMS Keys (NIST SP 800-57 / CIS 1.10)\n"
-            "description: Requires automatic key rotation period <= 90 days (7,776,000 seconds) for all symmetric ENCRYPT_DECRYPT keys."
-        ),
-        "gcloud_enforcement_commands": [
-            "gcloud org-policies set-custom-constraint custom-pqc-kms-algorithms.yaml",
-            f"gcloud org-policies set-policy enforce-pqc-kms-algorithms-policy.yaml --organization={org_target}",
-            "gcloud org-policies set-custom-constraint custom-pqc-kms-rotation-90d.yaml",
-            f"gcloud org-policies set-policy enforce-pqc-kms-rotation-90d-policy.yaml --organization={org_target}",
-        ],
-    }
-
-    software_vuln_keys = [
-        f"{vk.get('project_id', clean_id)}/{vk.get('key_ring')}/{vk.get('key_name')}"
-        for vk in vulnerable_keys
-        if str(vk.get("protection_level", "SOFTWARE")).upper() == "SOFTWARE"
-    ]
-    affected_legacy_apps = sorted(
-        {
-            a.get("application_name", "")
-            for vk in vulnerable_keys
-            for a in vk.get("consuming_applications", [])
-            if a.get("application_name")
-        }
-    )
-    storage_bq_workloads = sorted(
-        {
-            a.get("application_name", "")
-            for k in kms_items
-            if k.get("is_active", True)
-            for a in k.get("consuming_applications", [])
-            if any(t in str(a.get("workload_type", "")).lower() for t in ("storage", "bigquery", "bucket", "dataset"))
-        }
-    )
-
-    recommended_product_bom = [
-        {
-            "gap_category": "Software-Backed Production Keys (RSA/ECC)",
-            "identified_assets": software_vuln_keys or [f"{vk.get('project_id', clean_id)}/{vk.get('key_ring')}/{vk.get('key_name')}" for vk in vulnerable_keys],
-            "recommended_gcp_products": ["Cloud HSM (FIPS 140-3 Level 3)", "Cloud KMS Post-Quantum Cryptography (KEM_XWING / PQ_SIGN_ML_DSA_65)"],
-            "architectural_recommendation": (
-                "Migrate software-backed production keys (RSA/ECC) to 'Cloud HSM' (--protection-level=hsm) with algorithms "
-                "'KEM_XWING' or 'PQ_SIGN_ML_DSA_65' to eliminate transport risks and secure key materials within FIPS 140-3 Level 3 hardware."
-            ),
-        },
-        {
-            "gap_category": "Legacy Application Codebases Using Native Decryption or Signing",
-            "identified_assets": affected_legacy_apps,
-            "recommended_gcp_products": ["Google Tink SDK", "Cloud KMS"],
-            "architectural_recommendation": (
-                "Adopt the 'Google Tink SDK' integrated with 'Cloud KMS' to handle complex RFC 9180 HPKE (Hybrid Public Key Encryption) "
-                "flows, KEM Decapsulate envelope encryption, and public key formatting changes without manual coding toil."
-            ),
-        },
-        {
-            "gap_category": "Harvest Now, Decrypt Later (HNDL / SNDL) Risks for Data in Transit or at Rest",
-            "identified_assets": storage_bq_workloads or ["Cloud Storage Buckets", "BigQuery Datasets"],
-            "recommended_gcp_products": ["VPC Service Controls (VPC-SC)", "Private Service Connect (PSC)"],
-            "architectural_recommendation": (
-                "Wrap sensitive data resources (Cloud Storage, BigQuery) with 'VPC Service Controls (VPC-SC)' and "
-                "'Private Service Connect (PSC)' to establish zero-trust perimeter boundaries and prevent bulk ciphertext exfiltration."
-            ),
-        },
-        {
-            "gap_category": "Unsecured or Pre-TLS 1.3 Internal & External API Endpoints",
-            "identified_assets": affected_legacy_apps or ["API Ingress & Load Balancers"],
-            "recommended_gcp_products": ["Google Cloud Global Load Balancing (L7)", "Certificate Authority Service (CAS)"],
-            "architectural_recommendation": (
-                "Deploy 'Google Cloud Global Load Balancing (L7)' with TLS 1.3 modern/restricted policies (enabling X25519MLKEM768 hybrid PQC key exchange) "
-                "and 'Certificate Authority Service (CAS)' to enforce secure hybrid transport."
-            ),
-        },
-        {
-            "gap_category": "CI/CD Pipelines & Container Artifact Signing",
-            "identified_assets": ["Container Registry / Artifact Registry Workloads", "GKE & Cloud Run Deployments"],
-            "recommended_gcp_products": ["Binary Authorization", "Cloud HSM"],
-            "architectural_recommendation": (
-                "Enforce 'Binary Authorization' backed by 'Cloud HSM' and Post-Quantum signing keys (PQ_SIGN_ML_DSA_65 / PQ_SIGN_SLH_DSA_SHA2_128S) "
-                "to guarantee cryptographic supply-chain attestation prior to GKE and Cloud Run admission."
-            ),
-        },
-    ]
-
-    customer_environment_execution_guide = [
-        {
-            "workstream_id": "WORKSTREAM_1_GOVERNANCE_AND_SYMMETRIC_HYGIENE",
-            "title": "Fase 1 (Dia 0–15): Governança Preventiva e Higiene de Rotação Simétrica (Zero Downtime)",
-            "objective": "Bloquear a criação de novas chaves clássicas RSA/ECC na Organização e aplicar rotação automática <= 90 dias em todas as chaves CMEK AES-256 sem impacto nas aplicações.",
-            "step_by_step_actions": [
-                f"1. Aplicar as Custom Constraints de Organization Policy (`custom.pqcEnforceQuantumSafeKmsAlgorithms` e `custom.pqcEnforceSymmetricKeyRotation90d`) na Organização `{org_target}` em modo dry-run/enforced.",
-                f"2. Executar os {len(rotation_playbooks)} comandos `gcloud kms keys update --rotation-period=90d` listados em `symmetric_rotation_playbooks`.",
-                "3. Validar que 100% das chaves simétricas exibem `COMPLIANT_ROTATION_90D` e que tentativas de criar chaves `RSA_*` ou `EC_*` são bloqueadas pela política organizacional.",
-            ],
-        },
-        {
-            "workstream_id": "WORKSTREAM_2_NETWORK_TLS13_PQC_TRANSIT",
-            "title": "Fase 2 (Dia 15–30): Blindagem de Perímetro de Rede e TLS 1.3 Hybrid PQC (X25519MLKEM768)",
-            "objective": "Eliminar a captura passiva de pacotes (HNDL em trânsito) nos Cloud Load Balancers e expandir buffers HTTP antes da migração de assinaturas PQC.",
-            "step_by_step_actions": [
-                "1. Criar ou atualizar políticas `compute.sslPolicies` com `--min-tls-version=1.3 --profile=RESTRICTED` em todos os projetos com ingress externo/interno para habilitar a troca de chaves híbrida `X25519MLKEM768`.",
-                "2. Associar a SSL Policy a todos os `target-https-proxies` e `target-ssl-proxies` (`gcloud compute target-https-proxies update <PROXY> --ssl-policy=<POLICY>`).",
-                "3. Ajustar `max_request_headers_kb: 32` no Envoy/Istio e `large_client_header_buffers 4 32k` no NGINX/Apigee para suportar tokens JWT/cabeçalhos assinados com `ML-DSA-65` (~4.4 KB Base64URL).",
-            ],
-        },
-        {
-            "workstream_id": "WORKSTREAM_3_HNDL_KEM_DATA_PLANE_MIGRATION",
-            "title": "Fase 3 (Dia 30–60): Mitigação Crítica de HNDL em Chaves de Decriptação (RSA-OAEP -> KEM_XWING / ML-KEM-1024)",
-            "objective": "Substituir chaves `ASYMMETRIC_DECRYPT` vulneráveis ao Algoritmo de Shor por mecanismos de encapsulamento pós-quânticos em Cloud HSM (`--protection-level=hsm`).",
-            "step_by_step_actions": [
-                "1. Expandir colunas de banco de dados/metadados que armazenam DEKs encapsuladas de 256 bytes para >= 1.568 bytes (`VARBINARY(2048)`).",
-                "2. Provisionar as chaves substitutas `KEM_XWING` (ou `ML_KEM_1024` para CNSA 2.0) com `--purpose=key-encapsulation --protection-level=hsm` e conceder `roles/cloudkms.cryptoKeyDecapsulator` às Service Accounts consumidoras.",
-                "3. Refatorar os microsserviços consumidores de `kms.AsymmetricDecrypt` para `kms.Decapsulate` + `HKDF-SHA256` + `AES-256-GCM` (RFC 9180 HPKE / Google Tink SDK) e desativar as versões RSA legadas após re-encapsulamento.",
-            ],
-        },
-        {
-            "workstream_id": "WORKSTREAM_4_DIGITAL_SIGNATURES_JWT_AND_PKI",
-            "title": "Fase 4 (Dia 60–90): Migração de Assinaturas Digitais, Tokens JWT e PKI (RSA/ECDSA -> ML-DSA-65 / ML-DSA-87)",
-            "objective": "Eliminar o risco de falsificação quântica de identidade, tokens OAuth/JWT e webhooks com NIST FIPS 204 (`PQ_SIGN_ML_DSA_65`).",
-            "step_by_step_actions": [
-                "1. Provisionar as chaves `PQ_SIGN_ML_DSA_65` (ou `PQ_SIGN_ML_DSA_87`) em Cloud HSM (`--protection-level=hsm`) e vincular `roles/cloudkms.signerVerifier` às Service Accounts emissoras.",
-                "2. Refatorar as chamadas de assinatura no código de `AsymmetricSign(digest={'sha256': ...})` para `AsymmetricSign(data=raw_bytes)` (ou calcular `mu` de 64 bytes via SHAKE256 em modo `_EXTERNAL_MU`).",
-                "3. Atualizar os verificadores consumidores (OpenSSL 3.5+ / BoringSSL / Tink) com a nova chave pública ML-DSA-65 (1.952 bytes) e desativar as versões RSA/ECDSA antigas.",
-            ],
-        },
-        {
-            "workstream_id": "WORKSTREAM_5_BYOK_AND_POST_CUTOVER_VALIDATION",
-            "title": "Fase 5 (Contínuo): BYOK/EKM Pós-Quântico, Governança de Fornecedores (FAR/NCCoE) e Atestação CBOM CycloneDX 1.6",
-            "objective": "Garantir que chaves importadas (BYOK) utilizem wrapping híbrido pós-quântico RFC 9180 HPKE, validar dependências de terceiros e auditar o estado final do ambiente.",
-            "step_by_step_actions": [
-                "1. Substituir `ImportJobs` clássicos (`RSA_OAEP_*`) por wrapping pós-quântico RFC 9180 HPKE (`--import-method=hpke-kem-xwing-hkdf-sha256-aes-256-gcm`, `hpke-kem-ml-kem-768-hkdf-sha256-aes-256-gcm` ou `hpke-kem-ml-kem-1024-hkdf-sha256-aes-256-gcm`).",
-                "2. Executar os comandos `post_migration_disable_legacy_command` e `post_change_validation_command` e reconciliar com o painel nativo `Asymmetric PQC insights` do Cloud KMS e Wiz para confirmar que nenhuma versão clássica `RSA_*` ou `EC_*` permanece `ENABLED`.",
-                "3. Nomear formalmente o `PQC Migration Lead` (EO 14412 Sec. 4(a) / OMB M-26-15), incluir vulnerabilidades criptográficas na política de VDP/aquisições de fornecedores (EO 14412 Sec. 6(c)-(d) / NIST NCCoE) e exportar o inventário `CycloneDX v1.6 CBOM` para conformidade NIST IR 8547 (Final, Out/2026), UK NCSC (2028/2031/2035) e NSA CNSA 2.0.",
-            ],
-        },
-    ]
-
-    def _slim_key_ref(k: Dict[str, Any]) -> Dict[str, Any]:
-        """Projects a key dict into a token-efficient summary, avoiding repetition of nested arrays already in playbooks/matrix."""
-        return {
-            "project_id": k.get("project_id", clean_id),
-            "location": k.get("location", "global"),
-            "key_ring": k.get("key_ring"),
-            "key_name": k.get("key_name"),
-            "purpose": k.get("purpose"),
-            "algorithm": k.get("algorithm"),
-            "protection_level": k.get("protection_level"),
-            "quantum_status": k.get("quantum_status"),
-            "priority": k.get("priority"),
-            "recommended_algorithm": k.get("recommended_algorithm"),
-            "hygiene_status": k.get("hygiene_status"),
-            "primary_state": k.get("primary_state"),
-            "is_active": k.get("is_active", True),
-            "data_source": k.get("data_source", data_source_authenticity),
-        }
-
-    plan = {
+    keys.sort(key=lambda k: (k["project_id"], k["location"], k["key_ring"], k["key_name"]))
+    compact_keys, alternatives_reference = _attach_alternatives_reference(keys)
+    payload = {
         "scope": scope_uri,
         "scope_mode": mode,
-        "organization_id": DEFAULT_ORGANIZATION_ID if mode == "ORG" else None,
         "organization_domain": DEFAULT_ORGANIZATION_NAME if mode == "ORG" else None,
-        "project_id": clean_id if mode == "PROJECT" else scope_uri,
-        "data_validation_manifest": data_validation_manifest,
-        "validated_executive_scorecard": validated_executive_scorecard,
-        "cbom_summary": cbom_summary,
-        "projects_breakdown": projects_breakdown,
-        "application_compatibility_matrix": application_compatibility_matrix,
-        "priority_vulnerable_keys": [_slim_key_ref(vk) for vk in vulnerable_keys],
-        "symmetric_hygiene_findings": [_slim_key_ref(sk) for sk in unrotated_sym_keys],
-        "inactive_or_destroyed_keys": [_slim_key_ref(ik) for ik in inactive_keys],
-        "remediation_playbooks": remediation_commands,
-        "symmetric_rotation_playbooks": rotation_playbooks,
-        "customer_environment_execution_guide": customer_environment_execution_guide,
-        "preventive_org_policy_guardrails": preventive_org_policy_guardrails,
-        "recommended_google_cloud_security_architecture_and_product_bom": recommended_product_bom,
-        "regulatory_and_standards_alignment_2026": {
-            "nist_ir_8547_final": "Published October 27, 2026 (DOI: 10.6028/NIST.IR.8547) — Deprecates RSA/ECDSA/EdDSA/ECDH/FFDH in 2030 and disallows them after 2035.",
-            "white_house_eo_14412_and_omb_m_26_15": (
-                "Executive Order 14412 (June 22, 2026) & OMB M-26-15 mandate appointing a PQC Migration Lead (Sec. 4(a)), "
-                "automated CBOM inventories (Sec. 5(d)), PQC Key Establishment (FIPS 203) by Dec 31, 2030 (Sec. 4(b)(ii)), "
-                "PQC Digital Signatures (FIPS 204/205) by Dec 31, 2031 (Sec. 4(b)(iii)), accelerated CMVP FIPS 140-3 validations (Sec. 6(b)), "
-                "and Federal Acquisition Regulation (FAR) contractor PQC compliance & VDP coverage by Dec 31, 2030 (Sec. 6(c)-(d))."
-            ),
-            "uk_ncsc_and_nccoe_timelines": (
-                "UK NCSC 3-Phase Roadmap (2028 Discovery & CBOM Plan / 2031 High-Priority Migration / 2035 Full Migration) "
-                "and NIST NCCoE Migration to PQC Project (end-to-end business service interoperability & third-party supplier readiness)."
-            ),
-            "google_cloud_kms_pqc_capabilities": (
-                "Supports NIST FIPS 203 (KEM_XWING, ML_KEM_768, ML_KEM_1024), FIPS 204 (PQ_SIGN_ML_DSA_44/65/87 & _EXTERNAL_MU), "
-                "FIPS 205 (PQ_SIGN_SLH_DSA_SHA2_128S & _HASH_), Quantum-Safe BYOK Import (HPKE_KEM_XWING / ML_KEM_768 / ML_KEM_1024), "
-                "native Asymmetric PQC insights dashboard, and Wiz cryptographic posture integration."
-            ),
-        },
-        "governance_recommendations": [
-            "1. Critical Priority (Phase 1 - HNDL / FIPS 203 / EO 14412 Dec 31, 2030 Deadline): Replace ASYMMETRIC_DECRYPT (RSA-OAEP) keys with KEM_XWING (Hybrid X25519 + ML-KEM-768) or ML_KEM_1024 (CNSA 2.0 Category 5), refactoring consuming applications from AsymmetricDecrypt to client-side Encapsulate + KMS Decapsulate + HPKE/AES-256-GCM.",
-            "2. High Priority (Phase 2 - Signatures & PKI / FIPS 204 & 205 / NIST IR 8547 2030 Deprecation & EO 14412 Dec 31, 2031 Deadline): Migrate ASYMMETRIC_SIGN (RSA-PSS/PKCS1, ECDSA P-256/P-384, Ed25519) keys to PQ_SIGN_ML_DSA_65 (or PQ_SIGN_ML_DSA_87 for CNSA 2.0), refactor KMS signing calls from `digest` to `data` (or `_EXTERNAL_MU`), and validate HTTP header/payload size limits (3,309-byte signature vs. 64-byte ECDSA).",
-            "3. Symmetric Cryptographic Hygiene (Grover & NIST SP 800-57): Applications using AES-256 (GOOGLE_SYMMETRIC_ENCRYPTION) CMEK and HMAC-SHA256+ are 100% compatible with the PQC model with zero code changes (note: HMAC_SHA1 is non-quantum-safe and must be replaced); maintain automatic key rotation <= 90 days (CIS GCP Benchmark 1.10).",
-            "4. Data-in-Transit Security (TLS 1.3 PQC Hybrid KEX): Ensure all Cloud Load Balancing SslPolicies enforce minTlsVersion=TLS_1_3 to enable Post-Quantum Hybrid Key Exchange (X25519MLKEM768) against passive network packet harvesting.",
-            "5. Safe Decommissioning & Downgrade Prevention: After migrating consuming applications to PQC keys, disable and schedule destruction of legacy classical key versions (gcloud kms keys versions disable/destroy).",
-            "6. Preventive Organization Policy Guardrails: Deploy `custom.pqcEnforceQuantumSafeKmsAlgorithms` and `custom.pqcEnforceSymmetricKeyRotation90d` via GCP Organization Policy Service to block creation of new classical RSA/ECC keys.",
-            "7. Recommended Google Cloud Security Architecture & Product BOM: Combine Cloud HSM (FIPS 140-3 Level 3), Google Tink SDK (RFC 9180 HPKE), VPC Service Controls (VPC-SC) + Private Service Connect (PSC), Cloud Global Load Balancing (L7 TLS 1.3) + Certificate Authority Service (CAS), Binary Authorization, Cloud KMS Asymmetric PQC insights, and Wiz.",
-            "8. Executive Governance, Supplier Readiness & CBOM Mandate (NIST IR 8547 Final Oct 2026 / EO 14412 / UK NCSC 2028): Designate an enterprise PQC Migration Lead, enforce third-party SaaS/HSM supplier PQC clauses (FAR Sec. 6(c)) and Vulnerability Disclosure Policy (VDP) coverage for quantum-vulnerable cryptography (Sec. 6(d)), and maintain an automated CycloneDX v1.6 CBOM.",
-        ],
+        "data_source": LIVE_DATA_SOURCE,
+        "generated_at": _now_iso(),
+        **_inventory_summary(keys),
+        "keys": compact_keys,
+        "cloud_kms_pqc_alternatives_reference": alternatives_reference,
+        "collection_errors": errors,
+        "excluded_key_rings": sorted(set(skipped)),
     }
+    if not keys and errors:
+        payload["error"] = "No keys could be read; see collection_errors."
+        payload["required_roles"] = REQUIRED_READ_ROLES
+    return _cache_put(cache_key, _compact_json(payload))
 
-    return _compact_json(plan)
+
+# ---------------------------------------------------------------------------
+# Workload evidence (Cloud Asset Inventory) — raw facts for the correlation agent
+# ---------------------------------------------------------------------------
 
 
-def scan_organization_pqc_readiness(
-    organization_id: str = DEFAULT_ORGANIZATION_ID,
-) -> str:
-    """Executes a full Organization-wide PQC Readiness & Application Compatibility Assessment across all active GCP projects.
+def _normalize_kms_key_ref(k_ref: str) -> str:
+    clean = (k_ref or "").split("/cryptoKeyVersions/")[0]
+    idx = clean.find("projects/")
+    return clean[idx:] if idx >= 0 else clean
 
-    Evaluates all Cloud KMS keys, active `CryptoKeyVersions`, consuming applications/workloads, PQC model compatibility,
-    and Cloud Asset Inventory resources according to NIST FIPS 203/204/205, NIST SP 800-57 (<= 90-day rotation),
-    CIS GCP Benchmark 1.10, and NSA CNSA 2.0.
+
+def _build_workload_evidence_payload(
+    mode: str, scope_uri: str, raw_workloads: List[Dict[str, Any]], data_source: str, errors: List[str]
+) -> Dict[str, Any]:
+    cmek_references: List[Dict[str, Any]] = []
+    workloads: List[Dict[str, Any]] = []
+    by_type: Dict[str, int] = {}
+    for w in raw_workloads:
+        refs = [_normalize_kms_key_ref(r) for r in (w.get("kms_keys") or []) if r]
+        entry = {k: v for k, v in w.items() if k != "kms_keys"}
+        entry["kms_key_references"] = refs
+        workloads.append(entry)
+        by_type[w["asset_type"]] = by_type.get(w["asset_type"], 0) + 1
+        for ref in refs:
+            cmek_references.append(
+                {
+                    "kms_key": ref,
+                    "consumer_resource": w["name"],
+                    "consumer_asset_type": w["asset_type"],
+                    "consumer_project_id": w.get("project_id"),
+                    "evidence_source": "Cloud Asset Inventory resource kmsKey/kmsKeys field",
+                }
+            )
+    truncated = len(workloads) > MAX_WORKLOADS_RETURNED
+    payload: Dict[str, Any] = {
+        "scope": scope_uri,
+        "scope_mode": mode,
+        "data_source": data_source,
+        "generated_at": _now_iso(),
+        "cmek_reference_count": len(cmek_references),
+        "cmek_references": cmek_references,
+        "workload_count": len(workloads),
+        "workloads_by_asset_type": by_type,
+        "workloads": workloads[:MAX_WORKLOADS_RETURNED],
+        "workloads_truncated": truncated,
+        "collection_errors": errors,
+    }
+    if data_source == SIMULATED_DATA_SOURCE:
+        payload["simulation_notice"] = SIMULATION_NOTICE
+    return payload
+
+
+def collect_workload_evidence(scope: str = f"organizations/{DEFAULT_ORGANIZATION_ID}") -> str:
+    """Collects raw workload evidence from Cloud Asset Inventory for key-to-workload correlation (facts only).
+
+    Returns workloads (Cloud Run, GKE, Compute, Storage, BigQuery, Cloud SQL, Secret Manager, Pub/Sub,
+    Artifact Registry, service accounts) with labels and the exact Cloud KMS keys referenced by each resource
+    (CMEK). It does not infer relationships; the correlation agent decides and cites evidence levels.
 
     Args:
-        organization_id: Google Cloud Organization ID (default: `"31564119954"` — `jsaccomani.altostrat.com`).
+        scope: 'organizations/<id>', 'folders/<id>', 'projects/<id>' or a bare project ID.
 
     Returns:
-        Formatted JSON string containing the Organization-wide CBOM summary, separated PQC scores,
-        per-project breakdown, Application PQC Compatibility Matrix, vulnerable keys, and `gcloud kms` remediation playbooks.
+        JSON with `cmek_references` (exact key -> consumer resource), `workloads`, counts and `collection_errors`.
     """
-    clean_org = (organization_id or DEFAULT_ORGANIZATION_ID).strip()
-    if clean_org.lower() in ORG_MODE_TOKENS:
-        clean_org = DEFAULT_ORGANIZATION_ID
-    elif clean_org.lower().startswith("organizations/"):
-        clean_org = clean_org.split("/", 1)[1].strip()
-    elif _is_internal_runtime_tenant_project(clean_org):
-        clean_org = DEFAULT_ORGANIZATION_ID
+    mode, scope_uri, clean_id = _resolve_scope(scope)
+    simulated = simulation_requested(clean_id)
+    cache_key = f"workloads:{scope_uri}:{simulated}"
+    cached = _cache_get(cache_key)
+    if cached:
+        return cached
 
-    org_scope = f"organizations/{clean_org}"
-    migration_plan = json.loads(generate_pqc_migration_plan(project_id=org_scope, location_id="all"))
-    cai_assets = json.loads(discover_all_crypto_assets(project_id=org_scope))
-    migration_plan["cloud_asset_inventory_summary"] = {
-        "total_assets": cai_assets.get("total_assets", len(cai_assets.get("assets", []))),
-        "data_source": cai_assets.get("data_source", "LIVE_CLOUD_ASSET_INVENTORY"),
+    if simulated:
+        raw = mock_data.get_simulated_workload_evidence(clean_id)["workloads"]
+        payload = _build_workload_evidence_payload(mode, scope_uri, raw, SIMULATED_DATA_SOURCE, [])
+        return _cache_put(cache_key, _compact_json(payload))
+
+    raw_workloads: List[Dict[str, Any]] = []
+    try:
+        cai_client = asset_v1.AssetServiceClient(**_get_client_kwargs())
+        response = cai_client.search_all_resources(
+            request={"scope": scope_uri, "asset_types": WORKLOAD_ASSET_TYPES, "page_size": 500}
+        )
+        for r in response:
+            refs: List[str] = []
+            if getattr(r, "kms_key", ""):
+                refs.append(r.kms_key)
+            for k_ref in getattr(r, "kms_keys", None) or []:
+                if k_ref not in refs:
+                    refs.append(k_ref)
+            raw_workloads.append(
+                {
+                    "asset_type": r.asset_type,
+                    "name": r.name,
+                    "display_name": r.display_name or r.name.split("/")[-1],
+                    "project_id": _project_from_cai_name(r.name, r.project),
+                    "location": r.location or "global",
+                    "labels": dict(r.labels) if r.labels else {},
+                    "kms_keys": refs,
+                }
+            )
+    except Exception as exc:
+        return _compact_json(
+            {
+                "scope": scope_uri,
+                "scope_mode": mode,
+                "data_source": LIVE_DATA_SOURCE,
+                "error": f"Cloud Asset Inventory workload search failed: {type(exc).__name__}: {str(exc)[:300]}",
+                "required_roles": ["roles/cloudasset.viewer"],
+            }
+        )
+
+    payload = _build_workload_evidence_payload(mode, scope_uri, raw_workloads, LIVE_DATA_SOURCE, [])
+    return _cache_put(cache_key, _compact_json(payload))
+
+
+# ---------------------------------------------------------------------------
+# Crypto / PKI assets from Cloud Asset Inventory (raw attributes)
+# ---------------------------------------------------------------------------
+
+CRYPTO_ASSET_TYPES = [
+    "compute.googleapis.com/SslCertificate",
+    "certificatemanager.googleapis.com/Certificate",
+    "privateca.googleapis.com/CertificateAuthority",
+    "compute.googleapis.com/SslPolicy",
+]
+_CRYPTO_ATTRIBUTE_KEYS = (
+    "type",
+    "expireTime",
+    "minTlsVersion",
+    "profile",
+    "customFeatures",
+    "keySpec",
+    "managed",
+    "subjectAlternativeNames",
+    "state",
+)
+
+
+def discover_all_crypto_assets(scope: str = f"organizations/{DEFAULT_ORGANIZATION_ID}") -> str:
+    """Lists TLS certificates, Certificate Manager certificates, Private CA authorities and SSL policies (raw facts).
+
+    Args:
+        scope: 'organizations/<id>', 'folders/<id>', 'projects/<id>' or a bare project ID.
+
+    Returns:
+        JSON with `assets` (asset type, name, project, location, state, selected raw attributes, labels).
+    """
+    mode, scope_uri, clean_id = _resolve_scope(scope)
+    simulated = simulation_requested(clean_id)
+    cache_key = f"cai-crypto:{scope_uri}:{simulated}"
+    cached = _cache_get(cache_key)
+    if cached:
+        return cached
+
+    if simulated:
+        payload = {
+            "scope": scope_uri,
+            "scope_mode": mode,
+            "data_source": SIMULATED_DATA_SOURCE,
+            "simulation_notice": SIMULATION_NOTICE,
+            "generated_at": _now_iso(),
+            "assets": mock_data.get_simulated_cai_crypto_assets(clean_id),
+        }
+        payload["asset_count"] = len(payload["assets"])
+        return _cache_put(cache_key, _compact_json(payload))
+
+    assets: List[Dict[str, Any]] = []
+    try:
+        cai_client = asset_v1.AssetServiceClient(**_get_client_kwargs())
+        response = cai_client.search_all_resources(
+            request={"scope": scope_uri, "asset_types": CRYPTO_ASSET_TYPES, "page_size": 500, "read_mask": "*"}
+        )
+        for resource in response:
+            attrs: Dict[str, Any] = {}
+            if getattr(resource, "versioned_resources", None):
+                try:
+                    full = dict(resource.versioned_resources[0].resource)
+                    attrs = {k: full[k] for k in _CRYPTO_ATTRIBUTE_KEYS if k in full}
+                except Exception:
+                    attrs = {}
+            assets.append(
+                {
+                    "asset_type": resource.asset_type,
+                    "name": resource.name,
+                    "display_name": resource.display_name,
+                    "project_id": _project_from_cai_name(resource.name, resource.project),
+                    "location": resource.location,
+                    "state": resource.state,
+                    "attributes": attrs,
+                    "labels": dict(resource.labels) if resource.labels else {},
+                }
+            )
+    except Exception as exc:
+        return _compact_json(
+            {
+                "scope": scope_uri,
+                "scope_mode": mode,
+                "data_source": LIVE_DATA_SOURCE,
+                "error": f"Cloud Asset Inventory crypto asset search failed: {type(exc).__name__}: {str(exc)[:300]}",
+                "required_roles": ["roles/cloudasset.viewer"],
+            }
+        )
+
+    payload = {
+        "scope": scope_uri,
+        "scope_mode": mode,
+        "data_source": LIVE_DATA_SOURCE,
+        "generated_at": _now_iso(),
+        "asset_count": len(assets),
+        "assets": assets,
     }
-    return _compact_json(migration_plan)
+    return _cache_put(cache_key, _compact_json(payload))
 
 
-def _get_cyclonedx_crypto_properties(item: Dict[str, Any]) -> Dict[str, Any]:
-    """Maps a Cloud KMS key classification to official OWASP CycloneDX v1.6 `cryptoProperties` schema."""
-    algo = str(item.get("algorithm", "UNKNOWN")).upper()
-    purpose = str(item.get("purpose", "UNKNOWN")).upper()
-    prot = str(item.get("protection_level", "SOFTWARE")).upper()
-    q_status = str(item.get("quantum_status", "UNKNOWN"))
+# ---------------------------------------------------------------------------
+# Auditable scorecard (deterministic arithmetic with explicit numerators/denominators)
+# ---------------------------------------------------------------------------
 
-    # Map primitive and cryptoFunctions
+SCORECARD_WEIGHTS = {
+    "asymmetric_pqc_migration": 0.60,
+    "symmetric_quantum_resistance": 0.25,
+    "symmetric_rotation_hygiene": 0.15,
+}
+
+
+def compute_scorecard_from_keys(keys: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Computes KMS posture KPIs from factual key records. Pure arithmetic, fully reproducible."""
+    active = [k for k in keys if k.get("is_active")]
+
+    def family(k: Dict[str, Any]) -> str:
+        return k["algorithm_facts"]["algorithm_family"]
+
+    def status(k: Dict[str, Any]) -> str:
+        return k["algorithm_facts"]["quantum_status"]
+
+    asym = [k for k in active if family(k) in ASYMMETRIC_FAMILIES]
+    asym_pqc = [k for k in asym if status(k) == "QUANTUM_SAFE_PQC"]
+    sym = [k for k in active if family(k) in SYMMETRIC_FAMILIES]
+    sym_resistant = [k for k in sym if status(k) == "QUANTUM_RESISTANT_SYMMETRIC"]
+    sym_encrypt = [k for k in sym if k.get("purpose") == "ENCRYPT_DECRYPT"]
+    sym_rotated = [k for k in sym_encrypt if k.get("hygiene_flags", {}).get("rotation_within_90_days")]
+    quantum_safe = [k for k in active if status(k) in ("QUANTUM_SAFE_PQC", "QUANTUM_RESISTANT_SYMMETRIC")]
+    unknown = [k for k in active if status(k) == "UNKNOWN_REQUIRES_REVIEW"]
+
+    metrics = {
+        "asymmetric_pqc_migration": _ratio_metric(
+            len(asym_pqc), len(asym), "Active asymmetric keys using a post-quantum algorithm / all active asymmetric keys."
+        ),
+        "symmetric_quantum_resistance": _ratio_metric(
+            len(sym_resistant),
+            len(sym),
+            "Active symmetric/MAC keys with >= 128-bit post-quantum security / all active symmetric/MAC keys.",
+        ),
+        "symmetric_rotation_hygiene": _ratio_metric(
+            len(sym_rotated),
+            len(sym_encrypt),
+            "Active ENCRYPT_DECRYPT symmetric keys with automatic rotation <= 90 days / all active ENCRYPT_DECRYPT keys.",
+        ),
+        "algorithmic_quantum_safe": _ratio_metric(
+            len(quantum_safe), len(active), "Active keys whose algorithm is post-quantum or quantum-resistant / all active keys."
+        ),
+    }
+
+    available = {name: w for name, w in SCORECARD_WEIGHTS.items() if metrics[name]["denominator"]}
+    weight_sum = sum(available.values())
+    weighted_value = (
+        round(sum(metrics[n]["value_pct"] * w for n, w in available.items()) / weight_sum, 1) if weight_sum else None
+    )
+    metrics["weighted_kms_pqc_maturity"] = {
+        "value_pct": weighted_value,
+        "weights_used": {n: round(w / weight_sum, 3) for n, w in available.items()} if weight_sum else {},
+        "definition": (
+            "Weighted average of the KMS KPIs above (methodology weights 60% asymmetric PQC migration, "
+            "25% symmetric quantum resistance, 15% rotation hygiene), renormalized over KPIs that apply in this scope."
+        ),
+    }
+    return {
+        "metrics": metrics,
+        "counts": {
+            "active_keys": len(active),
+            "inactive_keys": len(keys) - len(active),
+            "active_asymmetric_keys": len(asym),
+            "active_asymmetric_pqc_keys": len(asym_pqc),
+            "active_shor_vulnerable_keys": len([k for k in asym if status(k) == "QUANTUM_VULNERABLE_SHOR"]),
+            "active_symmetric_or_mac_keys": len(sym),
+            "active_symmetric_below_pq_target": len([k for k in sym if status(k) == "BELOW_PQ_SECURITY_TARGET"]),
+            "active_symmetric_encrypt_keys_without_90d_rotation": len(sym_encrypt) - len(sym_rotated),
+            "active_keys_unknown_requires_review": len(unknown),
+        },
+    }
+
+
+def compute_pqc_scorecard(
+    scope: str = f"organizations/{DEFAULT_ORGANIZATION_ID}",
+    location: str = "all",
+    include_network_and_byok: bool = True,
+) -> str:
+    """Computes the auditable PQC posture scorecard (deterministic arithmetic, explicit numerators/denominators).
+
+    KMS KPIs come from `collect_kms_inventory`. When `include_network_and_byok` is true it also computes the share
+    of HTTPS/SSL target proxies that require TLS 1.3 and the share of active KMS import jobs that use post-quantum
+    HPKE wrapping. The tool does not interpret the numbers; the agent explains them.
+
+    Args:
+        scope: 'organizations/<id>', 'folders/<id>', 'projects/<id>' or a bare project ID.
+        location: Cloud KMS location filter or 'all'.
+        include_network_and_byok: Also compute TLS and BYOK import-job KPIs.
+
+    Returns:
+        JSON with `metrics` (value_pct, numerator, denominator, definition), `counts` and `data_sources`.
+    """
+    inventory = json.loads(collect_kms_inventory(scope=scope, location=location))
+    if inventory.get("error") and not inventory.get("keys"):
+        return _compact_json({"scope": inventory.get("scope"), "error": inventory["error"], "required_roles": REQUIRED_READ_ROLES})
+
+    result = compute_scorecard_from_keys(inventory.get("keys", []))
+    result.update(
+        {
+            "scope": inventory.get("scope"),
+            "generated_at": _now_iso(),
+            "data_sources": {"kms_inventory": inventory.get("data_source")},
+            "collection_errors": list(inventory.get("collection_errors", [])),
+        }
+    )
+    if inventory.get("data_source") == SIMULATED_DATA_SOURCE:
+        result["simulation_notice"] = SIMULATION_NOTICE
+
+    if include_network_and_byok:
+        from tools.pqc_detectors import collect_kms_import_jobs, collect_tls_policies
+
+        tls = json.loads(collect_tls_policies(scope=scope))
+        if tls.get("error"):
+            result["collection_errors"].append(f"TLS policies: {tls['error']}")
+        else:
+            proxies = tls.get("target_proxies", [])
+            tls13 = [p for p in proxies if p.get("effective_requires_tls_1_3")]
+            result["metrics"]["https_proxies_requiring_tls_1_3"] = _ratio_metric(
+                len(tls13), len(proxies), "HTTPS/SSL target proxies whose effective SSL policy requires TLS 1.3 / all target proxies."
+            )
+            result["data_sources"]["tls_policies"] = tls.get("data_source")
+
+        ij = json.loads(collect_kms_import_jobs(scope=scope, location=location))
+        if ij.get("error"):
+            result["collection_errors"].append(f"KMS import jobs: {ij['error']}")
+        else:
+            active_jobs = [j for j in ij.get("import_jobs", []) if j.get("is_active")]
+            pqc_jobs = [j for j in active_jobs if j.get("transport_quantum_status") == "QUANTUM_SAFE_PQC"]
+            result["metrics"]["byok_import_jobs_using_pqc_wrapping"] = _ratio_metric(
+                len(pqc_jobs), len(active_jobs), "Active KMS import jobs using post-quantum HPKE wrapping / all active import jobs."
+            )
+            result["data_sources"]["kms_import_jobs"] = ij.get("data_source")
+
+    return _compact_json(result)
+
+
+# ---------------------------------------------------------------------------
+# OWASP CycloneDX v1.6 CBOM export (facts + agent-validated correlations)
+# ---------------------------------------------------------------------------
+
+
+def _cyclonedx_crypto_properties(key: Dict[str, Any]) -> Dict[str, Any]:
+    """Maps a factual key record to CycloneDX v1.6 `cryptoProperties`."""
+    algo = str(key.get("effective_algorithm", "UNKNOWN")).upper()
+    purpose = str(key.get("purpose", "UNKNOWN")).upper()
+    facts = key.get("algorithm_facts", {})
+
     if "KEM" in purpose or "KEM" in algo or "XWING" in algo:
-        primitive = "kem"
-        crypto_functions = ["encapsulate", "decapsulate"]
+        primitive, functions = "kem", ["encapsulate", "decapsulate"]
     elif "DECRYPT" in purpose and "ASYMMETRIC" in purpose:
-        primitive = "pke"
-        crypto_functions = ["encrypt", "decrypt"]
+        primitive, functions = "pke", ["encrypt", "decrypt"]
     elif "SIGN" in purpose:
-        primitive = "signature"
-        crypto_functions = ["sign", "verify"]
-    elif "MAC" in purpose or "HMAC" in algo:
-        primitive = "mac"
-        crypto_functions = ["tag", "verify"]
+        primitive, functions = "signature", ["sign", "verify"]
+    elif "MAC" in purpose or algo.startswith("HMAC"):
+        primitive, functions = "mac", ["tag", "verify"]
     else:
-        primitive = "ae"
-        crypto_functions = ["encrypt", "decrypt", "keygen"]
+        primitive, functions = "ae", ["encrypt", "decrypt", "keygen"]
 
-    # Map ASN.1 OID, parameterSetIdentifier, classicalSecurityLevel, and nistQuantumSecurityLevel
-    oid = "2.16.840.1.101.3.4"
-    param_set = "256"
-    classical_bits = 128
-    nist_pqc_level = 1
-
-    if "KEM_XWING" in algo or "XWING" in algo:
-        oid = "1.3.6.1.4.1.62253.25722"  # IETF CFRG X-Wing Hybrid KEM (X25519 + ML-KEM-768)
-        param_set = "X25519+ML-KEM-768"
-        classical_bits = 192
-        nist_pqc_level = 3
-    elif "ML_KEM_768" in algo:
-        oid = "2.16.840.1.101.3.4.4.2"  # NIST CSOR id-alg-ml-kem-768
-        param_set = "768"
-        classical_bits = 192
-        nist_pqc_level = 3
-    elif "ML_KEM_1024" in algo:
-        oid = "2.16.840.1.101.3.4.4.3"  # NIST CSOR id-alg-ml-kem-1024
-        param_set = "1024"
-        classical_bits = 256
-        nist_pqc_level = 5
-    elif "ML_DSA_44" in algo:
-        oid = "2.16.840.1.101.3.4.3.17"  # NIST CSOR id-ml-dsa-44
-        param_set = "44"
-        classical_bits = 128
-        nist_pqc_level = 2
-    elif "ML_DSA_65" in algo:
-        oid = "2.16.840.1.101.3.4.3.18"  # NIST CSOR id-ml-dsa-65
-        param_set = "65"
-        classical_bits = 192
-        nist_pqc_level = 3
-    elif "ML_DSA_87" in algo:
-        oid = "2.16.840.1.101.3.4.3.19"  # NIST CSOR id-ml-dsa-87
-        param_set = "87"
-        classical_bits = 256
-        nist_pqc_level = 5
-    elif "SLH_DSA" in algo:
-        oid = "2.16.840.1.101.3.4.3.20"  # NIST CSOR id-slh-dsa-sha2-128s
-        param_set = "128s"
-        classical_bits = 128
-        nist_pqc_level = 1
-    elif "RSA_DECRYPT_OAEP" in algo:
-        oid = "1.2.840.113549.1.1.7"  # PKCS#1 id-RSAES-OAEP
+    table: List[Tuple[str, str, str, Optional[int], int]] = [
+        # (match token, oid, parameterSetIdentifier, classicalSecurityLevel, nistQuantumSecurityLevel)
+        ("XWING", "1.3.6.1.4.1.62253.25722", "X25519+ML-KEM-768", 192, 3),
+        ("ML_KEM_768", "2.16.840.1.101.3.4.4.2", "768", 192, 3),
+        ("ML_KEM_1024", "2.16.840.1.101.3.4.4.3", "1024", 256, 5),
+        ("ML_DSA_44", "2.16.840.1.101.3.4.3.17", "44", 128, 2),
+        ("ML_DSA_65", "2.16.840.1.101.3.4.3.18", "65", 192, 3),
+        ("ML_DSA_87", "2.16.840.1.101.3.4.3.19", "87", 256, 5),
+        ("SLH_DSA", "2.16.840.1.101.3.4.3.20", "128s", 128, 1),
+        ("RSA_DECRYPT_OAEP", "1.2.840.113549.1.1.7", "", None, 0),
+        ("RSA_SIGN_PSS", "1.2.840.113549.1.1.10", "", None, 0),
+        ("RSA_SIGN", "1.2.840.113549.1.1.11", "", None, 0),
+        ("EC_SIGN_P384", "1.2.840.10045.4.3.3", "P-384", 192, 0),
+        ("EC_SIGN_P256", "1.2.840.10045.4.3.2", "P-256", 128, 0),
+        ("ED25519", "1.3.101.112", "Ed25519", 128, 0),
+        ("SECP256K1", "1.2.840.10045.4.3.2", "secp256k1", 128, 0),
+        ("GOOGLE_SYMMETRIC_ENCRYPTION", "2.16.840.1.101.3.4.1.46", "256", 256, 5),
+        ("AES_256", "2.16.840.1.101.3.4.1.46", "256", 256, 5),
+        ("AES_128", "2.16.840.1.101.3.4.1.6", "128", 128, 1),
+        ("HMAC_SHA512", "1.2.840.113549.2.11", "512", 512, 5),
+        ("HMAC_SHA384", "1.2.840.113549.2.10", "384", 384, 5),
+        ("HMAC_SHA256", "1.2.840.113549.2.9", "256", 256, 5),
+        ("HMAC_SHA224", "1.2.840.113549.2.8", "224", 224, 3),
+        ("HMAC_SHA1", "1.2.840.113549.2.7", "160", 160, 1),
+    ]
+    oid, param_set, classical_bits, nist_level = "unknown", "", facts.get("classical_security_bits"), 0
+    for token, t_oid, t_param, t_classical, t_level in table:
+        if token in algo:
+            oid, param_set, nist_level = t_oid, t_param, t_level
+            classical_bits = t_classical if t_classical is not None else facts.get("classical_security_bits")
+            break
+    if algo.startswith("RSA_"):
         param_set = "4096" if "4096" in algo else ("3072" if "3072" in algo else "2048")
-        classical_bits = 140 if "4096" in algo else (128 if "3072" in algo else 112)
-        nist_pqc_level = 0  # Vulnerable to Shor's Algorithm
-    elif "RSA_SIGN" in algo:
-        oid = "1.2.840.113549.1.1.10" if "PSS" in algo else "1.2.840.113549.1.1.11"
-        param_set = "4096" if "4096" in algo else ("3072" if "3072" in algo else "2048")
-        classical_bits = 140 if "4096" in algo else (128 if "3072" in algo else 112)
-        nist_pqc_level = 0  # Vulnerable to Shor's Algorithm
-    elif "EC_SIGN" in algo:
-        oid = "1.2.840.10045.4.3.3" if "384" in algo else ("1.3.101.112" if "25519" in algo else "1.2.840.10045.4.3.2")
-        param_set = "P-384" if "384" in algo else ("Ed25519" if "25519" in algo else "P-256")
-        classical_bits = 192 if "384" in algo else 128
-        nist_pqc_level = 0  # Vulnerable to Shor's Algorithm
-    elif "GOOGLE_SYMMETRIC_ENCRYPTION" in algo or "AES_256" in algo:
-        oid = "2.16.840.1.101.3.4.1.46"  # NIST id-aes256-GCM
-        param_set = "256"
-        classical_bits = 256
-        nist_pqc_level = 1  # 128-bit post-quantum security against Grover's Algorithm (Category 1+)
-    elif "HMAC_SHA512" in algo:
-        oid = "1.2.840.113549.2.11"
-        param_set = "512"
-        classical_bits = 512
-        nist_pqc_level = 5
-    elif "HMAC_SHA256" in algo:
-        oid = "1.2.840.113549.2.9"
-        param_set = "256"
-        classical_bits = 256
-        nist_pqc_level = 1
-    elif q_status == "WEAK_SYMMETRIC_GROVER_RISK":
-        oid = "1.2.840.113549.2.7"
-        param_set = "128"
-        classical_bits = 128
-        nist_pqc_level = 0
-
-    exec_env = "hardware-environment" if "HSM" in prot else "software-plain-ram"
 
     return {
         "assetType": "algorithm",
         "algorithmProperties": {
             "primitive": primitive,
             "parameterSetIdentifier": param_set,
-            "executionEnvironment": exec_env,
+            "executionEnvironment": "hardware-environment" if "HSM" in str(key.get("protection_level")) else "software-plain-ram",
             "implementationPlatform": "gcp-cloud-kms",
-            "cryptoFunctions": crypto_functions,
+            "cryptoFunctions": functions,
             "classicalSecurityLevel": classical_bits,
-            "nistQuantumSecurityLevel": nist_pqc_level,
-        },
-        "relatedCryptoMaterialProperties": {
-            "type": "secret-key" if primitive in ("ae", "mac") else "private-key",
-            "state": "active" if item.get("is_active", True) else "deactivated",
-            "rotationPeriodDays": item.get("rotation_period_days"),
-            "enabledVersionsCount": item.get("enabled_versions_count", 1),
+            "nistQuantumSecurityLevel": nist_level,
         },
         "oid": oid,
     }
 
 
 def export_cyclonedx_cbom(
-    project_id: str = f"organizations/{DEFAULT_ORGANIZATION_ID}",
-    location_id: str = "all",
+    scope: str = f"organizations/{DEFAULT_ORGANIZATION_ID}",
+    location: str = "all",
+    validated_correlations_json: str = "",
 ) -> str:
-    """Exports a standards-compliant OWASP CycloneDX v1.6 Cryptographic Bill of Materials (CBOM) JSON document.
+    """Exports an OWASP CycloneDX v1.6 Cryptographic Bill of Materials (CBOM) for the Cloud KMS inventory.
 
-    Includes all discovered Cloud KMS `cryptographic-asset` components (with `cryptoProperties`, `algorithmProperties`,
-    `nistQuantumSecurityLevel`, ASN.1 `oid`, and Mosca's Theorem risk attributes), all consuming `application`
-    components, and the complete `dependencies` graph linking applications to their cryptographic keys.
+    Cryptographic-asset components come from `collect_kms_inventory`. Application components and dependencies
+    are included ONLY from `validated_correlations_json`, a JSON list produced by the correlation agent, e.g.
+    [{"application_name": "...", "workload_resource": "//run.googleapis.com/...", "kms_key": "projects/.../cryptoKeys/k",
+      "evidence_level": "STRONG|MEDIUM|WEAK", "evidence": "short citation"}]. Entries whose key is not in the inventory
+    are rejected and reported.
 
     Args:
-        project_id: GCP Organization (`organizations/31564119954`), Folder (`folders/<id>`), or Project ID.
-        location_id: Cloud KMS location (default: `"all"`).
+        scope: 'organizations/<id>', 'folders/<id>', 'projects/<id>' or a bare project ID.
+        location: Cloud KMS location filter or 'all'.
+        validated_correlations_json: Optional JSON list of agent-validated key-to-workload correlations.
 
     Returns:
-        Formatted JSON string conforming to the OWASP CycloneDX v1.6 CBOM specification.
+        JSON CycloneDX v1.6 document plus `export_notes` (rejected correlations, data source).
     """
-    mode, scope_uri, clean_id = _resolve_scope(project_id)
-    raw_kms_json = scan_pqc_readiness(project_id=project_id, location_id=location_id)
-    kms_items = json.loads(raw_kms_json)
+    inventory = json.loads(collect_kms_inventory(scope=scope, location=location))
+    if inventory.get("error") and not inventory.get("keys"):
+        return _compact_json({"scope": inventory.get("scope"), "error": inventory["error"]})
 
-    if isinstance(kms_items, dict) and "error" in kms_items:
-        return json.dumps(kms_items, indent=2, ensure_ascii=False)
-
-    cbom_summary = _compute_metrics_for_keys(kms_items)
-    serial_uuid = uuid.uuid5(uuid.NAMESPACE_DNS, f"cbom.pqc.gcp.{scope_uri}")
-    now_iso = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-    root_bom_ref = f"gcp-scope:{scope_uri}"
-
+    keys = inventory.get("keys", [])
+    scope_uri = inventory.get("scope", scope)
+    root_ref = f"gcp-scope:{scope_uri}"
     components: List[Dict[str, Any]] = []
-    app_components_by_ref: Dict[str, Dict[str, Any]] = {}
-    app_dependencies: Dict[str, List[str]] = {}
-    all_crypto_refs: List[str] = []
-
-    for item in kms_items:
-        proj = item.get("project_id") or clean_id
-        loc = item.get("location", "global")
-        kr = item.get("key_ring", "default")
-        kname = item.get("key_name", "key")
-        crypto_ref = f"crypto-key:{proj}/{loc}/{kr}/{kname}"
-        all_crypto_refs.append(crypto_ref)
-
-        mosca = item.get("mosca_risk_analysis", {})
-        compat = item.get("pqc_application_compatibility", {})
-
+    refs_by_resource: Dict[str, str] = {}
+    for k in keys:
+        ref = f"crypto-key:{k['resource_name']}"
+        refs_by_resource[k["resource_name"]] = ref
+        facts = k["algorithm_facts"]
         components.append(
             {
                 "type": "cryptographic-asset",
-                "bom-ref": crypto_ref,
-                "name": f"{kr}/{kname}",
-                "version": str(item.get("enabled_versions_count", 1)),
-                "description": (
-                    f"Google Cloud KMS CryptoKey ({item.get('algorithm')}) in {proj}/{loc} — "
-                    f"Quantum Status: {item.get('quantum_status')}"
-                ),
-                "cryptoProperties": _get_cyclonedx_crypto_properties(item),
+                "bom-ref": ref,
+                "name": f"{k['key_ring']}/{k['key_name']}",
+                "description": f"Cloud KMS CryptoKey {k['effective_algorithm']} in {k['project_id']}/{k['location']}",
+                "cryptoProperties": _cyclonedx_crypto_properties(k),
                 "properties": [
-                    {"name": "gcp:project_id", "value": str(proj)},
-                    {"name": "gcp:location", "value": str(loc)},
-                    {"name": "gcp:key_ring", "value": str(kr)},
-                    {"name": "pqc:quantum_status", "value": str(item.get("quantum_status"))},
-                    {"name": "pqc:priority", "value": str(item.get("priority"))},
-                    {"name": "pqc:recommended_algorithm", "value": str(item.get("recommended_algorithm"))},
-                    {"name": "pqc:cnsa_2_0_compliance", "value": str(item.get("cnsa_2_0_compliance"))},
-                    {"name": "pqc:mosca_status", "value": str(mosca.get("mosca_status"))},
-                    {"name": "pqc:mosca_x_plus_y_years", "value": str(mosca.get("x_plus_y_total_years"))},
-                    {
-                        "name": "pqc:is_compatible_with_pqc_model",
-                        "value": str(compat.get("is_compatible_with_pqc_model", True)).lower(),
-                    },
+                    {"name": "gcp:resource_name", "value": k["resource_name"]},
+                    {"name": "gcp:protection_level", "value": str(k.get("protection_level"))},
+                    {"name": "gcp:is_active", "value": str(k.get("is_active")).lower()},
+                    {"name": "pqc:quantum_status", "value": facts["quantum_status"]},
+                    {"name": "pqc:quantum_threat_model", "value": facts["quantum_threat_model"]},
+                    {"name": "pqc:data_source", "value": str(k.get("data_source"))},
                 ],
             }
         )
 
-        for app in item.get("consuming_applications", []):
-            app_name = app.get("application_name", "unknown-app")
-            app_ref = f"application:{proj}/{app_name}"
-            if app_ref not in app_components_by_ref:
-                app_components_by_ref[app_ref] = {
+    notes: Dict[str, Any] = {"data_source": inventory.get("data_source"), "rejected_correlations": []}
+    app_refs: Dict[str, Dict[str, Any]] = {}
+    app_deps: Dict[str, List[str]] = {}
+    if validated_correlations_json and validated_correlations_json.strip():
+        try:
+            correlations = json.loads(validated_correlations_json)
+            if not isinstance(correlations, list):
+                raise ValueError("validated_correlations_json must be a JSON list")
+        except Exception as exc:
+            correlations = []
+            notes["correlations_parse_error"] = str(exc)
+        for c in correlations:
+            key_ref = _normalize_kms_key_ref(str(c.get("kms_key", "")))
+            crypto_ref = refs_by_resource.get(key_ref)
+            if not crypto_ref:
+                notes["rejected_correlations"].append({"entry": c, "reason": "kms_key not found in inventory"})
+                continue
+            app_name = str(c.get("application_name") or c.get("workload_resource") or "unnamed-workload")
+            app_ref = f"application:{c.get('workload_resource') or app_name}"
+            app_refs.setdefault(
+                app_ref,
+                {
                     "type": "application",
                     "bom-ref": app_ref,
                     "name": app_name,
-                    "description": f"{app.get('workload_type')} ({app.get('workload_resource')})",
                     "properties": [
-                        {"name": "gcp:project_id", "value": str(proj)},
-                        {"name": "gcp:workload_type", "value": str(app.get("workload_type"))},
-                        {"name": "gcp:workload_resource", "value": str(app.get("workload_resource"))},
-                        {"name": "gcp:service_account", "value": str(app.get("service_account"))},
-                        {"name": "pqc:crypto_usage_pattern", "value": str(app.get("crypto_usage_pattern"))},
-                        {
-                            "name": "pqc:discovery_confidence",
-                            "value": str(app.get("discovery_confidence", "HIGH_TOPOLOGY_MAPPED")),
-                        },
-                        {
-                            "name": "pqc:is_compatible_with_pqc_model",
-                            "value": str(compat.get("is_compatible_with_pqc_model", True)).lower(),
-                        },
-                        {"name": "pqc:compatibility_verdict", "value": str(compat.get("verdict"))},
+                        {"name": "gcp:workload_resource", "value": str(c.get("workload_resource", ""))},
+                        {"name": "pqc:evidence_level", "value": str(c.get("evidence_level", "UNSPECIFIED"))},
+                        {"name": "pqc:evidence", "value": str(c.get("evidence", ""))[:300]},
+                        {"name": "pqc:correlation_source", "value": "agent_validated_correlation"},
                     ],
-                }
-            app_dependencies.setdefault(app_ref, [])
-            if crypto_ref not in app_dependencies[app_ref]:
-                app_dependencies[app_ref].append(crypto_ref)
+                },
+            )
+            deps = app_deps.setdefault(app_ref, [])
+            if crypto_ref not in deps:
+                deps.append(crypto_ref)
 
-    components.extend(app_components_by_ref.values())
+    components.extend(app_refs.values())
+    dependencies = [{"ref": root_ref, "dependsOn": list(app_refs.keys()) + list(refs_by_resource.values())}]
+    dependencies.extend({"ref": a, "dependsOn": d} for a, d in app_deps.items())
 
-    dependencies: List[Dict[str, Any]] = [
-        {
-            "ref": root_bom_ref,
-            "dependsOn": list(app_components_by_ref.keys()) + all_crypto_refs,
-        }
-    ]
-    for app_ref, dep_keys in app_dependencies.items():
-        dependencies.append(
-            {
-                "ref": app_ref,
-                "dependsOn": dep_keys,
-            }
-        )
-
-    cyclonedx_bom = {
+    bom = {
         "bomFormat": "CycloneDX",
         "specVersion": "1.6",
-        "serialNumber": f"urn:uuid:{serial_uuid}",
+        "serialNumber": f"urn:uuid:{uuid.uuid4()}",
         "version": 1,
         "metadata": {
-            "timestamp": now_iso,
-            "tools": {
-                "components": [
-                    {
-                        "type": "application",
-                        "author": "Google Cloud Security & Cryptography Architecture",
-                        "name": "pqc_enterprise_inventory_agent",
-                        "version": "2.0.0",
-                    }
-                ]
-            },
-            "component": {
-                "type": "platform",
-                "bom-ref": root_bom_ref,
-                "name": scope_uri,
-                "description": "Google Cloud Post-Quantum Cryptography (PQC) Inventory & Application Dependency CBOM",
-                "properties": [
-                    {
-                        "name": "pqc:readiness_score_pct",
-                        "value": str(cbom_summary.get("pqc_readiness_score_pct")),
-                    },
-                    {
-                        "name": "pqc:weighted_maturity_score_pct",
-                        "value": str(cbom_summary.get("weighted_pqc_maturity_score_pct")),
-                    },
-                    {
-                        "name": "pqc:application_compatibility_score_pct",
-                        "value": str(cbom_summary.get("application_pqc_compatibility_score_pct")),
-                    },
-                ],
-            },
+            "timestamp": _now_iso(),
+            "tools": {"components": [{"type": "application", "name": "agentic-pqc-workspace", "version": "4.0.0"}]},
+            "component": {"type": "platform", "bom-ref": root_ref, "name": scope_uri},
         },
         "components": components,
         "dependencies": dependencies,
+        "export_notes": notes,
     }
-    return _compact_json(cyclonedx_bom)
-
-
-def generate_application_pqc_refactoring_guide(
-    project_id: str = f"organizations/{DEFAULT_ORGANIZATION_ID}",
-    application_or_key_filter: str = "all",
-) -> str:
-    """Generates concrete Before/After SDK code and API Gateway refactoring blueprints for applications migrating to PQC.
-
-    Produces production-ready code migrations in Python (`google-cloud-kms` + `cryptography`), Go (`cloud.google.com/go/kms`),
-    and Node.js (`@google-cloud/kms`) for:
-    1. `ASYMMETRIC_DECRYPT` (`RSA_DECRYPT_OAEP_*`) -> `KEY_ENCAPSULATION` (`KEM_XWING` / `ML_KEM_1024`) via `Decapsulate` + `HKDF-SHA256` + `AES-256-GCM` (RFC 9180 HPKE).
-    2. `ASYMMETRIC_SIGN` (`RSA_SIGN_*`, `EC_SIGN_*`) -> `PQ_SIGN_ML_DSA_65` / `PQ_SIGN_ML_DSA_65_EXTERNAL_MU` (raw `data` or 64-byte FIPS 204 SHAKE256 external `mu`), plus Envoy/NGINX/Load Balancer HTTP header buffer configs for 3,309-byte ML-DSA-65 signatures.
-
-    Args:
-        project_id: GCP Organization (`organizations/31564119954`), Folder, or Project ID.
-        application_or_key_filter: Optional filter by application name or KMS key name (default: `"all"`).
-
-    Returns:
-        Formatted JSON string containing targeted refactoring guides, Before/After code snippets, and gateway configurations.
-    """
-    raw_kms_json = scan_pqc_readiness(project_id=project_id, location_id="all")
-    kms_items = json.loads(raw_kms_json)
-
-    if isinstance(kms_items, dict) and "error" in kms_items:
-        return _compact_json(kms_items)
-
-    flt = (application_or_key_filter or "all").strip().lower()
-    refactoring_blueprints: List[Dict[str, Any]] = []
-
-    for item in kms_items:
-        if not item.get("is_active", True):
-            continue
-        compat = item.get("pqc_application_compatibility", {})
-        if compat.get("is_compatible_with_pqc_model", True):
-            continue
-
-        proj = item.get("project_id", "")
-        loc = item.get("location", "global")
-        kr = item.get("key_ring", "default")
-        kname = item.get("key_name", "key")
-        purpose = str(item.get("purpose", "")).upper()
-        algo = str(item.get("algorithm", "")).upper()
-        apps = item.get("consuming_applications", [])
-        app_names = [a.get("application_name", "") for a in apps]
-
-        if flt not in ("all", "", "*"):
-            matched_key = flt in kname.lower() or flt in kr.lower() or flt in proj.lower()
-            matched_app = any(flt in str(a_name).lower() for a_name in app_names)
-            if not (matched_key or matched_app):
-                continue
-
-        if "DECRYPT" in purpose:
-            target_key_name = f"{kname}-pqc-xwing"
-            kv_resource = f"projects/{proj}/locations/{loc}/keyRings/{kr}/cryptoKeys/{target_key_name}/cryptoKeyVersions/1"
-            legacy_kv_resource = f"projects/{proj}/locations/{loc}/keyRings/{kr}/cryptoKeys/{kname}/cryptoKeyVersions/1"
-            refactoring_blueprints.append(
-                {
-                    "project_id": proj,
-                    "legacy_key": f"{proj}/{kr}/{kname} ({loc})",
-                    "legacy_algorithm": algo,
-                    "target_pqc_key": f"{proj}/{kr}/{target_key_name} ({loc})",
-                    "target_pqc_algorithm": "KEM_XWING (Hybrid X25519 + ML-KEM-768, FIPS 203) or ML_KEM_1024 (CNSA 2.0)",
-                    "affected_applications": apps,
-                    "migration_pattern": "RSA-OAEP Direct Decryption -> KEM Decapsulate + HKDF-SHA256 + AES-256-GCM (RFC 9180 HPKE)",
-                    "code_refactoring_snippets": {
-                        "python_before_legacy_rsa_oaep": (
-                            "from google.cloud import kms_v1\n\n"
-                            "kms_client = kms_v1.KeyManagementServiceClient()\n"
-                            f'key_version_name = "{legacy_kv_resource}"\n'
-                            "# LEGACY: Direct RSA-OAEP decryption of small payload\n"
-                            "response = kms_client.asymmetric_decrypt(\n"
-                            '    request={"name": key_version_name, "ciphertext": rsa_ciphertext}\n'
-                            ")\n"
-                            "plaintext = response.plaintext"
-                        ),
-                        "python_after_pqc_kem_xwing_hpke": (
-                            "import os\n"
-                            "from google.cloud import kms_v1\n"
-                            "from cryptography.hazmat.primitives import hashes\n"
-                            "from cryptography.hazmat.primitives.kdf.hkdf import HKDF\n"
-                            "from cryptography.hazmat.primitives.ciphers.aead import AESGCM\n\n"
-                            "kms_client = kms_v1.KeyManagementServiceClient()\n"
-                            f'pqc_key_version_name = "{kv_resource}"\n\n'
-                            "# STEP 1: Decapsulate the 1,120-byte KEM_XWING (or 1,568-byte ML_KEM_1024) ciphertext via Cloud KMS\n"
-                            "decap_response = kms_client.decapsulate(\n"
-                            '    request={"name": pqc_key_version_name, "ciphertext": kem_ciphertext}\n'
-                            ")\n"
-                            "shared_secret = decap_response.shared_secret  # 32-byte post-quantum shared secret\n\n"
-                            "# STEP 2: Derive 256-bit Data Encryption Key (DEK) via HKDF-SHA256 (RFC 9180 HPKE context)\n"
-                            "dek = HKDF(\n"
-                            "    algorithm=hashes.SHA256(),\n"
-                            "    length=32,\n"
-                            "    salt=hkdf_salt,\n"
-                            '    info=b"gcp-kms-pqc-kem-xwing-aes256gcm-v1",\n'
-                            ").derive(shared_secret)\n\n"
-                            "# STEP 3: Decrypt the envelope payload locally with AES-256-GCM (Grover-resilient)\n"
-                            "plaintext = AESGCM(dek).decrypt(nonce=aes_nonce, data=aes_ciphertext, associated_data=aad)"
-                        ),
-                        "go_after_pqc_kem_decapsulate": (
-                            'import (\n'
-                            '    "context"\n'
-                            '    kms "cloud.google.com/go/kms/apiv1"\n'
-                            '    kmspb "cloud.google.com/go/kms/apiv1/kmspb"\n'
-                            ')\n\n'
-                            "resp, err := kmsClient.Decapsulate(ctx, &kmspb.DecapsulateRequest{\n"
-                            f'    Name: "{kv_resource}",\n'
-                            "    Ciphertext: kemCiphertext, // 1,120 bytes for KEM_XWING\n"
-                            "})\n"
-                            "// Derive AES-256-GCM key from resp.SharedSecret using golang.org/x/crypto/hkdf"
-                        ),
-                    },
-                    "wire_protocol_and_storage_adjustments": {
-                        "kem_ciphertext_bytes": 1120,
-                        "ml_kem_1024_ciphertext_bytes": 1568,
-                        "public_key_bytes": 1216,
-                        "database_column_recommendation": (
-                            "Update encrypted DEK column from `BYTEA`/`VARBINARY(256)` to `BYTEA`/`VARBINARY(2048)` "
-                            "to store the 1,120-byte (X-Wing) or 1,568-byte (ML-KEM-1024) KEM ciphertext + 12-byte AES-GCM nonce."
-                        ),
-                    },
-                }
-            )
-        else:
-            target_key_name = f"{kname}-pqc-mldsa65"
-            kv_resource = f"projects/{proj}/locations/{loc}/keyRings/{kr}/cryptoKeys/{target_key_name}/cryptoKeyVersions/1"
-            legacy_kv_resource = f"projects/{proj}/locations/{loc}/keyRings/{kr}/cryptoKeys/{kname}/cryptoKeyVersions/1"
-            refactoring_blueprints.append(
-                {
-                    "project_id": proj,
-                    "legacy_key": f"{proj}/{kr}/{kname} ({loc})",
-                    "legacy_algorithm": algo,
-                    "target_pqc_key": f"{proj}/{kr}/{target_key_name} ({loc})",
-                    "target_pqc_algorithm": "PQ_SIGN_ML_DSA_65 (FIPS 204 Category 3) or PQ_SIGN_ML_DSA_87 (CNSA 2.0 Category 5)",
-                    "affected_applications": apps,
-                    "migration_pattern": (
-                        "AsymmetricSign(digest={'sha256': ...}) -> AsymmetricSign(data=raw_bytes) or "
-                        "PQ_SIGN_ML_DSA_65_EXTERNAL_MU (64-byte FIPS 204 SHAKE256 external mu)"
-                    ),
-                    "code_refactoring_snippets": {
-                        "python_before_legacy_digest_sign": (
-                            "import hashlib\n"
-                            "from google.cloud import kms_v1\n\n"
-                            "kms_client = kms_v1.KeyManagementServiceClient()\n"
-                            f'key_version_name = "{legacy_kv_resource}"\n'
-                            "digest_sha256 = hashlib.sha256(payload_bytes).digest()\n"
-                            "# LEGACY: Passing pre-computed SHA-256 digest (FAILS on pure PQ_SIGN_ML_DSA_65!)\n"
-                            "sign_resp = kms_client.asymmetric_sign(\n"
-                            '    request={"name": key_version_name, "digest": {"sha256": digest_sha256}}\n'
-                            ")\n"
-                            "signature = sign_resp.signature  # 64–256 bytes"
-                        ),
-                        "python_after_pqc_mldsa65_pure_data_sign": (
-                            "import crcmod\n"
-                            "from google.cloud import kms_v1\n\n"
-                            "kms_client = kms_v1.KeyManagementServiceClient()\n"
-                            f'pqc_key_version_name = "{kv_resource}"\n\n'
-                            "# OPTION A (Standard Pure ML-DSA-65): Pass raw `data` bytes directly (Cloud KMS hashes internally with SHAKE256)\n"
-                            "sign_resp = kms_client.asymmetric_sign(\n"
-                            "    request={\n"
-                            '        "name": pqc_key_version_name,\n'
-                            '        "data": payload_bytes,  # Up to 64 KiB raw message\n'
-                            "    }\n"
-                            ")\n"
-                            "pqc_signature = sign_resp.signature  # 3,309 bytes (ML-DSA-65) or 4,627 bytes (ML-DSA-87)"
-                        ),
-                        "python_after_pqc_mldsa65_external_mu_large_payloads": (
-                            "import hashlib\n"
-                            "from google.cloud import kms_v1\n\n"
-                            "# OPTION B (Large Artifacts > 64 KiB using PQ_SIGN_ML_DSA_65_EXTERNAL_MU, NIST FIPS 204 Section 6.2):\n"
-                            "# 1. Compute tr = SHAKE256(raw_public_key_1952_bytes, 64)\n"
-                            "# 2. Compute 64-byte external mu = SHAKE256(tr || 0x00 || 0x00 || large_payload_bytes, 64)\n"
-                            "tr = hashlib.shake_256(raw_mldsa65_public_key_bytes).digest(64)\n"
-                            'mu_64_bytes = hashlib.shake_256(tr + b"\\x00\\x00" + large_payload_bytes).digest(64)\n'
-                            "sign_resp = kms_client.asymmetric_sign(\n"
-                            "    request={\n"
-                            f'        "name": "{kv_resource}-external-mu",\n'
-                            '        "data": mu_64_bytes,  # 64-byte FIPS 204 representative mu\n'
-                            "    }\n"
-                            ")"
-                        ),
-                    },
-                    "api_gateway_and_proxy_configurations": {
-                        "signature_size_comparison": "ECDSA P-256 (64 B) / RSA-2048 (256 B) -> ML-DSA-65 (3,309 B raw / ~4,412 B Base64URL in JWT Header)",
-                        "envoy_istio_gateway_patch_yaml": (
-                            "apiVersion: networking.istio.io/v1alpha3\n"
-                            "kind: EnvoyFilter\n"
-                            "metadata:\n"
-                            "  name: pqc-mldsa-header-buffer-expansion\n"
-                            "spec:\n"
-                            "  configPatches:\n"
-                            "  - applyTo: NETWORK_FILTER\n"
-                            "    patch:\n"
-                            "      operation: MERGE\n"
-                            "      value:\n"
-                            "        typed_config:\n"
-                            "          '@type': type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager\n"
-                            "          max_request_headers_kb: 32"
-                        ),
-                        "nginx_ingress_config": (
-                            "# Increase HTTP header buffers to accommodate 4.4 KB Base64URL ML-DSA-65 Bearer JWTs\n"
-                            "client_header_buffer_size 16k;\n"
-                            "large_client_header_buffers 4 32k;\n"
-                            "proxy_buffer_size 32k;\n"
-                            "proxy_buffers 4 32k;"
-                        ),
-                    },
-                }
-            )
-
-    return _compact_json(
-        {
-            "scope": project_id,
-            "filter_applied": application_or_key_filter,
-            "total_incompatible_keys_requiring_refactoring": len(refactoring_blueprints),
-            "refactoring_blueprints": refactoring_blueprints,
-        }
-    )
-
+    if inventory.get("data_source") == SIMULATED_DATA_SOURCE:
+        bom["export_notes"]["simulation_notice"] = SIMULATION_NOTICE
+    return _compact_json(bom)

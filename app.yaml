@@ -1,6 +1,6 @@
 name: pqc-inventory-agent
 display_name: "PQC Enterprise Inventory & Application Compatibility Agent"
-version: "3.1.0"
+version: "4.0.0"
 description: >
   Expert AI Agent for Post-Quantum Cryptography (PQC) Readiness Assessment, 4-Vector Live
   Application-to-Key Dependency Mapping, PQC Application Compatibility Evaluation, Mosca's
@@ -28,28 +28,38 @@ runtime:
     cloud_run_volume_mount: "volume=pqc-data,mount-path=/data"
 
 model:
-  name: "gemini-3.1-pro-preview-customtools"
-  fallback: "gemini-2.5-pro"
-  temperature: 0.1
-  generation_config:
-    thinking_level: "MEDIUM"
-    max_output_tokens: 1048576
+  provider: "Vertex AI (Gemini only)"
+  default: "gemini-3.1-pro-preview-customtools"
+  default_thinking_level: "MEDIUM"
+  selection: "Portal lists only Gemini models verified with a live Vertex AI request (GET /api/models)"
+  fallback: "none (model errors are returned explicitly; no templated responses)"
+
+agents:
+  coordinator: pqc_inventory_agent
+  specialists:
+    - discovery_agent
+    - correlation_analyst_agent
+    - quantum_risk_agent
+    - remediation_architect_agent
+    - report_writer_agent
 
 tools:
-  - scan_organization_pqc_readiness
-  - generate_pqc_migration_plan
-  - scan_pqc_readiness
-  - scan_ssl_policies
-  - scan_import_jobs_pqc
-  - run_quantum_cryptanalysis_simulation
-  - discover_all_crypto_assets
-  - generate_application_pqc_refactoring_guide
-  - export_cyclonedx_cbom
-  - export_pqc_assessment_reports
-  - calibrate_assessment_from_discovery_questionnaire
-  - get_active_calibration_profile
-  - analyze_uploaded_pqc_artifact
-  - execute_gcloud_command
+  evidence:
+    - collect_kms_inventory
+    - collect_workload_evidence
+    - collect_tls_policies
+    - collect_kms_import_jobs
+    - discover_all_crypto_assets
+    - read_uploaded_artifact
+    - execute_gcloud_command
+  auditable_calculations:
+    - compute_pqc_scorecard
+    - run_quantum_cryptanalysis_simulation
+    - calibrate_assessment_context
+    - get_historical_calibration_profile
+  outputs:
+    - export_cyclonedx_cbom
+    - save_assessment_report
 
 
 security:
@@ -66,7 +76,7 @@ environment:
   GOOGLE_CLOUD_LOCATION: "global"
   GCP_ORGANIZATION_ID: "31564119954"
   GCP_ORGANIZATION_NAME: "jsaccomani.altostrat.com"
-  PQC_SIMULATION_MODE: "AUTO"
+  PQC_SIMULATION_MODE: "FALSE"
   PQC_AGENT_MODEL: "gemini-3.1-pro-preview-customtools"
   SESSION_DB_URL: "sqlite:///data/pqc_sessions.db"
   PQC_ARTIFACT_BUCKET: "gs://pqc-inventory-agent-cd06-pqc-agent-staging"

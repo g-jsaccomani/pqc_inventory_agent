@@ -3,7 +3,7 @@
 
 > **Google Drive Official Deliverable:** [Agentic PQC: Plain-Language Guide & Master README](https://docs.google.com/document/d/1HS0yym4MJoigjpzaN7dtBMi4P6S63Cri_U_Cgp4cRy0/edit)
 
-> **Executive Summary:** Welcome to the Agentic PQC kit! You do not need to be a cryptography or quantum physics expert to understand or pitch this solution. In simple terms: future quantum computers will break the digital locks (encryption) that companies use today to protect bank transfers, medical records, and cloud systems. Worse, hackers are already stealing encrypted data today to unlock it in a few years. Agentic PQC combines a Google Cloud AI Agent (which scans a customer's cloud in 7 seconds to find every vulnerable digital lock and calculate the financial risk in dollars) with a 6-week Google Cloud Consulting engagement to help the customer upgrade safely without downtime.
+> **Executive Summary:** Welcome to the Agentic PQC kit! You do not need to be a cryptography or quantum physics expert to understand or pitch this solution. In simple terms: future quantum computers will break the digital locks (encryption) that companies use today to protect bank transfers, medical records, and cloud systems. Worse, hackers are already stealing encrypted data today to unlock it in a few years. Agentic PQC combines a Google Cloud AI agent (Gemini specialist agents that read the customer's cloud configuration, find every vulnerable digital lock and explain each risk with evidence) with a 6-week Google Cloud Consulting engagement to help the customer upgrade safely without downtime.
 
 ---
 
@@ -15,7 +15,7 @@ If you are new to Post-Quantum Cryptography (PQC), here is the entire story in f
 - **Why Is This Urgent Today? ("Steal the Safe Today, Open It Tomorrow"):** A common question is: *"If powerful quantum computers are still a few years away, why care now?"* Because hackers are already intercepting and copying encrypted data today and storing it in giant hard drives. As soon as a quantum computer comes online, they will unlock everything they stole years earlier. Security experts call this **Harvest Now, Decrypt Later (HNDL)**. If a company's data must stay secret for 5 to 10+ years (financial records, health data, government secrets, personal IDs), it is already at risk today.
 - **What is PQC (Post-Quantum Cryptography)?** PQC is simply the new generation of "quantum-proof" digital locks approved by the US National Institute of Standards and Technology (NIST). **Important myth-buster:** A company does **NOT** need to buy a quantum computer to use PQC! These new locks are normal software updates that run on today's servers and cloud systems — they just use new mathematical puzzles that neither normal computers nor quantum computers can break.
 - **Why Do Companies Struggle to Upgrade?** A medium or large company has thousands of digital keys, certificates, databases, and applications spread across the cloud. Finding all of them manually with spreadsheets and interviews takes months. Worse, if an engineer swaps an old key for a new quantum-proof key without checking connected apps, systems can crash because the new keys are physically larger.
-- **What is Agentic PQC?** Agentic PQC is Google Cloud's intelligent accelerator. Instead of spending months on manual spreadsheets, our AI Agent (built with Gemini and Google ADK) scans the customer's Google Cloud environment in ~7 seconds. It is **100% read-only** — like looking at the brand label on the outside of a padlock without ever touching the key or seeing what is inside the safe. It maps every lock, calculates the financial risk in dollars, and gives our Google Cloud Consultants a complete blueprint to guide the customer through a safe 6-week modernization.
+- **What is Agentic PQC?** Agentic PQC is Google Cloud's intelligent accelerator. Instead of spending months on manual spreadsheets, our AI agent (built with Gemini and Google ADK) collects the cryptographic inventory of the customer's Google Cloud environment in seconds, and Gemini specialist agents then correlate keys to applications, prioritize risks and draft the migration plan, always citing the evidence. It is **100% read-only** — like looking at the brand label on the outside of a padlock without ever touching the key or seeing what is inside the safe. It maps every lock and gives our Google Cloud Consultants a complete, evidence-backed blueprint to guide the customer through a safe 6-week modernization.
 
 ## 2. Quick Dictionary: 5 Terms You Will Hear (Translated into Plain English)
 
@@ -26,7 +26,7 @@ Whenever someone mentions a technical acronym in a meeting, use this simple chea
 | PQC (Post-Quantum Cryptography) | New "quantum-proof" digital locks approved by global regulators (NIST) that run on normal computers today. | Replaces old digital locks (RSA and ECC) that quantum computers will break. Mandatory by 2030-2035. |
 | HNDL (Harvest Now, Decrypt Later) | "Steal the locked safe today, open it tomorrow." Hackers copy encrypted traffic now to unlock it when quantum computers arrive. | Means companies cannot wait until 2030 to protect sensitive data that must stay confidential for 5+ years. |
 | CBOM (Cryptographic Bill of Materials) | A complete nutrition label / inventory list of every digital lock, key, and certificate used across the company. | Regulators and auditors require companies to have an up-to-date inventory of all their encryption keys. |
-| Q-VaR 95% (Quantum Value-at-Risk) | A financial calculator that translates technical encryption risk into dollars (e.g., "$10.3M of potential loss"). | Helps the Security Lead and IT team justify budget to the CEO, CFO, and Board of Directors using clear financial ROI. |
+| Q-VaR (Quantum Value-at-Risk) | A way to translate encryption risk into money using the customer's own data-value and breach-cost inputs. | Optional. The agent never invents dollar figures; financial exposure is only quantified when the customer provides those inputs. |
 | Mosca's Rule (X + Y > Z) | A simple deadline check: (Years data must stay secret) + (Years needed to upgrade) vs. (Years until quantum arrives). | If keeping data secret (e.g., 7 yrs) + upgrading (2 yrs) = 9 yrs, and quantum arrives in 5 yrs, you are already 4 years late! |
 
 ## 3. Which File Should I Open? (Guide to the 8 Consolidated Deliverables)
@@ -48,7 +48,7 @@ All documentation is synchronized between the Google Drive folder and the `docs/
 
 ### 4.1 How to Pitch Agentic PQC in 60 Seconds
 
-"Today, attackers are already copying encrypted corporate data and storing it until quantum computers can break standard RSA and ECC encryption — a threat called Harvest Now, Decrypt Later. Because of this, global regulators require organizations to inventory and upgrade their digital locks by 2030. Normally, finding thousands of keys across the cloud takes months of manual spreadsheets. With Google Cloud's Agentic PQC, our read-only AI Agent scans your Google Cloud environment in 7 seconds, maps every vulnerable key and connected application, calculates your financial risk in dollars, and gives our Google Cloud Consulting team everything needed to guide your safe, zero-downtime upgrade in just 6 weeks."
+"Today, attackers are already copying encrypted corporate data and storing it until quantum computers can break standard RSA and ECC encryption — a threat called Harvest Now, Decrypt Later. Because of this, global regulators require organizations to inventory and upgrade their digital locks by 2030. Normally, finding thousands of keys across the cloud takes months of manual spreadsheets. With Google Cloud's Agentic PQC, our read-only AI agent reads your Google Cloud configuration in seconds, and Gemini specialist agents map every vulnerable key to the applications that use it, explain the evidence behind each risk, and give our Google Cloud Consulting team everything needed to guide your safe, zero-downtime upgrade in just 6 weeks."
 
 ### 4.2 Top 5 Questions Customers Ask — And How to Answer Simply
 
@@ -65,8 +65,8 @@ All documentation is synchronized between the Google Drive folder and the `docs/
 When a customer signs the 6-week engagement (224 consulting hours in the Agentic PQC Services Estimation Sheet), here is the simple week-by-week journey:
 
 1. **Week 1 — Kickoff & Fast Setup:** We hold the kickoff meeting, review the Discovery Questionnaire (File #7), and connect our read-only AI Agent to the customer's Google Cloud environment.
-2. **Week 2 — 7-Second Cloud Scan & Complete Inventory:** We run the automated scan across their cloud keys, databases, network load balancers, and certificates, producing their complete digital lock inventory (CBOM).
-3. **Week 3 — Prioritization & Financial Risk Calculation:** We calculate which systems are most urgent and run the financial simulation (Q-VaR) so executives see the exact dollar risk and ROI.
+2. **Week 2 — Automated Cloud Inventory:** We run the automated scan across their cloud keys, databases, network load balancers, and certificates, producing their complete digital lock inventory (CBOM).
+3. **Week 3 — Prioritization & Business Impact:** The agents rank which systems are most urgent, with the evidence for each, and we translate the risk into business impact using the customer's own data-value and breach-cost inputs.
 4. **Week 4 — Protecting Internet Traffic & Architecture Design:** We design the upgrade blueprint and show how to turn on quantum-safe internet traffic protection on Google Cloud Load Balancers.
 5. **Week 5 — Safe Testing & Application Tuning:** We guide the customer through a safe test upgrade in a non-production environment and help developers tune their apps and gateways.
 6. **Week 6 — Automatic Guardrails & Executive Presentation:** We turn on cloud rules that prevent anyone from creating old vulnerable keys again, and present the Agentic PQC Security Recommendations Book (File #5) and multi-year roadmap to leadership.
@@ -75,6 +75,15 @@ When a customer signs the 6-week engagement (224 consulting hours in the Agentic
 
 If you are showing the Agentic PQC web interface or Gemini chat live to a customer, simply copy and paste any of these 3 plain-language prompts:
 
-- **Prompt 1 — Full 7-Second Executive & Technical Scan:** `Run a complete Post-Quantum Cryptography (PQC) readiness scan across our Google Cloud organization. Show me our overall readiness score, which encryption keys are at risk first, our financial exposure in dollars (Q-VaR 95%), and a step-by-step upgrade plan.`
+- **Prompt 1 — Full Executive & Technical Assessment:** `Run a complete Post-Quantum Cryptography (PQC) readiness assessment across our Google Cloud organization. Show me our readiness scorecard, which encryption keys are at risk first and why (with evidence), which applications depend on them, and a step-by-step upgrade plan.`
 - **Prompt 2 — Calibrate for a Specific Industry (e.g., Banking):** `Calibrate our assessment for a Retail & Investment Bank where financial records must remain confidential for 10 years and regulatory deadlines require migration within 24 months. Recalculate our risk and top priorities.`
 - **Prompt 3 — Generate Safe Upgrade Instructions for Engineers:** `Generate the 5-step zero-downtime upgrade guide for our vulnerable signing and encryption keys in Cloud KMS, including how to test safely and prevent application outages.`
+
+## 7. How the AI Agent Works (Architecture in Brief)
+
+- **Gemini does the thinking.** A coordinator agent talks to the user and delegates to five Gemini specialist agents built with Google ADK: discovery, correlation analysis, quantum risk, remediation architecture and report writing.
+- **Tools only collect evidence and compute auditable numbers.** They read Cloud KMS, Cloud Asset Inventory, TLS policies and KMS import jobs (read-only) and compute the scorecard with explicit numerators and denominators. They never correlate, prioritize or recommend; the agents do, and they must cite the evidence.
+- **Gemini only, verified models.** The model selector lists only Gemini models that answered a live verification request on Vertex AI in the project. Every specialist uses the model you select.
+- **Full transparency per answer.** Each answer shows "Answered by" with the real Vertex AI model version, the number of LLM calls, token usage and which agents took part.
+- **No silent fallbacks.** If the model fails, the portal shows the error; no pre-written text is substituted. Demo data is only used when explicitly requested and is always labeled as demo data.
+

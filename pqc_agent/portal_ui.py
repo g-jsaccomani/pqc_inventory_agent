@@ -899,6 +899,60 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       flex-shrink: 0;
     }
 
+    .model-menu-note {
+      padding: 8px 12px 6px;
+      font-size: 11px;
+      line-height: 1.45;
+      color: var(--text-muted);
+      border-top: 1px solid var(--border-subtle);
+      margin-top: 4px;
+    }
+
+    .served-by-badge {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 6px;
+      margin: 2px 0 10px;
+      font-size: 11.5px;
+      color: var(--text-muted);
+    }
+
+    .served-by-badge .chip {
+      border: 1px solid var(--border-subtle);
+      border-radius: 999px;
+      padding: 1px 8px;
+      font-family: "Roboto Mono", ui-monospace, monospace;
+      font-size: 11px;
+    }
+
+    .served-by-badge .chip.verified {
+      color: #81c995;
+      border-color: rgba(129, 201, 149, 0.4);
+    }
+
+    .served-by-badge .chip.legacy,
+    .served-by-badge .chip.warn {
+      color: #fdd663;
+      border-color: rgba(253, 214, 99, 0.4);
+    }
+
+    .msg-error-card {
+      border: 1px solid rgba(242, 139, 130, 0.45);
+      background: rgba(242, 139, 130, 0.08);
+      border-radius: 12px;
+      padding: 12px 14px;
+      color: #f6aea9;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    .msg-error-card code {
+      color: #f28b82;
+      font-family: "Roboto Mono", ui-monospace, monospace;
+      margin-right: 6px;
+    }
+
     .btn-send {
       width: 32px;
       height: 32px;
@@ -1211,7 +1265,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
                 onclick="toggleModelMenu(event)"
                 title="Select AI Model"
               >
-                <span id="selected-model-label">Gemini 3.1 Pro</span>
+                <span id="selected-model-label">Verifying models...</span>
                 <span>▾</span>
               </button>
               <div class="model-dropdown-menu" id="model-dropdown-menu"></div>
@@ -1294,39 +1348,53 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     ];
 
     const LAB_PROMPTS = [
-      "Perform a complete Organization-wide Post-Quantum Cryptography (PQC) Readiness Assessment across 'organizations/31564119954' (location: 'all'). Invoke get_historical_calibration_profile, scan_organization_pqc_readiness, scan_ssl_policies, scan_import_jobs_pqc, and run_quantum_cryptanalysis_simulation. Present the full 6-part Google Cloud Consulting (PSO) Executive Readiness Assessment & Step-by-Step Execution Guide with Shor qubit fall-order ranking, Mosca (X+Y>Z) horizon matrix, and Monte Carlo Q-VaR 95%.",
-      "Evaluate our cryptographic governance posture across 'organizations/31564119954' and generate the complete Preventive GCP Organization Policy CEL Custom Constraints ('custom.pqcEnforceQuantumSafeKmsAlgorithms' and 'custom.pqcEnforceSymmetricKeyRotation90d') along with the zero-downtime <= 90-day automatic rotation gcloud kms runbooks for all unrotated symmetric CMEK keys.",
-      "Scan all Cloud Load Balancing SSL Policies across 'organizations/31564119954' for SNDL exposure and evaluate our JWT/OAuth digital signing keys. Provide the step-by-step commands to enforce TLS 1.3 RESTRICTED profile (hybrid X25519MLKEM768 key exchange) and the complete SDK + Envoy/NGINX/Apigee 16KB–32KB HTTP header buffer refactoring guide for 3,309-byte PQ_SIGN_ML_DSA_65 signatures.",
-      "Inspect all Cloud KMS ImportJobs across 'organizations/31564119954' for classical RSA-OAEP BYOK transport vulnerabilities and generate our OWASP CycloneDX v1.6 Cryptographic Bill of Materials (CBOM) alongside the HPKE_KEM_XWING_HKDF_SHA256_AES_256_GCM Cloud HSM (FIPS 140-3 Level 3) remediation runbooks.",
-      "Generate the complete Recommended Google Cloud Target Architecture & Product BOM for 'organizations/31564119954'—covering Cloud HSM FIPS 140-3 Level 3 (KEM_XWING & PQ_SIGN_ML_DSA_65), Google Tink SDK RFC 9180 HPKE, VPC Service Controls (VPC-SC) + Private Service Connect, Certificate Authority Service (CAS) PQC Hierarchy, Binary Authorization, and Security Command Center (SCC) Enterprise—with production-ready Terraform HCL and gcloud CLI code."
+      "Run a complete post-quantum cryptography readiness assessment for scope '{ORG}'. Use the discovery, correlation and quantum risk specialists, then the remediation architect. Deliver the consulting assessment with evidence: inventory facts, key-to-workload correlations with evidence levels, the scorecard with numerators and denominators, the Mosca analysis (say whether the parameters are calibrated or default), prioritized risks and a phased plan.",
+      "Evaluate the cryptographic governance posture of scope '{ORG}': keys with quantum-vulnerable or below-target algorithms, symmetric keys without rotation and protection levels. Then have the remediation architect propose preventive Organization Policy custom constraints and rotation runbooks for the exact keys found.",
+      "Assess transport-layer exposure in scope '{ORG}': SSL policies and HTTPS/SSL target proxies (effective policy and minimum TLS version) and the signing keys used for tokens. Explain store-now-decrypt-later exposure with evidence, and propose TLS 1.3 policy changes plus the gateway, header-size and verifier impact of moving signing keys to ML-DSA, using the sizes reported by the tools.",
+      "Inspect Cloud KMS import jobs in scope '{ORG}' for classical RSA-OAEP wrapping, correlate keys to workloads, and have the report writer export a CycloneDX v1.6 CBOM that includes only validated correlations. Propose the migration of import jobs to post-quantum HPKE wrapping.",
+      "Design the target Google Cloud architecture for the PQC migration of scope '{ORG}' grounded in the discovered resources: Cloud KMS and Cloud HSM post-quantum keys, Tink HPKE for applications, VPC Service Controls, Certificate Authority Service, Binary Authorization and Security Command Center. Provide Terraform and gcloud for the specific resources found and mark every new resource name as proposed."
     ];
 
-    const MODEL_OPTIONS = [
-      { id: "gemini-pro-next", label: "Gemini Pro Next", tier: "", has_arrow: false },
-      { id: "gemini-flash-next", label: "Gemini Flash Next", tier: "", has_arrow: false },
-      { id: "gemini-4-argon-high", label: "Gemini 4 Argon", tier: "High", has_arrow: true },
-      { id: "gemini-pro-orchestrator", label: "Gemini Pro Orchestrator", tier: "", badge: "Beta", has_arrow: false },
-      { id: "gemini-4-carbon-medium", label: "Gemini 4 Carbon", tier: "Medium", has_arrow: true },
-      { id: "gemini-3.8-flash-medium", label: "Gemini 3.8 Flash", tier: "Medium", has_arrow: true },
-      { id: "gemini-3.5-flash-lite", label: "Gemini 3.5 Flash Lite", tier: "", has_arrow: false },
-      { id: "gemini-3.1-pro", label: "Gemini 3.1 Pro", tier: "", has_arrow: false },
-      { id: "claude-fable-5.1-max", label: "Claude Fable 5.1 (Max)", tier: "", has_arrow: false },
-      { id: "claude-fable-5.1-medium", label: "Claude Fable 5.1", tier: "Medium", has_arrow: true },
-      { id: "claude-opus-5.5-max", label: "Claude Opus 5.5 (Max)", tier: "", has_arrow: false },
-      { id: "claude-opus-5.5-medium", label: "Claude Opus 5.5", tier: "Medium", has_arrow: true }
-    ];
+    let MODEL_OPTIONS = [];
+    let MODEL_CATALOG_META = { verification: null, unavailable: [], project: null, default_model: null };
 
     let currentUserId = localStorage.getItem("pqc_user_id") || "sec-architect";
     let currentSessionId = localStorage.getItem("pqc_active_session_id") || null;
-    let selectedModelId = localStorage.getItem("pqc_selected_model_id") || "gemini-3.1-pro";
+    let selectedModelId = localStorage.getItem("pqc_selected_model_id") || "";
     let allSessions = [];
     let pendingFiles = [];
     let assistantResponsesStore = {};
 
+    async function loadModelCatalog(forceRefresh = false) {
+      try {
+        const res = await fetch(`/api/models${forceRefresh ? "?refresh=true" : ""}`);
+        const data = await res.json();
+        MODEL_OPTIONS = data.models || [];
+        MODEL_CATALOG_META = {
+          verification: data.verification || null,
+          unavailable: data.unavailable_candidates || [],
+          project: data.project || null,
+          default_model: data.default_model || null,
+        };
+        const ids = MODEL_OPTIONS.map((m) => m.id);
+        if (!ids.includes(selectedModelId)) {
+          selectedModelId = data.default_model || ids[0] || "";
+          if (selectedModelId) localStorage.setItem("pqc_selected_model_id", selectedModelId);
+        }
+        const status = data.verification ? data.verification.status : "";
+        if (MODEL_OPTIONS.length === 0 && status !== "COMPLETE") {
+          setTimeout(() => loadModelCatalog(), 4000);
+        }
+      } catch (err) {
+        MODEL_OPTIONS = [];
+      }
+      renderModelDropdown();
+    }
+
     function getModelDisplayLabel(modelId) {
       const found = MODEL_OPTIONS.find((m) => m.id === modelId);
-      if (!found) return "Gemini 3.1 Pro";
-      return found.tier ? `${found.label} ${found.tier}` : found.label;
+      if (!found) return MODEL_OPTIONS.length ? "Select a model" : "Verifying models...";
+      return found.tier ? `${found.label} · ${found.tier}` : found.label;
     }
 
     function renderModelDropdown() {
@@ -1338,6 +1406,14 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       if (!menuEl) return;
       menuEl.innerHTML = "";
 
+      if (MODEL_OPTIONS.length === 0) {
+        const pending = document.createElement("div");
+        pending.className = "model-menu-note";
+        pending.textContent = "Verifying which Gemini models answer on Vertex AI in this project...";
+        menuEl.appendChild(pending);
+        return;
+      }
+
       MODEL_OPTIONS.forEach((opt) => {
         const btn = document.createElement("button");
         btn.type = "button";
@@ -1346,20 +1422,24 @@ PORTAL_HTML = r"""<!DOCTYPE html>
           ev.stopPropagation();
           selectModel(opt.id);
         };
-
         const tierHtml = opt.tier ? ` <span class="model-option-tier">${escapeHtml(opt.tier)}</span>` : "";
-        const badgeHtml = opt.badge ? ` <span class="model-option-badge">${escapeHtml(opt.badge)} ⓘ</span>` : "";
-        const rightHtml = opt.has_arrow ? `<span class="model-option-arrow">›</span>` : "";
-
         btn.innerHTML = `
           <span class="model-option-left">
             <span>${escapeHtml(opt.label)}${tierHtml}</span>
-            ${badgeHtml}
           </span>
-          ${rightHtml}
+          <span class="model-option-badge" title="Vertex AI model ID: ${escapeHtml(opt.model)}">verified</span>
         `;
         menuEl.appendChild(btn);
       });
+
+      const note = document.createElement("div");
+      note.className = "model-menu-note";
+      const unavailableCount = (MODEL_CATALOG_META.unavailable || []).length;
+      const projectTxt = MODEL_CATALOG_META.project ? ` (${MODEL_CATALOG_META.project})` : "";
+      note.textContent =
+        `Gemini only. Each model listed answered a live verification request on Vertex AI${projectTxt}.` +
+        (unavailableCount ? ` ${unavailableCount} candidate model(s) unavailable in this project are hidden.` : "");
+      menuEl.appendChild(note);
     }
 
     function toggleModelMenu(event) {
@@ -1580,7 +1660,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
           if (m.role === "user") {
             appendUserMessageUI(m.content, m.attachments || []);
           } else {
-            appendAssistantMessageUI(m.content, m.tool_calls || [], m.model_label);
+            appendAssistantMessageUI(m.content, m.tool_calls || [], m.model_label, m.served_by || null, m.error || null, Boolean(m.legacy_template_response));
           }
         });
       }
@@ -1642,7 +1722,29 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       container.appendChild(row);
     }
 
-    function appendAssistantMessageUI(markdownText, toolCalls = [], modelLabel = "") {
+    function formatTokens(n) {
+      return typeof n === "number" ? n.toLocaleString("en-US") : "0";
+    }
+
+    function buildServedByHtml(servedBy, legacyTemplate) {
+      if (legacyTemplate) {
+        return `<div class="served-by-badge"><span class="chip legacy">Legacy template response from the previous version (not generated by a model)</span></div>`;
+      }
+      if (!servedBy || !(servedBy.models_used || []).length) {
+        return "";
+      }
+      const models = servedBy.models_used.map((m) => `<span class="chip verified">${escapeHtml(m)}</span>`).join("");
+      const agents = (servedBy.agents_involved || []).filter((a) => a && a !== "user");
+      const agentsTxt = agents.length ? ` · agents: ${escapeHtml(agents.join(", "))}` : "";
+      const calls = servedBy.llm_call_count || 0;
+      return `
+        <div class="served-by-badge" title="Model version and token usage reported by Vertex AI for this answer">
+          <span>Answered by</span>${models}
+          <span>· ${calls} LLM call${calls === 1 ? "" : "s"} · ${formatTokens(servedBy.prompt_tokens)} in / ${formatTokens(servedBy.output_tokens)} out / ${formatTokens(servedBy.thinking_tokens)} thinking tokens${agentsTxt}</span>
+        </div>`;
+    }
+
+    function appendAssistantMessageUI(markdownText, toolCalls = [], modelLabel = "", servedBy = null, errorInfo = null, legacyTemplate = false) {
       const container = document.getElementById("messages-container");
       const msgId = "msg-" + Math.random().toString(36).slice(2, 10);
       assistantResponsesStore[msgId] = markdownText || "";
@@ -1655,10 +1757,11 @@ PORTAL_HTML = r"""<!DOCTYPE html>
         const itemsHtml = toolCalls.map((tc) => {
           const argsStr = typeof tc.args === "string" ? tc.args : JSON.stringify(tc.args || {});
           const outStr = typeof tc.output_preview === "string" ? tc.output_preview : JSON.stringify(tc.output_preview || "");
+          const kindLabel = tc.kind === "specialist_agent" ? "Specialist agent" : "Tool";
           return `
             <div class="trace-item">
               <div class="trace-item-head">
-                <span>${escapeHtml(tc.name || "tool")}</span>
+                <span>${escapeHtml(kindLabel)}: ${escapeHtml(tc.name || "tool")}</span>
                 <span>${escapeHtml(tc.status || "OK")}</span>
               </div>
               <div style="color:var(--text-muted);margin-bottom:3px;">${escapeHtml(argsStr)}</div>
@@ -1670,7 +1773,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
         traceDrawerHtml = `
           <details class="trace-drawer">
             <summary>
-              <span>Tool &amp; gcloud Execution Trace (${toolCalls.length})</span>
+              <span>Agent, Tool &amp; gcloud Execution Trace (${toolCalls.length})</span>
               <span>▾</span>
             </summary>
             <div class="trace-list">${itemsHtml}</div>
@@ -1679,6 +1782,18 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       }
 
       const activeBadge = modelLabel || getModelDisplayLabel(selectedModelId);
+      const toolbarHtml = errorInfo ? "" : `
+            <div class="msg-toolbar">
+              <button class="btn-minimal-action" onclick="downloadMarkdownReport('${msgId}')">
+                Download Report (.md)
+              </button>
+              <button class="btn-minimal-action" onclick="copyFullResponse('${msgId}', this)">
+                Copy
+              </button>
+            </div>`;
+      const bodyHtml = errorInfo
+        ? `<div class="msg-error-card"><strong>The model did not return an answer.</strong> Nothing was generated or substituted for this turn.<br/><code>${escapeHtml(String(errorInfo.code || "ERROR"))}</code>${escapeHtml(String(errorInfo.message || ""))}</div>`
+        : `<div class="markdown-body" id="md-${msgId}">${renderMarkdownSafe(markdownText)}</div>`;
 
       row.innerHTML = `
         <div class="msg-assistant-card">
@@ -1688,17 +1803,11 @@ PORTAL_HTML = r"""<!DOCTYPE html>
               <span>Agentic PQC Workspace</span>
               <span style="color:var(--text-muted);font-size:11.5px;font-weight:400;">• ${escapeHtml(activeBadge)}</span>
             </div>
-            <div class="msg-toolbar">
-              <button class="btn-minimal-action" onclick="downloadMarkdownReport('${msgId}')">
-                Download Report (.md)
-              </button>
-              <button class="btn-minimal-action" onclick="copyFullResponse('${msgId}', this)">
-                Copy
-              </button>
-            </div>
+            ${toolbarHtml}
           </div>
+          ${buildServedByHtml(servedBy, legacyTemplate)}
           ${traceDrawerHtml}
-          <div class="markdown-body" id="md-${msgId}">${renderMarkdownSafe(markdownText)}</div>
+          ${bodyHtml}
         </div>
       `;
       container.appendChild(row);
@@ -1729,8 +1838,10 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     }
 
     async function runLabPrompt(index) {
-      const promptText = LAB_PROMPTS[index];
-      if (!promptText) return;
+      const template = LAB_PROMPTS[index];
+      if (!template) return;
+      const orgId = (document.getElementById("conn-org-input").value.trim() || "31564119954").replace("organizations/", "");
+      const promptText = template.split("{ORG}").join(`organizations/${orgId}`);
       await createNewSession(PHASE_TITLES[index] || "New PQC Assessment");
       document.getElementById("chat-input").value = promptText;
       await sendChatMessage({ isPhaseScan: true });
@@ -1756,7 +1867,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       appendUserMessageUI(messageText || "(Attached file)", attachedMeta);
 
       const formData = new FormData();
-      formData.append("message", messageText || "Analyze the uploaded PQC artifact, extract all parameters, and auto-calibrate our assessment.");
+      formData.append("message", messageText || "Read the attached file(s), explain what they contain and how they affect our PQC assessment.");
       formData.append("user_id", currentUserId);
       formData.append("model_id", selectedModelId);
       if (currentSessionId) {
@@ -1775,15 +1886,9 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       pendingFiles = [];
       renderFileChips();
 
-      const lowerMsg = messageText.toLowerCase();
-      const isScanAction = Boolean(
-        options.isPhaseScan ||
-        hasFiles ||
-        lowerMsg.includes("scan_organization_pqc_readiness") ||
-        lowerMsg.includes("perform a complete organization-wide")
-      );
+      const isScanAction = Boolean(options.isPhaseScan || hasFiles);
       const statusLabel = isScanAction
-        ? "✦ Scanning cryptographic posture..."
+        ? `✦ Running specialist agents on ${getModelDisplayLabel(selectedModelId)}...`
         : `✦ Thinking (${getModelDisplayLabel(selectedModelId)})...`;
 
       const container = document.getElementById("messages-container");
@@ -1799,25 +1904,41 @@ PORTAL_HTML = r"""<!DOCTYPE html>
           body: formData,
         });
         loadingRow.remove();
-        if (!res.ok) {
-          const errText = await res.text();
-          appendAssistantMessageUI(`### Error\n\n\`\`\`\n${errText}\n\`\`\``, []);
-        } else {
-          const data = await res.json();
-          if (data.session_id) {
-            currentSessionId = data.session_id;
-            localStorage.setItem("pqc_active_session_id", currentSessionId);
+        let data = null;
+        try {
+          data = await res.json();
+        } catch (parseErr) {
+          data = null;
+        }
+        if (data && data.session_id) {
+          currentSessionId = data.session_id;
+          localStorage.setItem("pqc_active_session_id", currentSessionId);
+        }
+        if (!res.ok || !data || data.status !== "OK") {
+          const errorInfo = (data && data.error) || { code: `HTTP ${res.status}`, message: "Unexpected server response." };
+          appendAssistantMessageUI(
+            "",
+            (data && (data.tool_calls || data.tool_traces)) || [],
+            (data && data.model_label) || getModelDisplayLabel(selectedModelId),
+            (data && data.served_by) || null,
+            errorInfo
+          );
+          if (data && data.status === "MODEL_NOT_AVAILABLE") {
+            await loadModelCatalog(true);
           }
+        } else {
           appendAssistantMessageUI(
             data.response || "",
             data.tool_calls || data.tool_traces || [],
-            data.model_label || getModelDisplayLabel(selectedModelId)
+            data.model_label || getModelDisplayLabel(selectedModelId),
+            data.served_by || null,
+            null
           );
-          await fetchSessions();
         }
+        await fetchSessions();
       } catch (err) {
         loadingRow.remove();
-        appendAssistantMessageUI(`### Network Error\n\n\`${escapeHtml(String(err))}\``, []);
+        appendAssistantMessageUI("", [], getModelDisplayLabel(selectedModelId), null, { code: "NETWORK_ERROR", message: String(err) });
       } finally {
         sendBtn.disabled = false;
         scrollToBottom();
@@ -1876,7 +1997,12 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     });
 
     window.addEventListener("DOMContentLoaded", async () => {
+      const linkedSession = new URLSearchParams(window.location.search).get("session");
+      if (linkedSession) {
+        currentSessionId = linkedSession;
+      }
       renderModelDropdown();
+      await loadModelCatalog();
       await loadConnectionConfig();
       await fetchSessions();
       if (currentSessionId) {

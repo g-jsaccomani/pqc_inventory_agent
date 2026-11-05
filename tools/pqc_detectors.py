@@ -1,56 +1,56 @@
-"""Network (TLS/SSL Policy) and Key Import (BYOK ImportJob) Post-Quantum Cryptography Detectors.
+"""Evidence collection for TLS on Cloud Load Balancing and Cloud KMS BYOK import jobs (facts only).
 
-Provides specialized PQC posture detection tools for:
-1. `scan_ssl_policies(project_id: str) -> str`:
-   - Inspects active Google Cloud SSL Policies (via Cloud Asset Inventory and/or google-cloud-compute SDK).
-   - Evaluates whether policies enforce TLS 1.3 (`min_tls_version == "TLS_1_3"`) and support IETF hybrid
-     post-quantum key exchange (`X25519MLKEM768` = X25519 + ML-KEM-768).
-   - Flags non-compliant policies as `VULNERABLE_TO_SNDL_ATTACKS` (Store Now, Decrypt Later).
-2. `scan_import_jobs_pqc(project_id: str, location_id: str = "global") -> str`:
-   - Inspects Cloud KMS `ImportJobs` (Bring Your Own Key / BYOK transport wrapping).
-   - Flags classical RSA-OAEP import jobs (`RSA_OAEP_3072_*`, `RSA_OAEP_4096_*`) as `VULNERABLE_KEY_IMPORT_TRANSPORT`.
-   - Classifies quantum-safe HPKE X-Wing / ML-KEM import jobs (`HPKE_KEM_XWING_HKDF_SHA256_AES_256_GCM`,
-     `HPKE_KEM_ML_KEM_768_HKDF_SHA256_AES_256_GCM`, `HPKE_KEM_ML_KEM_1024_HKDF_SHA256_AES_256_GCM`)
-     as `SECURE_PQC_BYOK`.
+- `collect_tls_policies`: SSL policies and HTTPS/SSL target proxies with the effective policy each proxy uses.
+- `collect_kms_import_jobs`: Cloud KMS ImportJobs with their wrapping (import) method and state.
+
+No runbooks, recommendations or narrative are produced here; the Gemini agents reason over these facts.
+Simulation follows the same explicit policy as `tools.gcp_inventory` (never a silent fallback).
 """
 
+from __future__ import annotations
+
 import concurrent.futures
-import json
 import logging
-import os
-import time
 from typing import Any, Dict, List, Optional
 
-from google.api_core import exceptions as gcp_exceptions
 from google.cloud import asset_v1, kms_v1
 
+from tools import mock_data
 from tools.gcp_inventory import (
     DEFAULT_ORGANIZATION_ID,
-    DEFAULT_ORGANIZATION_NAME,
-    SIMULATION_PROJECT_IDS,
-    _CACHE_TTL_SECONDS,
-    _SCAN_CACHE,
+    LIVE_DATA_SOURCE,
+    SIMULATED_DATA_SOURCE,
+    SIMULATION_NOTICE,
+    _cache_get,
+    _cache_put,
     _compact_json,
     _get_client_kwargs,
+    _now_iso,
+    _project_from_cai_name,
     _resolve_scope,
+    excluded_key_rings,
+    simulation_requested,
 )
 
 logger = logging.getLogger(__name__)
 
+TLS_VERSION_RANK = {"TLS_1_0": 0, "TLS_1_1": 1, "TLS_1_2": 2, "TLS_1_3": 3}
+GCP_DEFAULT_SSL_POLICY = {"min_tls_version": "TLS_1_0", "profile": "COMPATIBLE"}
+TLS_REFERENCE_FACTS = [
+    "Hybrid post-quantum key exchange (for example X25519MLKEM768) is only negotiated in TLS 1.3 handshakes; "
+    "whether a given front end offers it must be confirmed separately.",
+    "A target proxy without an attached SSL policy uses the Google Cloud default SSL policy "
+    "(COMPATIBLE profile, minimum TLS 1.0).",
+]
 
-def _extract_project_from_resource_name(resource_name: str, fallback: str = "") -> str:
-    """Extracts the GCP Project ID from a full Cloud Asset Inventory resource URI."""
-    parts = resource_name.split("/")
-    if len(parts) >= 5 and parts[3] == "projects":
-        return parts[4]
-    if "projects/" in resource_name:
-        after = resource_name.split("projects/", 1)[1]
-        return after.split("/", 1)[0]
-    return fallback
+HPKE_PQC_IMPORT_METHODS = {
+    "HPKE_KEM_XWING_HKDF_SHA256_AES_256_GCM",
+    "HPKE_KEM_ML_KEM_768_HKDF_SHA256_AES_256_GCM",
+    "HPKE_KEM_ML_KEM_1024_HKDF_SHA256_AES_256_GCM",
+}
 
 
 def _proto_struct_to_dict(resource_obj: Any) -> Dict[str, Any]:
-    """Safely converts a protobuf Struct / MapComposite from CAI versioned_resources to a Python dict."""
     if not resource_obj:
         return {}
     try:
@@ -59,207 +59,7 @@ def _proto_struct_to_dict(resource_obj: Any) -> Dict[str, Any]:
         return {}
 
 
-def _discover_org_key_rings_via_cai(scope_uri: str) -> List[Dict[str, str]]:
-    """Discovers all Cloud KMS KeyRings within an Organization, Folder, or Project scope via Cloud Asset Inventory."""
-    keyrings: List[Dict[str, str]] = []
-    try:
-        cai_client = asset_v1.AssetServiceClient(**_get_client_kwargs())
-        response = cai_client.search_all_resources(
-            request={
-                "scope": scope_uri,
-                "asset_types": ["cloudkms.googleapis.com/KeyRing"],
-                "page_size": 500,
-            }
-        )
-        for item in response:
-            if "kr-pqc-audit-lab" in item.name:
-                continue
-            parts = item.name.split("/")
-            # Format: //cloudkms.googleapis.com/projects/{proj}/locations/{loc}/keyRings/{kr}
-            if len(parts) >= 9 and parts[3] == "projects" and parts[5] == "locations" and parts[7] == "keyRings":
-                proj_id = parts[4]
-                loc_id = parts[6]
-                kr_id = parts[8]
-                keyrings.append(
-                    {
-                        "project_id": proj_id,
-                        "location": loc_id,
-                        "key_ring": kr_id,
-                        "resource_name": f"projects/{proj_id}/locations/{loc_id}/keyRings/{kr_id}",
-                    }
-                )
-    except Exception as exc:
-        logger.debug("CAI KeyRing discovery fallback on '%s': %s", scope_uri, exc)
-    return keyrings
-
-
-# Cloud KMS ImportMethod classifications
-PQC_APPROVED_IMPORT_METHODS = {
-    "HPKE_KEM_XWING_HKDF_SHA256_AES_256_GCM",
-    "HPKE_KEM_ML_KEM_768_HKDF_SHA256_AES_256_GCM",
-    "HPKE_KEM_ML_KEM_1024_HKDF_SHA256_AES_256_GCM",
-}
-
-CLASSICAL_VULNERABLE_IMPORT_METHODS = {
-    "RSA_OAEP_3072_SHA1_AES_256",
-    "RSA_OAEP_3072_SHA256",
-    "RSA_OAEP_3072_SHA256_AES_256",
-    "RSA_OAEP_4096_SHA1_AES_256",
-    "RSA_OAEP_4096_SHA256",
-    "RSA_OAEP_4096_SHA256_AES_256",
-}
-
-
-def _get_simulated_ssl_policies(project_id: str) -> List[Dict[str, Any]]:
-    """Returns representative SSL Policies for local simulation and unit testing."""
-    return [
-        {
-            "project_id": project_id,
-            "policy_name": "ssl-policy-legacy-tls12-ingress",
-            "resource_name": f"//compute.googleapis.com/projects/{project_id}/global/sslPolicies/ssl-policy-legacy-tls12-ingress",
-            "location": "global",
-            "min_tls_version": "TLS_1_2",
-            "profile": "COMPATIBLE",
-            "custom_features": [],
-            "enforces_tls_1_3": False,
-            "supports_hybrid_pqc_key_share_x25519_mlkem768": False,
-            "pqc_status": "VULNERABLE_TO_SNDL_ATTACKS",
-            "threat_vector": (
-                "Store Now, Decrypt Later (SNDL / HNDL) — Allows classical TLS 1.2 handshakes (ECDHE-RSA / P-256) "
-                "vulnerable to Shor's Algorithm key recovery by a Cryptographically Relevant Quantum Computer (CRQC)."
-            ),
-            "remediation_Recommendation": (
-                "Upgrade SSL Policy to enforce TLS 1.3 (`--min-tls-version=1.3 --profile=RESTRICTED`) on "
-                "Google Cloud Global Load Balancing (L7) with Certificate Authority Service (CAS) to mandate "
-                "hybrid post-quantum key exchange (X25519 + ML-KEM-768 / X25519MLKEM768)."
-            ),
-            "remediation_recommendation": (
-                "Upgrade SSL Policy to enforce TLS 1.3 (`--min-tls-version=1.3 --profile=RESTRICTED`) on "
-                "Google Cloud Global Load Balancing (L7) with Certificate Authority Service (CAS) to mandate "
-                "hybrid post-quantum key exchange (X25519 + ML-KEM-768 / X25519MLKEM768)."
-            ),
-            "step_by_step_execution_guide": [
-                "Step 1 (Pre-Flight Client Telemetry Check): Query Cloud Load Balancing logs (`jsonPayload.tlsVersion`) to confirm no critical legacy clients rely exclusively on TLS 1.0/1.1.",
-                f"Step 2 (Policy Enforcement): Update `ssl-policy-legacy-tls12-ingress` in `{project_id}` to `minTlsVersion=TLS_1_3` and `profile=RESTRICTED` so BoringSSL negotiates IETF hybrid `X25519MLKEM768` (`0x11EC`).",
-                "Step 3 (Post-Change Handshake Verification): Validate the policy state via `gcloud compute ssl-policies describe` and verify hybrid key share negotiation (`X25519MLKEM768`) using a PQC-capable TLS 1.3 client (`bssl` / Chrome 124+ / OpenSSL 3.5+).",
-            ],
-            "gcloud_remediation_command": (
-                f"gcloud compute ssl-policies update ssl-policy-legacy-tls12-ingress "
-                f"--project={project_id} --min-tls-version=1.3 --profile=RESTRICTED"
-            ),
-            "post_change_validation_command": (
-                f"gcloud compute ssl-policies describe ssl-policy-legacy-tls12-ingress "
-                f"--project={project_id} --format=\"yaml(name,minTlsVersion,profile)\""
-            ),
-        },
-        {
-            "project_id": project_id,
-            "policy_name": "ssl-policy-pqc-hybrid-tls13-prod",
-            "resource_name": f"//compute.googleapis.com/projects/{project_id}/global/sslPolicies/ssl-policy-pqc-hybrid-tls13-prod",
-            "location": "global",
-            "min_tls_version": "TLS_1_3",
-            "profile": "RESTRICTED",
-            "custom_features": ["TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384", "TLS_AES_256_GCM_SHA384"],
-            "enforces_tls_1_3": True,
-            "supports_hybrid_pqc_key_share_x25519_mlkem768": True,
-            "pqc_status": "QUANTUM_READY_HYBRID_TLS_1_3",
-            "threat_vector": "NONE (Protected against SNDL/HNDL via TLS 1.3 + X25519MLKEM768 hybrid post-quantum key exchange)",
-            "remediation_Recommendation": (
-                "Compliant: Enforces TLS 1.3 minimum version and supports hybrid post-quantum key shares "
-                "(X25519 + ML-KEM-768) on Google Cloud Global Load Balancing (L7)."
-            ),
-            "remediation_recommendation": (
-                "Compliant: Enforces TLS 1.3 minimum version and supports hybrid post-quantum key shares "
-                "(X25519 + ML-KEM-768) on Google Cloud Global Load Balancing (L7)."
-            ),
-            "step_by_step_execution_guide": [
-                "No remediation required: Policy already enforces TLS 1.3 RESTRICTED profile with hybrid X25519MLKEM768 key exchange."
-            ],
-            "gcloud_remediation_command": None,
-            "post_change_validation_command": (
-                f"gcloud compute ssl-policies describe ssl-policy-pqc-hybrid-tls13-prod "
-                f"--project={project_id} --format=\"yaml(name,minTlsVersion,profile)\""
-            ),
-        },
-    ]
-
-
-def _get_simulated_import_jobs(project_id: str) -> List[Dict[str, Any]]:
-    """Returns representative Cloud KMS ImportJobs for local simulation and unit testing."""
-    return [
-        {
-            "project_id": project_id,
-            "location": "us-central1",
-            "key_ring": "kr-pagamentos-prod",
-            "import_job_name": "ij-legacy-byok-rsa3072",
-            "resource_name": (
-                f"projects/{project_id}/locations/us-central1/keyRings/kr-pagamentos-prod/"
-                f"importJobs/ij-legacy-byok-rsa3072"
-            ),
-            "state": "ACTIVE",
-            "is_active": True,
-            "import_method": "RSA_OAEP_3072_SHA256_AES_256",
-            "protection_level": "HSM",
-            "pqc_status": "VULNERABLE_KEY_IMPORT_TRANSPORT",
-            "threat_vector": (
-                "Shor's Algorithm (BYOK Wrapping Vulnerability) — Classical RSA-OAEP wrapping key can be factored "
-                "by a CRQC if the wrapped key material or API transport payload is intercepted (SNDL/HNDL), "
-                "compromising the imported production key."
-            ),
-            "recommendation": (
-                "Replace classical RSA-OAEP ImportJob with a quantum-safe RFC 9180 HPKE ImportJob using "
-                "`HPKE_KEM_XWING_HKDF_SHA256_AES_256_GCM` backed by Cloud HSM (`--protection-level=hsm`)."
-            ),
-            "step_by_step_execution_guide": [
-                "Step 1 (Pre-Flight On-Premises HSM / Tink Check): Verify that your local key generation utility or gcloud CLI (>= 495.0.0) supports RFC 9180 HPKE X-Wing wrapping.",
-                f"Step 2 (Provision Quantum-Safe ImportJob): Create `ij-pqc-byok-xwing` in KeyRing `kr-pagamentos-prod` (`us-central1`) with `--import-method=hpke-kem-xwing-hkdf-sha256-aes-256-gcm` and `--protection-level=hsm`.",
-                "Step 3 (Fetch HPKE Wrapping Public Key & Import): Download the X-Wing public key from the active ImportJob and execute `gcloud kms keys versions import` to wrap and upload key material.",
-                "Step 4 (Validate Imported Key Version): Verify that the newly imported `CryptoKeyVersion` reaches `ENABLED` state with `protectionLevel: HSM`.",
-            ],
-            "gcloud_remediation_command": (
-                f"gcloud kms import-jobs create ij-pqc-byok-xwing "
-                f"--location=us-central1 --keyring=kr-pagamentos-prod "
-                f"--import-method=hpke-kem-xwing-hkdf-sha256-aes-256-gcm "
-                f"--protection-level=hsm --project={project_id}"
-            ),
-            "post_change_validation_command": (
-                f"gcloud kms import-jobs describe ij-pqc-byok-xwing "
-                f"--location=us-central1 --keyring=kr-pagamentos-prod --project={project_id} "
-                f"--format=\"yaml(name,importMethod,protectionLevel,state)\""
-            ),
-        },
-        {
-            "project_id": project_id,
-            "location": "global",
-            "key_ring": "kr-pqc-canary-global",
-            "import_job_name": "ij-pqc-byok-xwing-prod",
-            "resource_name": (
-                f"projects/{project_id}/locations/global/keyRings/kr-pqc-canary-global/"
-                f"importJobs/ij-pqc-byok-xwing-prod"
-            ),
-            "state": "ACTIVE",
-            "is_active": True,
-            "import_method": "HPKE_KEM_XWING_HKDF_SHA256_AES_256_GCM",
-            "protection_level": "HSM",
-            "pqc_status": "SECURE_PQC_BYOK",
-            "threat_vector": "NONE (Protected via Hybrid Post-Quantum HPKE X-Wing = X25519 + ML-KEM-768 + HKDF-SHA256 + AES-256-GCM)",
-            "recommendation": (
-                "Compliant: Uses quantum-safe HPKE_KEM_XWING_HKDF_SHA256_AES_256_GCM key wrapping for BYOK imports."
-            ),
-            "step_by_step_execution_guide": [
-                "No remediation required: ImportJob already uses quantum-safe HPKE_KEM_XWING_HKDF_SHA256_AES_256_GCM on Cloud HSM."
-            ],
-            "gcloud_remediation_command": None,
-            "post_change_validation_command": (
-                f"gcloud kms import-jobs describe ij-pqc-byok-xwing-prod "
-                f"--location=global --keyring=kr-pqc-canary-global --project={project_id} "
-                f"--format=\"yaml(name,importMethod,protectionLevel,state)\""
-            ),
-        },
-    ]
-
-
-def _evaluate_ssl_policy_dict(
+def _policy_record(
     policy_name: str,
     resource_name: str,
     project_id: str,
@@ -268,147 +68,95 @@ def _evaluate_ssl_policy_dict(
     profile: str,
     custom_features: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Analyzes a single SSL Policy for TLS 1.3 enforcement and hybrid PQC key share support (X25519 + ML-KEM-768)."""
     norm_tls = (min_tls_version or "TLS_1_0").upper()
-    norm_profile = (profile or "COMPATIBLE").upper()
-    features = list(custom_features or [])
-    region_flag = "" if location in ("global", "", None) else f" --region={location}"
-
-    # Strict requirement: Enforce TLS 1.3 (and compatible profile/features) to guarantee hybrid PQC key shares (X25519 + ML-KEM-768)
-    enforces_tls_1_3 = norm_tls == "TLS_1_3"
-    supports_hybrid_pqc = enforces_tls_1_3 and norm_profile in ("MODERN", "RESTRICTED", "CUSTOM", "DEFAULT")
-
-    if enforces_tls_1_3 and supports_hybrid_pqc:
-        pqc_status = "QUANTUM_READY_HYBRID_TLS_1_3"
-        threat_vector = (
-            "NONE (Enforces TLS 1.3 and supports hybrid post-quantum key shares X25519 + ML-KEM-768 / X25519MLKEM768)"
-        )
-        recommendation = (
-            "Compliant: SSL Policy enforces TLS 1.3 and supports hybrid post-quantum key exchange "
-            "(X25519 + ML-KEM-768) on Google Cloud Global Load Balancing (L7)."
-        )
-        gcloud_cmd = None
-        execution_steps = [
-            "No remediation required: Policy already enforces TLS 1.3 and supports X25519MLKEM768 hybrid key shares."
-        ]
-    else:
-        pqc_status = "VULNERABLE_TO_SNDL_ATTACKS"
-        threat_vector = (
-            f"Store Now, Decrypt Later (SNDL / HNDL) — Policy has minTlsVersion='{norm_tls}' (profile='{norm_profile}'), "
-            "permitting classical TLS 1.2/1.1/1.0 ECDHE/RSA key exchanges that do not negotiate hybrid post-quantum "
-            "key shares (X25519 + ML-KEM-768) and can be decrypted retroactively by a CRQC using Shor's Algorithm."
-        )
-        gcloud_cmd = (
-            f"gcloud compute ssl-policies update {policy_name} "
-            f"--project={project_id}{region_flag} --min-tls-version=1.3 --profile=RESTRICTED"
-        )
-        recommendation = (
-            "Enforce TLS 1.3 (`--min-tls-version=1.3 --profile=RESTRICTED`) on Google Cloud Global Load Balancing (L7) "
-            "and pair with Certificate Authority Service (CAS) to mandate hybrid post-quantum key shares (X25519 + ML-KEM-768)."
-        )
-        execution_steps = [
-            f"Step 1 (Pre-Flight Client Telemetry Check): Inspect Cloud Load Balancing logs in `{project_id}` to confirm external clients support TLS 1.3.",
-            f"Step 2 (Upgrade Policy to TLS 1.3 Restricted): Run `{gcloud_cmd}` to disable legacy TLS 1.0–1.2 handshakes and enable IETF hybrid `X25519MLKEM768`.",
-            f"Step 3 (Verify Policy Enforcement): Run `gcloud compute ssl-policies describe {policy_name} --project={project_id}{region_flag}` and confirm `minTlsVersion: TLS_1_3`.",
-        ]
-
     return {
-        "project_id": project_id,
         "policy_name": policy_name,
         "resource_name": resource_name,
+        "project_id": project_id,
         "location": location or "global",
         "min_tls_version": norm_tls,
-        "profile": norm_profile,
-        "custom_features": features,
-        "enforces_tls_1_3": enforces_tls_1_3,
-        "supports_hybrid_pqc_key_share_x25519_mlkem768": supports_hybrid_pqc,
-        "pqc_status": pqc_status,
-        "threat_vector": threat_vector,
-        "remediation_recommendation": recommendation,
-        "step_by_step_execution_guide": execution_steps,
-        "gcloud_remediation_command": gcloud_cmd,
-        "post_change_validation_command": (
-            f"gcloud compute ssl-policies describe {policy_name} "
-            f"--project={project_id}{region_flag} --format=\"yaml(name,minTlsVersion,profile)\""
-        ),
+        "profile": (profile or "COMPATIBLE").upper(),
+        "custom_features": list(custom_features or []),
+        "requires_tls_1_3": norm_tls == "TLS_1_3",
+        "allows_pre_tls13_handshakes": TLS_VERSION_RANK.get(norm_tls, 0) < 3,
     }
 
 
-def scan_ssl_policies(project_id: str = f"organizations/{DEFAULT_ORGANIZATION_ID}") -> str:
-    """Fetches all active Google Cloud SSL Policies and analyzes whether they enforce TLS 1.3
-    and support hybrid post-quantum key shares (X25519 + ML-KEM-768). Flags non-compliant policies
-    as 'VULNERABLE_TO_SNDL_ATTACKS'.
+def _policy_short_name(ref: Optional[str]) -> Optional[str]:
+    if not ref:
+        return None
+    return str(ref).rstrip("/").split("/")[-1]
 
-    Args:
-        project_id: Target GCP Project ID (e.g. 'pqc-inventory-agent-cd06') or Organization scope
-                    (e.g. 'organizations/31564119954', 'org', 'all').
 
-    Returns:
-        JSON string containing the SSL Policy PQC posture analysis, SNDL vulnerability flags,
-        deterministic ssl_pqc_readiness_score_pct, step-by-step execution guide, and remediation commands.
-    """
-    sim_mode = os.getenv("PQC_SIMULATION_MODE", "AUTO").upper()
-    mode, scope_uri, clean_id = _resolve_scope(project_id)
-    cache_key = f"ssl:{sim_mode}:{scope_uri}"
-    now_ts = time.monotonic()
-    cached = _SCAN_CACHE.get(cache_key)
-    if cached and (now_ts - cached[0]) < _CACHE_TTL_SECONDS:
-        return cached[1]
-
-    if sim_mode == "TRUE" or clean_id.lower() in SIMULATION_PROJECT_IDS:
-        sim_policies = _get_simulated_ssl_policies(clean_id)
-        vuln_count = sum(1 for p in sim_policies if p["pqc_status"] == "VULNERABLE_TO_SNDL_ATTACKS")
-        ready_count = sum(1 for p in sim_policies if p["pqc_status"] == "QUANTUM_READY_HYBRID_TLS_1_3")
-        score_pct = round((ready_count / len(sim_policies)) * 100.0, 1) if sim_policies else 0.0
-        out_json = _compact_json(
+def _resolve_proxy_records(policies: List[Dict[str, Any]], proxies_raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    by_key = {(p["project_id"], p["policy_name"]): p for p in policies}
+    records: List[Dict[str, Any]] = []
+    for proxy in proxies_raw:
+        attached = _policy_short_name(proxy.get("attached_ssl_policy"))
+        policy = by_key.get((proxy.get("project_id"), attached)) if attached else None
+        if attached and policy:
+            effective_tls, effective_profile, source = policy["min_tls_version"], policy["profile"], "ATTACHED_SSL_POLICY"
+        elif attached:
+            effective_tls, effective_profile, source = None, None, "ATTACHED_SSL_POLICY_NOT_FOUND_IN_SCOPE"
+        else:
+            effective_tls = GCP_DEFAULT_SSL_POLICY["min_tls_version"]
+            effective_profile = GCP_DEFAULT_SSL_POLICY["profile"]
+            source = "GCP_DEFAULT_SSL_POLICY"
+        records.append(
             {
-                "scope": scope_uri,
-                "scope_mode": mode,
-                "data_source": "SIMULATION_MODE",
-                "data_source_authenticity": "SIMULATED_BENCHMARK_DATASET",
-                "total_ssl_policies_scanned": len(sim_policies),
-                "vulnerable_to_sndl_attacks_count": vuln_count,
-                "quantum_ready_hybrid_tls13_count": ready_count,
-                "ssl_pqc_readiness_score_pct": score_pct,
-                "ssl_policies": sim_policies,
-                "architectural_upsell_recommendation": (
-                    "Deploy Google Cloud Global Load Balancing (L7) with TLS 1.3 modern/restricted policies "
-                    "(X25519 + ML-KEM-768 hybrid PQC key exchange) and Certificate Authority Service (CAS)."
-                ),
+                "proxy_name": proxy.get("proxy_name"),
+                "resource_name": proxy.get("resource_name"),
+                "project_id": proxy.get("project_id"),
+                "proxy_type": proxy.get("proxy_type"),
+                "attached_ssl_policy": attached,
+                "effective_policy_source": source,
+                "effective_min_tls_version": effective_tls,
+                "effective_profile": effective_profile,
+                "effective_requires_tls_1_3": effective_tls == "TLS_1_3",
             }
         )
-        _SCAN_CACHE[cache_key] = (now_ts, out_json)
-        return out_json
+    return records
 
-    evaluated_policies: List[Dict[str, Any]] = []
-    seen_resources = set()
 
-    # 1. Try google-cloud-compute SDK if installed and scanning a single project
-    if mode == "PROJECT":
-        try:
-            from google.cloud import compute_v1  # type: ignore
+def collect_tls_policies(scope: str = f"organizations/{DEFAULT_ORGANIZATION_ID}") -> str:
+    """Collects SSL policies and HTTPS/SSL target proxies with the effective TLS policy of each proxy (facts only).
 
-            ssl_client = compute_v1.SslPoliciesClient()
-            for policy in ssl_client.list(project=clean_id):
-                res_name = f"//compute.googleapis.com/projects/{clean_id}/global/sslPolicies/{policy.name}"
-                seen_resources.add(res_name)
-                evaluated_policies.append(
-                    _evaluate_ssl_policy_dict(
-                        policy_name=policy.name,
-                        resource_name=res_name,
-                        project_id=clean_id,
-                        location="global",
-                        min_tls_version=str(getattr(policy, "min_tls_version", "TLS_1_0")),
-                        profile=str(getattr(policy, "profile", "COMPATIBLE")),
-                        custom_features=list(getattr(policy, "custom_features", []) or []),
-                    )
-                )
-        except ImportError:
-            logger.debug("google-cloud-compute not installed; using Cloud Asset Inventory for SSL Policy discovery.")
-        except Exception as exc:
-            logger.warning("Compute Engine SslPoliciesClient lookup note on '%s': %s", clean_id, exc)
+    Args:
+        scope: 'organizations/<id>', 'folders/<id>', 'projects/<id>' or a bare project ID.
 
-    # 2. Query Cloud Asset Inventory for compute.googleapis.com/SslPolicy across Organization or Project
+    Returns:
+        JSON with `ssl_policies`, `target_proxies` (attached or default policy, effective minimum TLS version),
+        `reference_facts` and `data_source`, or an `error` object.
+    """
+    mode, scope_uri, clean_id = _resolve_scope(scope)
+    simulated = simulation_requested(clean_id)
+    cache_key = f"tls:{scope_uri}:{simulated}"
+    cached = _cache_get(cache_key)
+    if cached:
+        return cached
+
+    if simulated:
+        demo = mock_data.get_simulated_tls_evidence(clean_id)
+        policies = [
+            _policy_record(
+                p["policy_name"], p["resource_name"], p["project_id"], p["location"], p["min_tls_version"], p["profile"], p["custom_features"]
+            )
+            for p in demo["policies"]
+        ]
+        payload = {
+            "scope": scope_uri,
+            "scope_mode": mode,
+            "data_source": SIMULATED_DATA_SOURCE,
+            "simulation_notice": SIMULATION_NOTICE,
+            "generated_at": _now_iso(),
+            "ssl_policies": policies,
+            "target_proxies": _resolve_proxy_records(policies, demo["proxies"]),
+            "reference_facts": TLS_REFERENCE_FACTS,
+        }
+        return _cache_put(cache_key, _compact_json(payload))
+
+    policies: List[Dict[str, Any]] = []
+    proxies_raw: List[Dict[str, Any]] = []
     try:
         cai_client = asset_v1.AssetServiceClient(**_get_client_kwargs())
         request = asset_v1.SearchAllResourcesRequest(
@@ -420,411 +168,212 @@ def scan_ssl_policies(project_id: str = f"organizations/{DEFAULT_ORGANIZATION_ID
             ],
             read_mask="*",
         )
-        unattached_https_proxies: List[Dict[str, Any]] = []
-
         for item in cai_client.search_all_resources(request=request):
-            asset_type = item.asset_type
-            res_name = item.name
-            proj = _extract_project_from_resource_name(res_name, item.project or clean_id)
+            proj = _project_from_cai_name(item.name, item.project or clean_id)
             attrs = _proto_struct_to_dict(item.versioned_resources[0].resource) if item.versioned_resources else {}
-
-            if asset_type == "compute.googleapis.com/SslPolicy":
-                if res_name in seen_resources:
-                    continue
-                seen_resources.add(res_name)
-                policy_name = item.display_name or res_name.split("/")[-1]
-                min_tls = str(attrs.get("minTlsVersion", attrs.get("min_tls_version", "TLS_1_0")))
-                profile = str(attrs.get("profile", "COMPATIBLE"))
-                custom_features = attrs.get("customFeatures", attrs.get("custom_features", [])) or []
-                evaluated_policies.append(
-                    _evaluate_ssl_policy_dict(
-                        policy_name=policy_name,
-                        resource_name=res_name,
-                        project_id=proj,
-                        location=item.location or "global",
-                        min_tls_version=min_tls,
-                        profile=profile,
-                        custom_features=custom_features if isinstance(custom_features, list) else [],
+            name = item.display_name or item.name.split("/")[-1]
+            if item.asset_type == "compute.googleapis.com/SslPolicy":
+                features = attrs.get("customFeatures") or attrs.get("custom_features") or []
+                policies.append(
+                    _policy_record(
+                        name,
+                        item.name,
+                        proj,
+                        item.location or "global",
+                        str(attrs.get("minTlsVersion") or attrs.get("min_tls_version") or "TLS_1_0"),
+                        str(attrs.get("profile") or "COMPATIBLE"),
+                        features if isinstance(features, list) else [],
                     )
                 )
-            elif asset_type in ("compute.googleapis.com/TargetHttpsProxy", "compute.googleapis.com/TargetSslProxy"):
-                bound_policy = attrs.get("sslPolicy") or attrs.get("ssl_policy")
-                if not bound_policy:
-                    proxy_name = item.display_name or res_name.split("/")[-1]
-                    create_attach_cmd = (
-                        f"gcloud compute ssl-policies create ssl-policy-pqc-tls13 --project={proj} "
-                        f"--min-tls-version=1.3 --profile=RESTRICTED && "
-                        f"gcloud compute target-https-proxies update {proxy_name} --project={proj} "
-                        f"--ssl-policy=ssl-policy-pqc-tls13"
-                    )
-                    unattached_https_proxies.append(
-                        {
-                            "project_id": proj,
-                            "policy_name": f"DEFAULT_UNATTACHED_SSL_POLICY ({proxy_name})",
-                            "resource_name": res_name,
-                            "location": item.location or "global",
-                            "min_tls_version": "TLS_1_0 (GCP Default SSL Policy)",
-                            "profile": "COMPATIBLE (Default)",
-                            "custom_features": [],
-                            "enforces_tls_1_3": False,
-                            "supports_hybrid_pqc_key_share_x25519_mlkem768": False,
-                            "pqc_status": "VULNERABLE_TO_SNDL_ATTACKS",
-                            "threat_vector": (
-                                f"Target proxy '{proxy_name}' has no custom SslPolicy attached and defaults to "
-                                "TLS_1_0 / COMPATIBLE, making it vulnerable to Store Now, Decrypt Later (SNDL) attacks."
-                            ),
-                            "remediation_recommendation": (
-                                "Create and attach a Google Cloud SSL Policy enforcing TLS 1.3 (`--min-tls-version=1.3 --profile=RESTRICTED`) "
-                                "on Google Cloud Global Load Balancing (L7) with Certificate Authority Service (CAS)."
-                            ),
-                            "step_by_step_execution_guide": [
-                                f"Step 1: Create a restricted TLS 1.3 SSL policy (`ssl-policy-pqc-tls13`) in project `{proj}`.",
-                                f"Step 2: Bind `ssl-policy-pqc-tls13` to proxy `{proxy_name}` to mandate hybrid `X25519MLKEM768` key exchange.",
-                                f"Step 3: Verify proxy attachment via `gcloud compute target-https-proxies describe {proxy_name} --project={proj}`.",
-                            ],
-                            "gcloud_remediation_command": create_attach_cmd,
-                            "post_change_validation_command": (
-                                f"gcloud compute target-https-proxies describe {proxy_name} "
-                                f"--project={proj} --format=\"yaml(name,sslPolicy)\""
-                            ),
-                        }
-                    )
-
-        evaluated_policies.extend(unattached_https_proxies)
-
-        vuln_count = sum(1 for p in evaluated_policies if p["pqc_status"] == "VULNERABLE_TO_SNDL_ATTACKS")
-        ready_count = sum(1 for p in evaluated_policies if p["pqc_status"] == "QUANTUM_READY_HYBRID_TLS_1_3")
-        score_pct = round((ready_count / len(evaluated_policies)) * 100.0, 1) if evaluated_policies else 0.0
-
-        advisory_note = None
-        if not evaluated_policies:
-            advisory_note = (
-                "No custom compute.googleapis.com/SslPolicy resources were found in this scope. "
-                "Any public or internal HTTPS endpoints without an explicit TLS 1.3 SSL Policy default to "
-                "TLS 1.0/1.2 fallback ('VULNERABLE_TO_SNDL_ATTACKS'). Provision Google Cloud Global Load Balancing (L7) "
-                "with a TLS 1.3 SSL Policy (X25519 + ML-KEM-768) and Certificate Authority Service (CAS)."
-            )
-
-        out_json = _compact_json(
+            else:
+                proxies_raw.append(
+                    {
+                        "proxy_name": name,
+                        "resource_name": item.name,
+                        "project_id": proj,
+                        "proxy_type": item.asset_type,
+                        "attached_ssl_policy": attrs.get("sslPolicy") or attrs.get("ssl_policy"),
+                    }
+                )
+    except Exception as exc:
+        return _compact_json(
             {
                 "scope": scope_uri,
                 "scope_mode": mode,
-                "organization_id": DEFAULT_ORGANIZATION_ID if mode == "ORG" else None,
-                "organization_domain": DEFAULT_ORGANIZATION_NAME if mode == "ORG" else None,
-                "data_source": "LIVE_GCP_CLOUD_ASSET_INVENTORY_AND_COMPUTE_API",
-                "data_source_authenticity": "LIVE_GCP_TELEMETRY_VERIFIED",
-                "total_ssl_policies_scanned": len(evaluated_policies),
-                "vulnerable_to_sndl_attacks_count": vuln_count,
-                "quantum_ready_hybrid_tls13_count": ready_count,
-                "ssl_pqc_readiness_score_pct": score_pct,
-                "ssl_policies": evaluated_policies,
-                "advisory_note": advisory_note,
-                "baseline_ssl_policy_creation_guide": {
-                    "step_1_create_tls13_policy_cmd": (
-                        f"gcloud compute ssl-policies create ssl-policy-pqc-hybrid-tls13 "
-                        f"--project={clean_id if mode == 'PROJECT' else 'pqc-inventory-agent-cd06'} "
-                        f"--min-tls-version=1.3 --profile=RESTRICTED"
-                    ),
-                    "step_2_attach_to_https_proxy_cmd": (
-                        "gcloud compute target-https-proxies update <TARGET_HTTPS_PROXY_NAME> "
-                        f"--project={clean_id if mode == 'PROJECT' else 'pqc-inventory-agent-cd06'} "
-                        "--ssl-policy=ssl-policy-pqc-hybrid-tls13"
-                    ),
-                    "step_3_validate_policy_cmd": (
-                        "gcloud compute ssl-policies describe ssl-policy-pqc-hybrid-tls13 "
-                        f"--project={clean_id if mode == 'PROJECT' else 'pqc-inventory-agent-cd06'} "
-                        "--format=\"yaml(name,minTlsVersion,profile)\""
-                    ),
-                },
-                "architectural_upsell_recommendation": (
-                    "Recommend Google Cloud Global Load Balancing (L7) with TLS 1.3 modern/restricted policies "
-                    "(enabling hybrid post-quantum key shares X25519 + ML-KEM-768 / X25519MLKEM768) and "
-                    "Certificate Authority Service (CAS) to enforce quantum-safe transport."
-                ),
-            }
-        )
-        _SCAN_CACHE[cache_key] = (now_ts, out_json)
-        return out_json
-    except gcp_exceptions.GoogleAPICallError as exc:
-        logger.warning("GCP API error in scan_ssl_policies on '%s': %s", scope_uri, exc)
-        return _compact_json(
-            {
-                "error": f"Failed to scan SSL Policies in scope '{scope_uri}': {exc.message}",
-                "scope": scope_uri,
+                "data_source": LIVE_DATA_SOURCE,
+                "error": f"SSL policy / target proxy search failed: {type(exc).__name__}: {str(exc)[:300]}",
+                "required_roles": ["roles/cloudasset.viewer", "roles/compute.viewer"],
             }
         )
 
+    payload = {
+        "scope": scope_uri,
+        "scope_mode": mode,
+        "data_source": LIVE_DATA_SOURCE,
+        "generated_at": _now_iso(),
+        "ssl_policies": policies,
+        "target_proxies": _resolve_proxy_records(policies, proxies_raw),
+        "reference_facts": TLS_REFERENCE_FACTS,
+    }
+    return _cache_put(cache_key, _compact_json(payload))
 
-def _classify_import_job(
-    project_id: str,
-    location: str,
-    key_ring: str,
-    job_name: str,
-    resource_name: str,
-    state_name: str,
-    import_method_name: str,
-    protection_level_name: str,
-) -> Dict[str, Any]:
-    """Classifies a Cloud KMS ImportJob based on its wrapping algorithm and state."""
-    norm_method = (import_method_name or "IMPORT_METHOD_UNSPECIFIED").upper()
-    norm_state = (state_name or "IMPORT_JOB_STATE_UNSPECIFIED").upper()
-    norm_prot = (protection_level_name or "SOFTWARE").upper()
-    is_active = norm_state in ("ACTIVE", "PENDING_GENERATION")
 
-    if norm_method in PQC_APPROVED_IMPORT_METHODS:
-        pqc_status = "SECURE_PQC_BYOK"
-        threat_vector = (
-            f"NONE — Uses quantum-safe RFC 9180 HPKE key wrapping ({norm_method}), protecting imported key material "
-            "in transit against Shor's Algorithm and Store Now, Decrypt Later (SNDL) attacks."
-        )
-        recommendation = (
-            f"Compliant ('SECURE_PQC_BYOK'): ImportJob uses post-quantum {norm_method} wrapping "
-            f"with protection level {norm_prot}."
-        )
-        gcloud_cmd = None
-        execution_steps = [
-            f"No remediation required: ImportJob `{job_name}` already uses post-quantum `{norm_method}` wrapping."
-        ]
-        validation_cmd = (
-            f"gcloud kms import-jobs describe {job_name} "
-            f"--location={location} --keyring={key_ring} --project={project_id} "
-            f"--format=\"yaml(name,importMethod,protectionLevel,state)\""
-        )
-    elif norm_method in CLASSICAL_VULNERABLE_IMPORT_METHODS or "RSA_OAEP" in norm_method:
-        pqc_status = "VULNERABLE_KEY_IMPORT_TRANSPORT"
-        threat_vector = (
-            f"Shor's Algorithm (BYOK Transport Vulnerability) — ImportJob uses classical '{norm_method}' wrapping. "
-            "An adversary capturing wrapped BYOK key material in transit can factor the RSA-3072/4096 wrapping key "
-            "using a Cryptographically Relevant Quantum Computer (CRQC) and compromise the imported production key."
-        )
-        recommendation = (
-            "Migrate BYOK key imports from classical RSA-OAEP to quantum-safe hybrid HPKE "
-            "('HPKE_KEM_XWING_HKDF_SHA256_AES_256_GCM') backed by Cloud HSM ('--protection-level=hsm')."
-        )
-        gcloud_cmd = (
-            f"gcloud kms import-jobs create {job_name}-pqc-xwing "
-            f"--location={location} --keyring={key_ring} "
-            f"--import-method=hpke-kem-xwing-hkdf-sha256-aes-256-gcm "
-            f"--protection-level=hsm --project={project_id}"
-        )
-        validation_cmd = (
-            f"gcloud kms import-jobs describe {job_name}-pqc-xwing "
-            f"--location={location} --keyring={key_ring} --project={project_id} "
-            f"--format=\"yaml(name,importMethod,protectionLevel,state)\""
-        )
-        execution_steps = [
-            "Step 1 (Pre-Flight CLI / HSM Readiness): Ensure gcloud CLI >= 495.0.0 or local Tink HPKE wrapper is installed on the key generation workstation.",
-            f"Step 2 (Provision Quantum-Safe ImportJob): Execute `{gcloud_cmd}` to create a parallel HPKE X-Wing ImportJob backed by Cloud HSM.",
-            f"Step 3 (Re-Wrap & Import Key Material): Retrieve the new ImportJob public key and run `gcloud kms keys versions import --import-job={job_name}-pqc-xwing ...`.",
-            f"Step 4 (Verify Active State): Run `{validation_cmd}` to confirm `state: ACTIVE` and `importMethod: HPKE_KEM_XWING_HKDF_SHA256_AES_256_GCM`.",
-        ]
+def _import_job_record(raw: Dict[str, Any], data_source: str) -> Dict[str, Any]:
+    method = (raw.get("import_method") or "IMPORT_METHOD_UNSPECIFIED").upper()
+    state = (raw.get("state") or "IMPORT_JOB_STATE_UNSPECIFIED").upper()
+    if method in HPKE_PQC_IMPORT_METHODS:
+        family, status = "HPKE_POST_QUANTUM_KEM", "QUANTUM_SAFE_PQC"
+    elif method.startswith("RSA_OAEP"):
+        family, status = "RSA_OAEP_CLASSICAL", "QUANTUM_VULNERABLE_SHOR"
     else:
-        pqc_status = "UNKNOWN_IMPORT_METHOD_REVIEW_REQUIRED"
-        threat_vector = f"Unrecognized ImportMethod '{norm_method}'; verify quantum resistance."
-        recommendation = (
-            "Use 'HPKE_KEM_XWING_HKDF_SHA256_AES_256_GCM' backed by Cloud HSM for quantum-safe BYOK key transport."
-        )
-        gcloud_cmd = None
-        execution_steps = [
-            "Verify ImportJob wrapping method and standardize on HPKE_KEM_XWING_HKDF_SHA256_AES_256_GCM."
-        ]
-        validation_cmd = (
-            f"gcloud kms import-jobs describe {job_name} "
-            f"--location={location} --keyring={key_ring} --project={project_id}"
-        )
-
+        family, status = "UNRECOGNIZED", "UNKNOWN_REQUIRES_REVIEW"
     return {
-        "project_id": project_id,
-        "location": location,
-        "key_ring": key_ring,
-        "import_job_name": job_name,
-        "resource_name": resource_name,
-        "state": norm_state,
-        "is_active": is_active,
-        "import_method": norm_method,
-        "protection_level": norm_prot,
-        "pqc_status": pqc_status,
-        "threat_vector": threat_vector,
-        "recommendation": recommendation,
-        "step_by_step_execution_guide": execution_steps,
-        "gcloud_remediation_command": gcloud_cmd,
-        "post_change_validation_command": validation_cmd,
+        "project_id": raw.get("project_id"),
+        "location": raw.get("location"),
+        "key_ring": raw.get("key_ring"),
+        "import_job_name": raw.get("import_job_name"),
+        "resource_name": raw.get("resource_name"),
+        "state": state,
+        "is_active": state in ("ACTIVE", "PENDING_GENERATION"),
+        "import_method": method,
+        "wrapping_family": family,
+        "transport_quantum_status": status,
+        "protection_level": (raw.get("protection_level") or "UNKNOWN").upper(),
+        "expire_time": raw.get("expire_time"),
+        "data_source": data_source,
     }
 
 
-def scan_import_jobs_pqc(
-    project_id: str = f"organizations/{DEFAULT_ORGANIZATION_ID}",
-    location_id: str = "global",
+def _discover_key_rings_via_cai(scope_uri: str) -> List[Dict[str, str]]:
+    keyrings: List[Dict[str, str]] = []
+    excluded = excluded_key_rings()
+    cai_client = asset_v1.AssetServiceClient(**_get_client_kwargs())
+    for item in cai_client.search_all_resources(
+        request={"scope": scope_uri, "asset_types": ["cloudkms.googleapis.com/KeyRing"], "page_size": 500}
+    ):
+        parts = item.name.split("/")
+        if len(parts) >= 9 and parts[3] == "projects" and parts[5] == "locations" and parts[7] == "keyRings":
+            if parts[8] in excluded:
+                continue
+            keyrings.append(
+                {
+                    "project_id": parts[4],
+                    "location": parts[6],
+                    "key_ring": parts[8],
+                    "resource_name": f"projects/{parts[4]}/locations/{parts[6]}/keyRings/{parts[8]}",
+                }
+            )
+    return keyrings
+
+
+def collect_kms_import_jobs(
+    scope: str = f"organizations/{DEFAULT_ORGANIZATION_ID}",
+    location: str = "all",
 ) -> str:
-    """Lists all active ImportJobs in Cloud KMS and inspects their wrapping/import methods.
-    Flags classical RSA-OAEP jobs as 'VULNERABLE_KEY_IMPORT_TRANSPORT' and classifies
-    'HPKE_KEM_XWING_HKDF_SHA256_AES_256_GCM' (and ML-KEM HPKE variants) as 'SECURE_PQC_BYOK'.
+    """Collects Cloud KMS ImportJobs (BYOK) with their wrapping method, state and protection level (facts only).
 
     Args:
-        project_id: Target GCP Project ID (e.g. 'pqc-inventory-agent-cd06') or Organization scope
-                    (e.g. 'organizations/31564119954', 'org', 'all').
-        location_id: Cloud KMS location (e.g. 'global', 'us-central1', or 'all' to scan all locations).
+        scope: 'organizations/<id>', 'folders/<id>', 'projects/<id>' or a bare project ID.
+        location: Cloud KMS location filter or 'all'.
 
     Returns:
-        JSON string containing the Cloud KMS ImportJobs PQC assessment, classification verdicts,
-        deterministic byok_pqc_readiness_score_pct, step-by-step execution guide, and remediation commands.
+        JSON with `import_jobs` (import_method, wrapping_family, transport_quantum_status, state), `key_rings_inspected`,
+        `collection_notes`, `data_source`, or an `error` object.
     """
-    sim_mode = os.getenv("PQC_SIMULATION_MODE", "AUTO").upper()
-    mode, scope_uri, clean_id = _resolve_scope(project_id)
-    cache_key = f"ij:{sim_mode}:{scope_uri}:{(location_id or 'global').lower()}"
-    now_ts = time.monotonic()
-    cached = _SCAN_CACHE.get(cache_key)
-    if cached and (now_ts - cached[0]) < _CACHE_TTL_SECONDS:
-        return cached[1]
+    mode, scope_uri, clean_id = _resolve_scope(scope)
+    loc = (location or "all").strip()
+    simulated = simulation_requested(clean_id)
+    cache_key = f"importjobs:{scope_uri}:{loc.lower()}:{simulated}"
+    cached = _cache_get(cache_key)
+    if cached:
+        return cached
 
-    if sim_mode == "TRUE" or clean_id.lower() in SIMULATION_PROJECT_IDS:
-        sim_jobs = _get_simulated_import_jobs(clean_id)
-        if location_id and location_id.lower() not in ("all", "*", "global"):
-            sim_jobs = [j for j in sim_jobs if j["location"] == location_id]
-        active_sim = [j for j in sim_jobs if j["is_active"]]
-        vuln_count = sum(1 for j in active_sim if j["pqc_status"] == "VULNERABLE_KEY_IMPORT_TRANSPORT")
-        secure_count = sum(1 for j in active_sim if j["pqc_status"] == "SECURE_PQC_BYOK")
-        score_pct = round((secure_count / len(active_sim)) * 100.0, 1) if active_sim else 100.0
-        out_json = _compact_json(
-            {
-                "scope": scope_uri,
-                "scope_mode": mode,
-                "location_filter": location_id,
-                "data_source": "SIMULATION_MODE",
-                "data_source_authenticity": "SIMULATED_BENCHMARK_DATASET",
-                "total_import_jobs_scanned": len(sim_jobs),
-                "active_import_jobs_count": len(active_sim),
-                "vulnerable_key_import_transport_count": vuln_count,
-                "secure_pqc_byok_count": secure_count,
-                "byok_pqc_readiness_score_pct": score_pct,
-                "import_jobs": sim_jobs,
-                "architectural_upsell_recommendation": (
-                    "Migrate BYOK workflows to Cloud HSM (FIPS 140-3 Level 3) using "
-                    "HPKE_KEM_XWING_HKDF_SHA256_AES_256_GCM import jobs to eliminate key transport risks."
-                ),
-            }
-        )
-        _SCAN_CACHE[cache_key] = (now_ts, out_json)
-        return out_json
+    if simulated:
+        jobs = [_import_job_record(j, SIMULATED_DATA_SOURCE) for j in mock_data.get_simulated_import_jobs(clean_id)]
+        if loc.lower() not in ("all", "*", ""):
+            jobs = [j for j in jobs if j["location"] == loc]
+        payload = {
+            "scope": scope_uri,
+            "scope_mode": mode,
+            "data_source": SIMULATED_DATA_SOURCE,
+            "simulation_notice": SIMULATION_NOTICE,
+            "generated_at": _now_iso(),
+            "import_jobs": jobs,
+            "key_rings_inspected": len({(j["project_id"], j["location"], j["key_ring"]) for j in jobs}),
+            "collection_notes": [],
+        }
+        return _cache_put(cache_key, _compact_json(payload))
 
+    notes: List[str] = []
     try:
         kms_client = kms_v1.KeyManagementServiceClient(**_get_client_kwargs())
-        key_rings_to_scan: List[Dict[str, str]] = []
+        key_rings = _discover_key_rings_via_cai(scope_uri)
+        if loc.lower() not in ("all", "*", ""):
+            key_rings = [kr for kr in key_rings if kr["location"] == loc]
+        if not key_rings and mode == "PROJECT":
+            probe_locations = ["global"] if loc.lower() in ("all", "*", "") else [loc]
+            notes.append(
+                "Cloud Asset Inventory returned no key rings for this project; only "
+                f"{', '.join(probe_locations)} was listed directly via the Cloud KMS API."
+            )
+            for probe_loc in probe_locations:
+                for kr in kms_client.list_key_rings(request={"parent": f"projects/{clean_id}/locations/{probe_loc}"}):
+                    key_rings.append(
+                        {
+                            "project_id": clean_id,
+                            "location": probe_loc,
+                            "key_ring": kr.name.split("/")[-1],
+                            "resource_name": kr.name,
+                        }
+                    )
 
-        if mode in ("ORG", "FOLDER"):
-            org_krs = _discover_org_key_rings_via_cai(scope_uri)
-            for kr in org_krs:
-                if location_id.lower() in ("all", "*", "global") or kr["location"] == location_id:
-                    key_rings_to_scan.append(kr)
-        else:
-            # Project mode: discover KeyRings via CAI first, or fallback to common locations
-            proj_krs = _discover_org_key_rings_via_cai(f"projects/{clean_id}")
-            if proj_krs:
-                for kr in proj_krs:
-                    if location_id.lower() in ("all", "*") or kr["location"] == location_id or location_id == "global":
-                        key_rings_to_scan.append(kr)
-            else:
-                locs = (
-                    ["global", "us-central1", "us-east1", "southamerica-east1", "europe-west1"]
-                    if location_id.lower() in ("all", "*")
-                    else [location_id]
-                )
-                for loc in locs:
-                    parent = f"projects/{clean_id}/locations/{loc}"
-                    try:
-                        for kr in kms_client.list_key_rings(request={"parent": parent}):
-                            kr_id = kr.name.split("/")[-1]
-                            key_rings_to_scan.append(
-                                {
-                                    "project_id": clean_id,
-                                    "location": loc,
-                                    "key_ring": kr_id,
-                                    "resource_name": kr.name,
-                                }
-                            )
-                    except Exception:
-                        continue
-
-        def _scan_keyring_import_jobs(kr_info: Dict[str, str]) -> List[Dict[str, Any]]:
-            kr_parent = kr_info["resource_name"]
-            proj = kr_info["project_id"]
-            loc = kr_info["location"]
-            kr_name = kr_info["key_ring"]
+        def _list_jobs(kr_info: Dict[str, str]) -> List[Dict[str, Any]]:
             results: List[Dict[str, Any]] = []
             try:
-                for ij in kms_client.list_import_jobs(request={"parent": kr_parent}):
-                    job_id = ij.name.split("/")[-1]
-                    state_str = kms_v1.ImportJob.ImportJobState(ij.state).name
-                    method_str = kms_v1.ImportJob.ImportMethod(ij.import_method).name
-                    prot_str = kms_v1.ProtectionLevel(ij.protection_level).name
+                for ij in kms_client.list_import_jobs(request={"parent": kr_info["resource_name"]}):
                     results.append(
-                        _classify_import_job(
-                            project_id=proj,
-                            location=loc,
-                            key_ring=kr_name,
-                            job_name=job_id,
-                            resource_name=ij.name,
-                            state_name=state_str,
-                            import_method_name=method_str,
-                            protection_level_name=prot_str,
+                        _import_job_record(
+                            {
+                                "project_id": kr_info["project_id"],
+                                "location": kr_info["location"],
+                                "key_ring": kr_info["key_ring"],
+                                "import_job_name": ij.name.split("/")[-1],
+                                "resource_name": ij.name,
+                                "state": kms_v1.ImportJob.ImportJobState(ij.state).name,
+                                "import_method": kms_v1.ImportJob.ImportMethod(ij.import_method).name,
+                                "protection_level": kms_v1.ProtectionLevel(ij.protection_level).name,
+                                "expire_time": str(ij.expire_time) if getattr(ij, "expire_time", None) else None,
+                            },
+                            LIVE_DATA_SOURCE,
                         )
                     )
             except Exception as exc:
-                logger.debug("Could not list ImportJobs in '%s': %s", kr_parent, exc)
+                notes.append(f"Could not list import jobs in {kr_info['resource_name']}: {type(exc).__name__}: {str(exc)[:160]}")
             return results
 
-        all_jobs: List[Dict[str, Any]] = []
-        if key_rings_to_scan:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(key_rings_to_scan))) as executor:
-                for kr_jobs in executor.map(_scan_keyring_import_jobs, key_rings_to_scan):
-                    all_jobs.extend(kr_jobs)
-
-        active_jobs = [j for j in all_jobs if j["is_active"]]
-        vuln_count = sum(1 for j in active_jobs if j["pqc_status"] == "VULNERABLE_KEY_IMPORT_TRANSPORT")
-        secure_count = sum(1 for j in active_jobs if j["pqc_status"] == "SECURE_PQC_BYOK")
-        score_pct = round((secure_count / len(active_jobs)) * 100.0, 1) if active_jobs else 100.0
-
-        out_json = _compact_json(
+        jobs: List[Dict[str, Any]] = []
+        if key_rings:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(key_rings))) as executor:
+                for kr_jobs in executor.map(_list_jobs, key_rings):
+                    jobs.extend(kr_jobs)
+    except Exception as exc:
+        return _compact_json(
             {
                 "scope": scope_uri,
                 "scope_mode": mode,
-                "location_filter": location_id,
-                "data_source": "LIVE_GCP_KMS_IMPORT_JOBS_API",
-                "data_source_authenticity": "LIVE_GCP_TELEMETRY_VERIFIED",
-                "keyrings_inspected_count": len(key_rings_to_scan),
-                "total_import_jobs_scanned": len(all_jobs),
-                "active_import_jobs_count": len(active_jobs),
-                "vulnerable_key_import_transport_count": vuln_count,
-                "secure_pqc_byok_count": secure_count,
-                "byok_pqc_readiness_score_pct": score_pct,
-                "import_jobs": all_jobs,
-                "baseline_byok_pqc_import_guide": {
-                    "step_1_create_hpke_xwing_import_job_cmd": (
-                        f"gcloud kms import-jobs create ij-pqc-byok-xwing "
-                        f"--location=global --keyring=kr-pqc-enterprise-prod "
-                        f"--import-method=hpke-kem-xwing-hkdf-sha256-aes-256-gcm "
-                        f"--protection-level=hsm --project={clean_id if mode == 'PROJECT' else 'pqc-inventory-agent-cd06'}"
-                    ),
-                    "step_2_describe_and_verify_state_cmd": (
-                        f"gcloud kms import-jobs describe ij-pqc-byok-xwing "
-                        f"--location=global --keyring=kr-pqc-enterprise-prod "
-                        f"--project={clean_id if mode == 'PROJECT' else 'pqc-inventory-agent-cd06'} "
-                        f"--format=\"yaml(name,importMethod,protectionLevel,state)\""
-                    ),
-                },
-                "architectural_upsell_recommendation": (
-                    "For all BYOK workflows, mandate Cloud HSM (protection-level=HSM) with "
-                    "HPKE_KEM_XWING_HKDF_SHA256_AES_256_GCM ImportJobs to protect key material during import transport."
-                ),
+                "data_source": LIVE_DATA_SOURCE,
+                "error": f"Cloud KMS import job collection failed: {type(exc).__name__}: {str(exc)[:300]}",
+                "required_roles": ["roles/cloudkms.viewer", "roles/cloudasset.viewer"],
             }
         )
-        _SCAN_CACHE[cache_key] = (now_ts, out_json)
-        return out_json
-    except gcp_exceptions.GoogleAPICallError as exc:
-        logger.warning("GCP API error in scan_import_jobs_pqc on '%s': %s", scope_uri, exc)
-        return _compact_json(
-            {
-                "error": f"Failed to scan Cloud KMS ImportJobs in scope '{scope_uri}': {exc.message}",
-                "scope": scope_uri,
-            }
-        )
+
+    payload = {
+        "scope": scope_uri,
+        "scope_mode": mode,
+        "data_source": LIVE_DATA_SOURCE,
+        "generated_at": _now_iso(),
+        "import_jobs": jobs,
+        "key_rings_inspected": len(key_rings),
+        "collection_notes": notes,
+    }
+    return _cache_put(cache_key, _compact_json(payload))
