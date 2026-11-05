@@ -9,24 +9,24 @@
 - **Header Badge:** Overview: Agentic PQC Readiness
 
 ## What is the Agentic PQC Accelerator?
-The Agentic PQC Readiness Accelerator is a Google Cloud Consulting offering that uses an AI Agent to discover vulnerable encryption in 7 seconds, quantify quantum risk in dollars (Q-VaR), and guide safe migration to NIST Post-Quantum Cryptography.
+The Agentic PQC Readiness Accelerator is a Google Cloud Consulting offering where Gemini AI agents inventory your encryption, map which applications depend on each key with evidence, and guide safe migration to NIST Post-Quantum Cryptography.
 
 ## Is this offering right for you?
 - **Quantum Readiness:** You want a clear roadmap to NIST Post-Quantum Cryptography (FIPS 203/204).
-- **Fast Discovery:** You need to find vulnerable RSA/ECC keys and quantify financial risk (Q-VaR) in 7 seconds.
+- **Fast Discovery:** You need to find vulnerable RSA/ECC keys and the applications that depend on them, with evidence.
 - **HNDL Protection:** You need to protect long-life data against "Harvest Now, Decrypt Later" attacks before 2030 mandates.
 
 ## What does your team gain?
-- **7-Second CBOM Map:** An automated CycloneDX v1.6 inventory mapping all Cloud KMS keys, certificates, and connected workloads.
-- **Quantified ROI ($):** Board-ready financial risk modeling (Q-VaR 95%) and automated GCP Org Policies that block legacy keys.
-- **Zero-Downtime Upgrade:** Safe transition using tested 5-step Cloud HSM runbooks, hybrid TLS 1.3, and Google Tink SDK refactoring.
+- **Evidence-Based CBOM:** An automated CycloneDX v1.6 inventory of Cloud KMS keys, certificates, and the workloads that use them.
+- **Auditable Risk & Impact:** Transparent scorecard, business impact sized with your own data, and Org Policies that block legacy keys.
+- **Zero-Downtime Upgrade:** Safe transition using per-key Cloud HSM runbooks from your inventory, hybrid TLS 1.3, and Google Tink SDK refactoring.
 
 ## Engagement Overview (Right Column Badges)
 - **Key deliverables:**
-  - `Executive Risk & Q-VaR`
+  - `Executive Risk Scorecard`
   - `Security Recs Book`
   - `CycloneDX v1.6 CBOM`
-  - `5-Step HSM Runbooks`
+  - `Per-Key HSM Runbooks`
 - **Google team could include:**
   - `GSD Security Architect`
   - `PSO Security Consultant`
@@ -43,7 +43,7 @@ The Agentic PQC Readiness Accelerator is a Google Cloud Consulting offering that
   - `Delivery time est: 6 weeks - 224 hours`
 
 ## Key items we need from you
-- Engaged Security, PKI, Network & AppMod teams
+- Engaged Security, PKI, Network, AppMod & Risk teams
 - Read-only IAM roles enabled before Week 1 Kickoff
 - Access to Cloud KMS, Cloud Asset Inventory & TLS policies
 
