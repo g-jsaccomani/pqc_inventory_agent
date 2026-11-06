@@ -13,7 +13,7 @@ import concurrent.futures
 import logging
 from typing import Any, Dict, List, Optional
 
-from google.cloud import asset_v1, kms_v1
+from google.cloud import asset_v1, compute_v1, kms_v1
 
 from tools import mock_data
 from tools.gcp_inventory import (
@@ -35,12 +35,19 @@ from tools.gcp_inventory import (
 logger = logging.getLogger(__name__)
 
 TLS_VERSION_RANK = {"TLS_1_0": 0, "TLS_1_1": 1, "TLS_1_2": 2, "TLS_1_3": 3}
-GCP_DEFAULT_SSL_POLICY = {"min_tls_version": "TLS_1_0", "profile": "COMPATIBLE"}
+GCP_DEFAULT_SSL_POLICY = {
+    "min_tls_version": "TLS_1_0",
+    "profile": "COMPATIBLE",
+    "post_quantum_key_exchange": "DEFAULT",
+}
 TLS_REFERENCE_FACTS = [
-    "Hybrid post-quantum key exchange (for example X25519MLKEM768) is only negotiated in TLS 1.3 handshakes; "
-    "whether a given front end offers it must be confirmed separately.",
+    "Hybrid post-quantum key exchange (X25519MLKEM768) is only negotiated in TLS 1.3 handshakes on supported "
+    "Cloud Load Balancing frontends.",
+    "SSL policy postQuantumKeyExchange modes: ENABLED (uses X25519MLKEM768 with supporting TLS 1.3 clients), "
+    "DEFAULT (enabled by default starting October 2026; also applies when no SSL policy is attached), and "
+    "DEFERRED (disallows X25519MLKEM768 until October 2027).",
     "A target proxy without an attached SSL policy uses the Google Cloud default SSL policy "
-    "(COMPATIBLE profile, minimum TLS 1.0).",
+    "(COMPATIBLE profile, minimum TLS 1.0, postQuantumKeyExchange DEFAULT).",
 ]
 
 HPKE_PQC_IMPORT_METHODS = {
@@ -59,6 +66,11 @@ def _proto_struct_to_dict(resource_obj: Any) -> Dict[str, Any]:
         return {}
 
 
+def _normalize_pq_key_exchange(mode: Optional[str]) -> str:
+    norm = (mode or "DEFAULT").strip().upper()
+    return norm if norm in ("ENABLED", "DEFAULT", "DEFERRED") else norm
+
+
 def _policy_record(
     policy_name: str,
     resource_name: str,
@@ -67,8 +79,10 @@ def _policy_record(
     min_tls_version: str,
     profile: str,
     custom_features: Optional[List[str]] = None,
+    post_quantum_key_exchange: Optional[str] = None,
 ) -> Dict[str, Any]:
     norm_tls = (min_tls_version or "TLS_1_0").upper()
+    pq_mode = _normalize_pq_key_exchange(post_quantum_key_exchange)
     return {
         "policy_name": policy_name,
         "resource_name": resource_name,
@@ -76,10 +90,29 @@ def _policy_record(
         "location": location or "global",
         "min_tls_version": norm_tls,
         "profile": (profile or "COMPATIBLE").upper(),
+        "post_quantum_key_exchange": pq_mode,
+        "post_quantum_key_exchange_deferred": pq_mode == "DEFERRED",
         "custom_features": list(custom_features or []),
         "requires_tls_1_3": norm_tls == "TLS_1_3",
         "allows_pre_tls13_handshakes": TLS_VERSION_RANK.get(norm_tls, 0) < 3,
     }
+
+
+def _fetch_compute_pq_key_exchange(project_id: str, location: str, policy_name: str) -> Optional[str]:
+    """Queries Compute Engine SslPolicies API directly when Cloud Asset Inventory omits postQuantumKeyExchange."""
+    try:
+        kwargs = _get_client_kwargs()
+        loc = (location or "global").lower()
+        if loc == "global":
+            client = compute_v1.SslPoliciesClient(**kwargs)
+            pol = client.get(project=project_id, ssl_policy=policy_name)
+        else:
+            rclient = compute_v1.RegionSslPoliciesClient(**kwargs)
+            pol = rclient.get(project=project_id, region=location, ssl_policy=policy_name)
+        val = getattr(pol, "post_quantum_key_exchange", None)
+        return str(val).strip().upper() if val else "DEFAULT"
+    except Exception:
+        return None
 
 
 def _policy_short_name(ref: Optional[str]) -> Optional[str]:
@@ -95,12 +128,21 @@ def _resolve_proxy_records(policies: List[Dict[str, Any]], proxies_raw: List[Dic
         attached = _policy_short_name(proxy.get("attached_ssl_policy"))
         policy = by_key.get((proxy.get("project_id"), attached)) if attached else None
         if attached and policy:
-            effective_tls, effective_profile, source = policy["min_tls_version"], policy["profile"], "ATTACHED_SSL_POLICY"
+            effective_tls = policy["min_tls_version"]
+            effective_profile = policy["profile"]
+            effective_pq = policy["post_quantum_key_exchange"]
+            source = "ATTACHED_SSL_POLICY"
         elif attached:
-            effective_tls, effective_profile, source = None, None, "ATTACHED_SSL_POLICY_NOT_FOUND_IN_SCOPE"
+            effective_tls, effective_profile, effective_pq, source = (
+                None,
+                None,
+                None,
+                "ATTACHED_SSL_POLICY_NOT_FOUND_IN_SCOPE",
+            )
         else:
             effective_tls = GCP_DEFAULT_SSL_POLICY["min_tls_version"]
             effective_profile = GCP_DEFAULT_SSL_POLICY["profile"]
+            effective_pq = GCP_DEFAULT_SSL_POLICY["post_quantum_key_exchange"]
             source = "GCP_DEFAULT_SSL_POLICY"
         records.append(
             {
@@ -112,6 +154,8 @@ def _resolve_proxy_records(policies: List[Dict[str, Any]], proxies_raw: List[Dic
                 "effective_policy_source": source,
                 "effective_min_tls_version": effective_tls,
                 "effective_profile": effective_profile,
+                "effective_post_quantum_key_exchange": effective_pq,
+                "effective_post_quantum_key_exchange_deferred": effective_pq == "DEFERRED",
                 "effective_requires_tls_1_3": effective_tls == "TLS_1_3",
             }
         )
@@ -125,8 +169,9 @@ def collect_tls_policies(scope: str = f"organizations/{DEFAULT_ORGANIZATION_ID}"
         scope: 'organizations/<id>', 'folders/<id>', 'projects/<id>' or a bare project ID.
 
     Returns:
-        JSON with `ssl_policies`, `target_proxies` (attached or default policy, effective minimum TLS version),
-        `reference_facts` and `data_source`, or an `error` object.
+        JSON with `ssl_policies` (including `post_quantum_key_exchange`: ENABLED, DEFAULT or DEFERRED),
+        `target_proxies` (attached or default policy, effective minimum TLS version and effective
+        `post_quantum_key_exchange`), `reference_facts` and `data_source`, or an `error` object.
     """
     mode, scope_uri, clean_id = _resolve_scope(scope)
     simulated = simulation_requested(clean_id)
@@ -139,7 +184,14 @@ def collect_tls_policies(scope: str = f"organizations/{DEFAULT_ORGANIZATION_ID}"
         demo = mock_data.get_simulated_tls_evidence(clean_id)
         policies = [
             _policy_record(
-                p["policy_name"], p["resource_name"], p["project_id"], p["location"], p["min_tls_version"], p["profile"], p["custom_features"]
+                p["policy_name"],
+                p["resource_name"],
+                p["project_id"],
+                p["location"],
+                p["min_tls_version"],
+                p["profile"],
+                p.get("custom_features"),
+                p.get("post_quantum_key_exchange"),
             )
             for p in demo["policies"]
         ]
@@ -174,15 +226,20 @@ def collect_tls_policies(scope: str = f"organizations/{DEFAULT_ORGANIZATION_ID}"
             name = item.display_name or item.name.split("/")[-1]
             if item.asset_type == "compute.googleapis.com/SslPolicy":
                 features = attrs.get("customFeatures") or attrs.get("custom_features") or []
+                loc = item.location or "global"
+                raw_pq = attrs.get("postQuantumKeyExchange") or attrs.get("post_quantum_key_exchange")
+                if not raw_pq:
+                    raw_pq = _fetch_compute_pq_key_exchange(proj, loc, name) or "DEFAULT"
                 policies.append(
                     _policy_record(
                         name,
                         item.name,
                         proj,
-                        item.location or "global",
+                        loc,
                         str(attrs.get("minTlsVersion") or attrs.get("min_tls_version") or "TLS_1_0"),
                         str(attrs.get("profile") or "COMPATIBLE"),
                         features if isinstance(features, list) else [],
+                        str(raw_pq),
                     )
                 )
             else:

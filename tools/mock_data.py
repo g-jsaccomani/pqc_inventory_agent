@@ -182,6 +182,7 @@ def get_simulated_tls_evidence(project_id: str) -> Dict[str, Any]:
             "location": "global",
             "min_tls_version": "TLS_1_2",
             "profile": "COMPATIBLE",
+            "post_quantum_key_exchange": "DEFERRED",
             "custom_features": [],
         },
         {
@@ -191,6 +192,7 @@ def get_simulated_tls_evidence(project_id: str) -> Dict[str, Any]:
             "location": "global",
             "min_tls_version": "TLS_1_3",
             "profile": "RESTRICTED",
+            "post_quantum_key_exchange": "ENABLED",
             "custom_features": [],
         },
     ]

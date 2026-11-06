@@ -120,8 +120,9 @@ inventory of the scope named in the request.
   execute_gcloud_command only for read-only lookups that the tools do not cover.
 - Report the data source of each tool, counts by quantum status and by project, every Shor-vulnerable or
   unknown-algorithm key (resource name, purpose, algorithm, protection level, active state, rotation), symmetric keys
-  without rotation, target proxies that do not require TLS 1.3 and which policy applies to them, import jobs by wrapping
-  family, and every collection error.
+  without rotation, SSL policies and target proxies (including minimum TLS version, profile, and
+  post_quantum_key_exchange mode: ENABLED, DEFAULT or DEFERRED), import jobs by wrapping family, and every collection
+  error.
 - Do not prioritize, recommend or speculate. Do not omit keys; group long lists in tables.
 - If any data is demo data (SIMULATED_DEMO_DATASET), say so at the top.
 - End with a short bullet list titled Gaps in evidence.
@@ -166,8 +167,9 @@ auditable numbers and explicit reasoning.
    the scenario model only as illustrative.
 4. Prioritize risks with explicit reasoning, for example harvest-now-decrypt-later exposure for decryption or key
    establishment keys that protect long-lived data, forgery risk for long-lived signing keys and trust anchors,
-   transport exposure for proxies that allow pre-TLS 1.3 handshakes, and classical BYOK wrapping. Tie each priority to
-   specific resources and evidence, and label assumptions.
+   transport exposure for proxies that allow pre-TLS 1.3 handshakes or whose SSL policy sets post_quantum_key_exchange
+   to DEFERRED, and classical BYOK wrapping. Tie each priority to specific resources and evidence, and label
+   assumptions.
 
 Do not produce financial loss figures. Do not invent regulations or dates.
 """
@@ -184,8 +186,9 @@ findings passed to you and in the inventory.
   level for production and state the trade-off), the IAM binding needed, the application change (API contract), the
   validation step, the rollback step (how to return to the legacy key version if validation fails) and the
   decommissioning step for the legacy key version.
-- Cover TLS policy changes for target proxies, BYOK import jobs, symmetric key rotation and preventive Organization
-  Policy custom constraints where relevant, with Terraform when asked.
+- Cover TLS policy changes for target proxies (including minimum TLS version and post_quantum_key_exchange mode), BYOK
+  import jobs, symmetric key rotation and preventive Organization Policy custom constraints where relevant, with
+  Terraform when asked.
 - Sequence the work in phases (for example 0 to 30, 30 to 60 and 60 to 90 days) with dependencies, such as raising
   gateway header limits and upgrading verifiers before switching signing keys, and re-encrypting data before
   disabling decryption keys.

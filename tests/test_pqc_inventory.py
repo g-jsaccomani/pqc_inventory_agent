@@ -259,10 +259,20 @@ def test_tls_and_import_job_evidence_are_facts_only():
     from tools.pqc_detectors import collect_kms_import_jobs, collect_tls_policies
 
     tls = json.loads(collect_tls_policies(DEMO_SCOPE))
+    policies = {p["policy_name"]: p for p in tls["ssl_policies"]}
+    assert policies["ssl-policy-legacy-tls12-ingress"]["post_quantum_key_exchange"] == "DEFERRED"
+    assert policies["ssl-policy-legacy-tls12-ingress"]["post_quantum_key_exchange_deferred"] is True
+    assert policies["ssl-policy-tls13-restricted"]["post_quantum_key_exchange"] == "ENABLED"
+    assert policies["ssl-policy-tls13-restricted"]["post_quantum_key_exchange_deferred"] is False
+
     proxies = {p["proxy_name"]: p for p in tls["target_proxies"]}
     assert proxies["openbanking-https-proxy"]["effective_min_tls_version"] == "TLS_1_2"
+    assert proxies["openbanking-https-proxy"]["effective_post_quantum_key_exchange"] == "DEFERRED"
+    assert proxies["openbanking-https-proxy"]["effective_post_quantum_key_exchange_deferred"] is True
     assert proxies["internal-admin-https-proxy"]["effective_policy_source"] == "GCP_DEFAULT_SSL_POLICY"
     assert proxies["internal-admin-https-proxy"]["effective_min_tls_version"] == "TLS_1_0"
+    assert proxies["internal-admin-https-proxy"]["effective_post_quantum_key_exchange"] == "DEFAULT"
+    assert proxies["internal-admin-https-proxy"]["effective_post_quantum_key_exchange_deferred"] is False
 
     jobs = {j["import_job_name"]: j for j in json.loads(collect_kms_import_jobs(DEMO_SCOPE))["import_jobs"]}
     assert jobs["ij-byok-legacy-rsa3072"]["transport_quantum_status"] == "QUANTUM_VULNERABLE_SHOR"

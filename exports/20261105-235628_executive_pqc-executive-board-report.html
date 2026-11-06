@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>PQC Executive Board Report</title>
+  <style>
+    :root {
+      --gcp-blue: #1a73e8;
+      --gcp-dark: #202124;
+      --gcp-gray: #5f6368;
+      --gcp-light-bg: #f8f9fa;
+      --gcp-border: #dadce0;
+      --gcp-green: #1e8e3e;
+      --gcp-red: #d93025;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Google Sans", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      color: var(--gcp-dark);
+      background: #ffffff;
+      line-height: 1.6;
+      margin: 0;
+      padding: 0;
+    }
+    .page-wrapper {
+      max-width: 1120px;
+      margin: 0 auto;
+      padding: 40px 48px;
+    }
+    .top-banner {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 3px solid var(--gcp-blue);
+      padding-bottom: 14px;
+      margin-bottom: 28px;
+    }
+    .top-banner .brand {
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 1.2px;
+      color: var(--gcp-blue);
+      text-transform: uppercase;
+    }
+    .top-banner .timestamp {
+      font-size: 12px;
+      color: var(--gcp-gray);
+    }
+    h1 {
+      font-size: 26px;
+      color: var(--gcp-blue);
+      margin: 0 0 6px 0;
+      letter-spacing: -0.3px;
+    }
+    h2 {
+      font-size: 20px;
+      color: var(--gcp-dark);
+      margin-top: 32px;
+      margin-bottom: 12px;
+      padding-bottom: 6px;
+      border-bottom: 1px solid var(--gcp-border);
+    }
+    h3 {
+      font-size: 16px;
+      color: #174ea6;
+      margin-top: 24px;
+      margin-bottom: 8px;
+    }
+    h4 {
+      font-size: 14px;
+      color: var(--gcp-dark);
+      background: var(--gcp-light-bg);
+      padding: 8px 12px;
+      border-left: 4px solid var(--gcp-blue);
+      margin-top: 20px;
+      margin-bottom: 8px;
+    }
+    p, li {
+      font-size: 14px;
+      color: #3c4043;
+    }
+    ul {
+      margin: 8px 0 16px 20px;
+      padding: 0;
+    }
+    li {
+      margin-bottom: 6px;
+    }
+    hr {
+      border: 0;
+      border-top: 1px solid var(--gcp-border);
+      margin: 28px 0;
+    }
+    .table-wrap {
+      overflow-x: auto;
+      margin: 14px 0 22px 0;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+      border: 1px solid var(--gcp-border);
+    }
+    th {
+      background: #e8f0fe;
+      color: #174ea6;
+      font-weight: 600;
+      text-align: left;
+      padding: 10px 12px;
+      border: 1px solid var(--gcp-border);
+    }
+    td {
+      padding: 9px 12px;
+      border: 1px solid var(--gcp-border);
+      vertical-align: top;
+    }
+    tr:nth-child(even) td {
+      background: #fbfcfe;
+    }
+    code {
+      font-family: "Roboto Mono", "SFMono-Regular", Consolas, Menlo, monospace;
+      font-size: 12px;
+      background: #f1f3f4;
+      color: #c5221f;
+      padding: 2px 5px;
+      border-radius: 4px;
+      word-break: break-word;
+    }
+    .code-container {
+      margin: 12px 0 20px 0;
+      border: 1px solid var(--gcp-border);
+      border-radius: 6px;
+      overflow: hidden;
+      background: #1e1e1e;
+    }
+    .code-lang {
+      background: #2d2d2d;
+      color: #9aa0a6;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 5px 12px;
+      font-family: monospace;
+    }
+    pre {
+      margin: 0;
+      padding: 14px;
+      overflow-x: auto;
+    }
+    pre code {
+      background: transparent;
+      color: #e8eaed;
+      padding: 0;
+      font-size: 12px;
+      word-break: normal;
+    }
+    @media print {
+      .page-wrapper { padding: 15px 20px; max-width: 100%; }
+      h2, h3, h4 { page-break-after: avoid; }
+      .table-wrap, .code-container { page-break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page-wrapper">
+    <div class="top-banner">
+      <div class="brand">GOOGLE CLOUD CONSULTING • POST-QUANTUM CRYPTOGRAPHY</div>
+      <div class="timestamp">Generated: 2026-11-05 23:56 UTC</div>
+    </div>
+    <h1>PQC Executive Board Report</h1>
+<h2>Bottom Line</h2>
+<p>This report outlines the Post-Quantum Cryptography (PQC) readiness for the assessed scope. Based on the current inventory of 22 cryptographic keys, we have identified specific risks related to legacy asymmetric algorithms that require modernization to quantum-resistant standards.</p>
+<h2>Scorecard</h2>
+<ul>
+<li><strong>Total Keys:</strong> 22</li>
+<li><strong>Overall Maturity:</strong> 66.6%</li>
+<li><strong>Asymmetric PQC:</strong> 4/9 keys</li>
+<li><strong>Symmetric Hygiene:</strong> 13/13 keys</li>
+<li><strong>Rotation Hygiene:</strong> 13/13 keys</li>
+<li><strong>Algorithmic Quantum Safe:</strong> 17/22 keys</li>
+</ul>
+<h2>Mosca&#x27;s Theorem Calibration</h2>
+<p><em>Assessing the urgency of PQC migration (X + Y vs Z)</em></p>
+<ul>
+<li><strong>X (Shelf-life of data):</strong> 10 years</li>
+<li><strong>Y (Migration time):</strong> 2 years</li>
+<li><strong>Z (Time to CRQC):</strong> 8.5 years (enterprise defaults)</li>
+<li><strong>Assessment:</strong> Since X + Y (12) &gt; Z (8.5), there is an urgent need to transition to quantum-safe cryptography to protect long-term confidential data against Harvest Now, Decrypt Later (HNDL) attacks.</li>
+</ul>
+<h2>Top Risks</h2>
+<p>1. <strong>Priority 1 (HNDL - Harvest Now, Decrypt Later):</strong></p>
+<ul>
+<li><strong>Assets:</strong> <code>legacy-rsa-oaep-decrypt</code> (in lab &amp; prod)</li>
+<li><strong>Decision Needed/Action:</strong> Requires immediate move to <strong>ML-KEM</strong>.</li>
+</ul>
+<p>2. <strong>Priority 2 (Forgery):</strong></p>
+<ul>
+<li><strong>Assets:</strong> <code>legacy-ecdsa-p256-sign</code> (in lab &amp; prod) and <code>jwt-signing-rsa2048</code></li>
+<li><strong>Decision Needed/Action:</strong> Requires move to <strong>ML-DSA</strong>.</li>
+</ul>
+<h2>Decisions Needed</h2>
+<p>1. Approve the resource allocation for the immediate migration of Priority 1 <code>legacy-rsa-oaep-decrypt</code> keys to ML-KEM.</p>
+<p>2. Approve the migration timeline for Priority 2 signing keys to ML-DSA.</p>
+<h2>Phased Roadmap</h2>
+<ul>
+<li><strong>Phase 1 (Immediate):</strong> Address Priority 1 HNDL risks. Migrate <code>legacy-rsa-oaep-decrypt</code> to ML-KEM.</li>
+<li><strong>Phase 2 (Short-term):</strong> Address Priority 2 Forgery risks. Migrate <code>legacy-ecdsa-p256-sign</code> and <code>jwt-signing-rsa2048</code> to ML-DSA.</li>
+<li><strong>Phase 3 (Ongoing):</strong> Maintain 100% symmetric and rotation hygiene, ensuring all future keys adhere to PQC standards.</li>
+</ul>
+<p><em>(Note: Findings are strictly based on the provided assessment facts. No demo data was generated.)</em></p>
+  </div>
+</body>
+</html>

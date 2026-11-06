@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>PQC Technical Engineering Playbook</title>
+  <style>
+    :root {
+      --gcp-blue: #1a73e8;
+      --gcp-dark: #202124;
+      --gcp-gray: #5f6368;
+      --gcp-light-bg: #f8f9fa;
+      --gcp-border: #dadce0;
+      --gcp-green: #1e8e3e;
+      --gcp-red: #d93025;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Google Sans", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      color: var(--gcp-dark);
+      background: #ffffff;
+      line-height: 1.6;
+      margin: 0;
+      padding: 0;
+    }
+    .page-wrapper {
+      max-width: 1120px;
+      margin: 0 auto;
+      padding: 40px 48px;
+    }
+    .top-banner {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 3px solid var(--gcp-blue);
+      padding-bottom: 14px;
+      margin-bottom: 28px;
+    }
+    .top-banner .brand {
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 1.2px;
+      color: var(--gcp-blue);
+      text-transform: uppercase;
+    }
+    .top-banner .timestamp {
+      font-size: 12px;
+      color: var(--gcp-gray);
+    }
+    h1 {
+      font-size: 26px;
+      color: var(--gcp-blue);
+      margin: 0 0 6px 0;
+      letter-spacing: -0.3px;
+    }
+    h2 {
+      font-size: 20px;
+      color: var(--gcp-dark);
+      margin-top: 32px;
+      margin-bottom: 12px;
+      padding-bottom: 6px;
+      border-bottom: 1px solid var(--gcp-border);
+    }
+    h3 {
+      font-size: 16px;
+      color: #174ea6;
+      margin-top: 24px;
+      margin-bottom: 8px;
+    }
+    h4 {
+      font-size: 14px;
+      color: var(--gcp-dark);
+      background: var(--gcp-light-bg);
+      padding: 8px 12px;
+      border-left: 4px solid var(--gcp-blue);
+      margin-top: 20px;
+      margin-bottom: 8px;
+    }
+    p, li {
+      font-size: 14px;
+      color: #3c4043;
+    }
+    ul {
+      margin: 8px 0 16px 20px;
+      padding: 0;
+    }
+    li {
+      margin-bottom: 6px;
+    }
+    hr {
+      border: 0;
+      border-top: 1px solid var(--gcp-border);
+      margin: 28px 0;
+    }
+    .table-wrap {
+      overflow-x: auto;
+      margin: 14px 0 22px 0;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+      border: 1px solid var(--gcp-border);
+    }
+    th {
+      background: #e8f0fe;
+      color: #174ea6;
+      font-weight: 600;
+      text-align: left;
+      padding: 10px 12px;
+      border: 1px solid var(--gcp-border);
+    }
+    td {
+      padding: 9px 12px;
+      border: 1px solid var(--gcp-border);
+      vertical-align: top;
+    }
+    tr:nth-child(even) td {
+      background: #fbfcfe;
+    }
+    code {
+      font-family: "Roboto Mono", "SFMono-Regular", Consolas, Menlo, monospace;
+      font-size: 12px;
+      background: #f1f3f4;
+      color: #c5221f;
+      padding: 2px 5px;
+      border-radius: 4px;
+      word-break: break-word;
+    }
+    .code-container {
+      margin: 12px 0 20px 0;
+      border: 1px solid var(--gcp-border);
+      border-radius: 6px;
+      overflow: hidden;
+      background: #1e1e1e;
+    }
+    .code-lang {
+      background: #2d2d2d;
+      color: #9aa0a6;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 5px 12px;
+      font-family: monospace;
+    }
+    pre {
+      margin: 0;
+      padding: 14px;
+      overflow-x: auto;
+    }
+    pre code {
+      background: transparent;
+      color: #e8eaed;
+      padding: 0;
+      font-size: 12px;
+      word-break: normal;
+    }
+    @media print {
+      .page-wrapper { padding: 15px 20px; max-width: 100%; }
+      h2, h3, h4 { page-break-after: avoid; }
+      .table-wrap, .code-container { page-break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page-wrapper">
+    <div class="top-banner">
+      <div class="brand">GOOGLE CLOUD CONSULTING • POST-QUANTUM CRYPTOGRAPHY</div>
+      <div class="timestamp">Generated: 2026-11-05 23:58 UTC</div>
+    </div>
+    <h1>PQC Technical Engineering Playbook</h1>
+<h2>1. Inventory and Vulnerable Key Resources</h2>
+<p>The following key resources have been identified as vulnerable and require remediation:</p>
+<ul>
+<li>jwt-signing-rsa2048</li>
+<li>legacy-ecdsa-p256-sign (lab)</li>
+<li>legacy-ecdsa-p256-sign (prod)</li>
+<li>legacy-rsa-oaep-decrypt (lab)</li>
+<li>legacy-rsa-oaep-decrypt (prod)</li>
+</ul>
+<h2>2. Assessment Scorecard</h2>
+<ul>
+<li>Weighted KMS PQC Maturity: 66.6%</li>
+<li>Asymmetric PQC Migration: 4/9 = 44.4%</li>
+<li>Symmetric Quantum Resistance: 13/13 = 100%</li>
+<li>Symmetric 90-Day Rotation Hygiene: 11/11 = 100%</li>
+<li>Algorithmic Quantum-Safe: 17/22 = 77.3%</li>
+</ul>
+<h2>3. Literature Quantum Estimates</h2>
+<ul>
+<li><strong>RSA-2048:</strong> 4098 logical qubits, Gidney 2025 arXiv:2505.15917</li>
+<li><strong>EC P-256:</strong> 2330 logical qubits, Roetteler et al. 2017 arXiv:1706.06752</li>
+</ul>
+<h2>4. Technical Engineering Facts for Remediation</h2>
+<h3>4.1. Migration Runbooks</h3>
+<p>Cloud KMS does not allow changing the algorithm of an existing CryptoKey across algorithm families. Therefore, migrating RSA or ECDSA keys to <code>PQ_SIGN_ML_DSA_65</code> (purpose <code>ASYMMETRIC_SIGN</code>) or <code>KEM_XWING</code> / <code>ML_KEM_768</code> (purpose <code>KEY_ENCAPSULATION</code>) requires creating a NEW CryptoKey.</p>
+<p><strong>Creation Command Example:</strong></p>
+<div class="code-container"><div class="code-lang">BASH</div><pre><code>gcloud kms keys create &lt;proposed-new-key&gt; --purpose=asymmetric-sign --default-algorithm=pq-sign-ml-dsa-65 --protection-level=hsm</code></pre></div>
+<p><strong>Rollback Steps:</strong></p>
+<p>Roll back by switching the application configuration back to the legacy CryptoKey before disabling the legacy key version.</p>
+<h3>4.2. Signature Size Considerations</h3>
+<p>When migrating away from ECDSA P-256:</p>
+<ul>
+<li><strong>ECDSA P-256 raw signatures:</strong> 64 bytes (~70-72 bytes DER)</li>
+<li><strong>ML-DSA-65 signatures:</strong> 3,309 bytes</li>
+</ul>
+<h3>4.3. Cloud Load Balancing TLS Policies</h3>
+<p>For Cloud Load Balancing TLS policies, hybrid post-quantum key exchange (X25519MLKEM768, negotiated on TLS 1.3 handshakes) is controlled by the <code>--post-quantum-key-exchange</code> flag.</p>
+<ul>
+<li><code>ENABLED</code> or <code>DEFAULT</code>: Enabled by default starting October 2026.</li>
+<li><code>DEFERRED</code>: Disallows X25519MLKEM768 until October 2027.</li>
+</ul>
+<p><strong>Policy Creation Command Example:</strong></p>
+<div class="code-container"><div class="code-lang">BASH</div><pre><code>gcloud compute ssl-policies create pqc-tls13-restricted-policy --profile=RESTRICTED --min-tls-version=1.3 --post-quantum-key-exchange=ENABLED</code></pre></div>
+<h2>5. Validation Checklist and Open Questions</h2>
+<ul>
+<li>&#9744; Confirm application capability to handle 3,309-byte ML-DSA-65 signatures.</li>
+<li>&#9744; Ensure application configurations can switch to the new CryptoKeys and successfully perform rollback if needed.</li>
+<li>&#9744; Verify load balancers have appropriate TLS 1.3 policies with Post-Quantum Key Exchange enabled.</li>
+<li><strong>Open Question:</strong> Have all downstream consumers of signed tokens (e.g., JWT) been updated to verify ML-DSA-65 signatures?</li>
+</ul>
+  </div>
+</body>
+</html>

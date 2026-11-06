@@ -1,0 +1,1207 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.6",
+  "serialNumber": "urn:uuid:cd8e95e2-d959-4e3b-8ee5-b036be282aa5",
+  "version": 1,
+  "metadata": {
+    "timestamp": "2026-11-05T23:57:10+00:00",
+    "tools": {
+      "components": [
+        {
+          "type": "application",
+          "name": "agentic-pqc-workspace",
+          "version": "4.0.0"
+        }
+      ]
+    },
+    "component": {
+      "type": "platform",
+      "bom-ref": "gcp-scope:organizations/31564119954",
+      "name": "organizations/31564119954"
+    }
+  },
+  "components": [
+    {
+      "type": "cryptographic-asset",
+      "bom-ref": "crypto-key:projects/api-sec-poc-1582/locations/us-central1/keyRings/hsm-keyring/cryptoKeys/etcd-encryption-key",
+      "name": "hsm-keyring/etcd-encryption-key",
+      "description": "Cloud KMS CryptoKey GOOGLE_SYMMETRIC_ENCRYPTION in api-sec-poc-1582/us-central1",
+      "cryptoProperties": {
+        "assetType": "algorithm",
+        "algorithmProperties": {
+          "primitive": "ae",
+          "parameterSetIdentifier": "256",
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "gcp-cloud-kms",
+          "cryptoFunctions": [
+            "encrypt",
+            "decrypt",
+            "keygen"
+          ],
+          "classicalSecurityLevel": 256,
+          "nistQuantumSecurityLevel": 5
+        },
+        "oid": "2.16.840.1.101.3.4.1.46"
+      },
+      "properties": [
+        {
+          "name": "gcp:resource_name",
+          "value": "projects/api-sec-poc-1582/locations/us-central1/keyRings/hsm-keyring/cryptoKeys/etcd-encryption-key"
+        },
+        {
+          "name": "gcp:protection_level",
+          "value": "SOFTWARE"
+        },
+        {
+          "name": "gcp:is_active",
+          "value": "true"
+        },
+        {
+          "name": "pqc:quantum_status",
+          "value": "QUANTUM_RESISTANT_SYMMETRIC"
+        },
+        {
+          "name": "pqc:quantum_threat_model",
+          "value": "GROVER_QUADRATIC_SPEEDUP"
+        },
+        {
+          "name": "pqc:data_source",
+          "value": "LIVE_GCP_API"
+        }
+      ]
+    },
+    {
+      "type": "cryptographic-asset",
+      "bom-ref": "crypto-key:projects/api-sec-poc-1582/locations/us-central1/keyRings/hsm-keyring/cryptoKeys/registry-encryption-key",
+      "name": "hsm-keyring/registry-encryption-key",
+      "description": "Cloud KMS CryptoKey GOOGLE_SYMMETRIC_ENCRYPTION in api-sec-poc-1582/us-central1",
+      "cryptoProperties": {
+        "assetType": "algorithm",
+        "algorithmProperties": {
+          "primitive": "ae",
+          "parameterSetIdentifier": "256",
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "gcp-cloud-kms",
+          "cryptoFunctions": [
+            "encrypt",
+            "decrypt",
+            "keygen"
+          ],
+          "classicalSecurityLevel": 256,
+          "nistQuantumSecurityLevel": 5
+        },
+        "oid": "2.16.840.1.101.3.4.1.46"
+      },
+      "properties": [
+        {
+          "name": "gcp:resource_name",
+          "value": "projects/api-sec-poc-1582/locations/us-central1/keyRings/hsm-keyring/cryptoKeys/registry-encryption-key"
+        },
+        {
+          "name": "gcp:protection_level",
+          "value": "SOFTWARE"
+        },
+        {
+          "name": "gcp:is_active",
+          "value": "true"
+        },
+        {
+          "name": "pqc:quantum_status",
+          "value": "QUANTUM_RESISTANT_SYMMETRIC"
+        },
+        {
+          "name": "pqc:quantum_threat_model",
+          "value": "GROVER_QUADRATIC_SPEEDUP"
+        },
+        {
+          "name": "pqc:data_source",
+          "value": "LIVE_GCP_API"
+        }
+      ]
+    },
+    {
+      "type": "cryptographic-asset",
+      "bom-ref": "crypto-key:projects/fnlab-apps-8fa913/locations/us-central1/keyRings/kr-iso-legacy-apps/cryptoKeys/jwt-signing-rsa2048",
+      "name": "kr-iso-legacy-apps/jwt-signing-rsa2048",
+      "description": "Cloud KMS CryptoKey RSA_SIGN_PSS_2048_SHA256 in fnlab-apps-8fa913/us-central1",
+      "cryptoProperties": {
+        "assetType": "algorithm",
+        "algorithmProperties": {
+          "primitive": "signature",
+          "parameterSetIdentifier": "2048",
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "gcp-cloud-kms",
+          "cryptoFunctions": [
+            "sign",
+            "verify"
+          ],
+          "classicalSecurityLevel": 112,
+          "nistQuantumSecurityLevel": 0
+        },
+        "oid": "1.2.840.113549.1.1.10"
+      },
+      "properties": [
+        {
+          "name": "gcp:resource_name",
+          "value": "projects/fnlab-apps-8fa913/locations/us-central1/keyRings/kr-iso-legacy-apps/cryptoKeys/jwt-signing-rsa2048"
+        },
+        {
+          "name": "gcp:protection_level",
+          "value": "SOFTWARE"
+        },
+        {
+          "name": "gcp:is_active",
+          "value": "true"
+        },
+        {
+          "name": "pqc:quantum_status",
+          "value": "QUANTUM_VULNERABLE_SHOR"
+        },
+        {
+          "name": "pqc:quantum_threat_model",
+          "value": "SHOR_INTEGER_FACTORIZATION"
+        },
+        {
+          "name": "pqc:data_source",
+          "value": "LIVE_GCP_API"
+        }
+      ]
+    },
+    {
+      "type": "cryptographic-asset",
+      "bom-ref": "crypto-key:projects/fnlab-apps-8fa913/locations/us-central1/keyRings/kr-iso-legacy-apps/cryptoKeys/kms-key-legacy-insecure",
+      "name": "kr-iso-legacy-apps/kms-key-legacy-insecure",
+      "description": "Cloud KMS CryptoKey GOOGLE_SYMMETRIC_ENCRYPTION in fnlab-apps-8fa913/us-central1",
+      "cryptoProperties": {
+        "assetType": "algorithm",
+        "algorithmProperties": {
+          "primitive": "ae",
+          "parameterSetIdentifier": "256",
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "gcp-cloud-kms",
+          "cryptoFunctions": [
+            "encrypt",
+            "decrypt",
+            "keygen"
+          ],
+          "classicalSecurityLevel": 256,
+          "nistQuantumSecurityLevel": 5
+        },
+        "oid": "2.16.840.1.101.3.4.1.46"
+      },
+      "properties": [
+        {
+          "name": "gcp:resource_name",
+          "value": "projects/fnlab-apps-8fa913/locations/us-central1/keyRings/kr-iso-legacy-apps/cryptoKeys/kms-key-legacy-insecure"
+        },
+        {
+          "name": "gcp:protection_level",
+          "value": "SOFTWARE"
+        },
+        {
+          "name": "gcp:is_active",
+          "value": "true"
+        },
+        {
+          "name": "pqc:quantum_status",
+          "value": "QUANTUM_RESISTANT_SYMMETRIC"
+        },
+        {
+          "name": "pqc:quantum_threat_model",
+          "value": "GROVER_QUADRATIC_SPEEDUP"
+        },
+        {
+          "name": "pqc:data_source",
+          "value": "LIVE_GCP_API"
+        }
+      ]
+    },
+    {
+      "type": "cryptographic-asset",
+      "bom-ref": "crypto-key:projects/fnlab-apps-8fa913/locations/us-central1/keyRings/poc-keyring-apps/cryptoKeys/poc-key-app-data",
+      "name": "poc-keyring-apps/poc-key-app-data",
+      "description": "Cloud KMS CryptoKey GOOGLE_SYMMETRIC_ENCRYPTION in fnlab-apps-8fa913/us-central1",
+      "cryptoProperties": {
+        "assetType": "algorithm",
+        "algorithmProperties": {
+          "primitive": "ae",
+          "parameterSetIdentifier": "256",
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "gcp-cloud-kms",
+          "cryptoFunctions": [
+            "encrypt",
+            "decrypt",
+            "keygen"
+          ],
+          "classicalSecurityLevel": 256,
+          "nistQuantumSecurityLevel": 5
+        },
+        "oid": "2.16.840.1.101.3.4.1.46"
+      },
+      "properties": [
+        {
+          "name": "gcp:resource_name",
+          "value": "projects/fnlab-apps-8fa913/locations/us-central1/keyRings/poc-keyring-apps/cryptoKeys/poc-key-app-data"
+        },
+        {
+          "name": "gcp:protection_level",
+          "value": "SOFTWARE"
+        },
+        {
+          "name": "gcp:is_active",
+          "value": "true"
+        },
+        {
+          "name": "pqc:quantum_status",
+          "value": "QUANTUM_RESISTANT_SYMMETRIC"
+        },
+        {
+          "name": "pqc:quantum_threat_model",
+          "value": "GROVER_QUADRATIC_SPEEDUP"
+        },
+        {
+          "name": "pqc:data_source",
+          "value": "LIVE_GCP_API"
+        }
+      ]
+    },
+    {
+      "type": "cryptographic-asset",
+      "bom-ref": "crypto-key:projects/fnlab-apps-8fa913/locations/us-central1/keyRings/poc-keyring-apps/cryptoKeys/poc-key-backup-long",
+      "name": "poc-keyring-apps/poc-key-backup-long",
+      "description": "Cloud KMS CryptoKey GOOGLE_SYMMETRIC_ENCRYPTION in fnlab-apps-8fa913/us-central1",
+      "cryptoProperties": {
+        "assetType": "algorithm",
+        "algorithmProperties": {
+          "primitive": "ae",
+          "parameterSetIdentifier": "256",
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "gcp-cloud-kms",
+          "cryptoFunctions": [
+            "encrypt",
+            "decrypt",
+            "keygen"
+          ],
+          "classicalSecurityLevel": 256,
+          "nistQuantumSecurityLevel": 5
+        },
+        "oid": "2.16.840.1.101.3.4.1.46"
+      },
+      "properties": [
+        {
+          "name": "gcp:resource_name",
+          "value": "projects/fnlab-apps-8fa913/locations/us-central1/keyRings/poc-keyring-apps/cryptoKeys/poc-key-backup-long"
+        },
+        {
+          "name": "gcp:protection_level",
+          "value": "SOFTWARE"
+        },
+        {
+          "name": "gcp:is_active",
+          "value": "true"
+        },
+        {
+          "name": "pqc:quantum_status",
+          "value": "QUANTUM_RESISTANT_SYMMETRIC"
+        },
+        {
+          "name": "pqc:quantum_threat_model",
+          "value": "GROVER_QUADRATIC_SPEEDUP"
+        },
+        {
+          "name": "pqc:data_source",
+          "value": "LIVE_GCP_API"
+        }
+      ]
+    },
+    {
+      "type": "cryptographic-asset",
+      "bom-ref": "crypto-key:projects/fnlab-apps-8fa913/locations/us-central1/keyRings/poc-keyring-apps/cryptoKeys/poc-key-tokens-stale",
+      "name": "poc-keyring-apps/poc-key-tokens-stale",
+      "description": "Cloud KMS CryptoKey GOOGLE_SYMMETRIC_ENCRYPTION in fnlab-apps-8fa913/us-central1",
+      "cryptoProperties": {
+        "assetType": "algorithm",
+        "algorithmProperties": {
+          "primitive": "ae",
+          "parameterSetIdentifier": "256",
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "gcp-cloud-kms",
+          "cryptoFunctions": [
+            "encrypt",
+            "decrypt",
+            "keygen"
+          ],
+          "classicalSecurityLevel": 256,
+          "nistQuantumSecurityLevel": 5
+        },
+        "oid": "2.16.840.1.101.3.4.1.46"
+      },
+      "properties": [
+        {
+          "name": "gcp:resource_name",
+          "value": "projects/fnlab-apps-8fa913/locations/us-central1/keyRings/poc-keyring-apps/cryptoKeys/poc-key-tokens-stale"
+        },
+        {
+          "name": "gcp:protection_level",
+          "value": "SOFTWARE"
+        },
+        {
+          "name": "gcp:is_active",
+          "value": "true"
+        },
+        {
+          "name": "pqc:quantum_status",
+          "value": "QUANTUM_RESISTANT_SYMMETRIC"
+        },
+        {
+          "name": "pqc:quantum_threat_model",
+          "value": "GROVER_QUADRATIC_SPEEDUP"
+        },
+        {
+          "name": "pqc:data_source",
+          "value": "LIVE_GCP_API"
+        }
+      ]
+    },
+    {
+      "type": "cryptographic-asset",
+      "bom-ref": "crypto-key:projects/fnlab-sec-mgmt-8fa913/locations/us-central1/keyRings/kr-iso-compliance-mgmt/cryptoKeys/kms-key-fintech-compliant",
+      "name": "kr-iso-compliance-mgmt/kms-key-fintech-compliant",
+      "description": "Cloud KMS CryptoKey GOOGLE_SYMMETRIC_ENCRYPTION in fnlab-sec-mgmt-8fa913/us-central1",
+      "cryptoProperties": {
+        "assetType": "algorithm",
+        "algorithmProperties": {
+          "primitive": "ae",
+          "parameterSetIdentifier": "256",
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "gcp-cloud-kms",
+          "cryptoFunctions": [
+            "encrypt",
+            "decrypt",
+            "keygen"
+          ],
+          "classicalSecurityLevel": 256,
+          "nistQuantumSecurityLevel": 5
+        },
+        "oid": "2.16.840.1.101.3.4.1.46"
+      },
+      "properties": [
+        {
+          "name": "gcp:resource_name",
+          "value": "projects/fnlab-sec-mgmt-8fa913/locations/us-central1/keyRings/kr-iso-compliance-mgmt/cryptoKeys/kms-key-fintech-compliant"
+        },
+        {
+          "name": "gcp:protection_level",
+          "value": "SOFTWARE"
+        },
+        {
+          "name": "gcp:is_active",
+          "value": "true"
+        },
+        {
+          "name": "pqc:quantum_status",
+          "value": "QUANTUM_RESISTANT_SYMMETRIC"
+        },
+        {
+          "name": "pqc:quantum_threat_model",
+          "value": "GROVER_QUADRATIC_SPEEDUP"
+        },
+        {
+          "name": "pqc:data_source",
+          "value": "LIVE_GCP_API"
+        }
+      ]
+    },
+    {
+      "type": "cryptographic-asset",
+      "bom-ref": "crypto-key:projects/fnlab-sec-mgmt-8fa913/locations/us-central1/keyRings/kr-security-mgmt/cryptoKeys/key-root-database-encryption",
+      "name": "kr-security-mgmt/key-root-database-encryption",
+      "description": "Cloud KMS CryptoKey GOOGLE_SYMMETRIC_ENCRYPTION in fnlab-sec-mgmt-8fa913/us-central1",
+      "cryptoProperties": {
+        "assetType": "algorithm",
+        "algorithmProperties": {
+          "primitive": "ae",
+          "parameterSetIdentifier": "256",
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "gcp-cloud-kms",
+          "cryptoFunctions": [
+            "encrypt",
+            "decrypt",
+            "keygen"
+          ],
+          "classicalSecurityLevel": 256,
+          "nistQuantumSecurityLevel": 5
+        },
+        "oid": "2.16.840.1.101.3.4.1.46"
+      },
+      "properties": [
+        {
+          "name": "gcp:resource_name",
+          "value": "projects/fnlab-sec-mgmt-8fa913/locations/us-central1/keyRings/kr-security-mgmt/cryptoKeys/key-root-database-encryption"
+        },
+        {
+          "name": "gcp:protection_level",
+          "value": "SOFTWARE"
+        },
+        {
+          "name": "gcp:is_active",
+          "value": "true"
+        },
+        {
+          "name": "pqc:quantum_status",
+          "value": "QUANTUM_RESISTANT_SYMMETRIC"
+        },
+        {
+          "name": "pqc:quantum_threat_model",
+          "value": "GROVER_QUADRATIC_SPEEDUP"
+        },
+        {
+          "name": "pqc:data_source",
+          "value": "LIVE_GCP_API"
+        }
+      ]
+    },
+    {
+      "type": "cryptographic-asset",
+      "bom-ref": "crypto-key:projects/fnlab-sec-mgmt-8fa913/locations/us-central1/keyRings/poc-keyring-sec/cryptoKeys/poc-key-audit-software",
+      "name": "poc-keyring-sec/poc-key-audit-software",
+      "description": "Cloud KMS CryptoKey GOOGLE_SYMMETRIC_ENCRYPTION in fnlab-sec-mgmt-8fa913/us-central1",
+      "cryptoProperties": {
+        "assetType": "algorithm",
+        "algorithmProperties": {
+          "primitive": "ae",
+          "parameterSetIdentifier": "256",
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "gcp-cloud-kms",
+          "cryptoFunctions": [
+            "encrypt",
+            "decrypt",
+            "keygen"
+          ],
+          "classicalSecurityLevel": 256,
+          "nistQuantumSecurityLevel": 5
+        },
+        "oid": "2.16.840.1.101.3.4.1.46"
+      },
+      "properties": [
+        {
+          "name": "gcp:resource_name",
+          "value": "projects/fnlab-sec-mgmt-8fa913/locations/us-central1/keyRings/poc-keyring-sec/cryptoKeys/poc-key-audit-software"
+        },
+        {
+          "name": "gcp:protection_level",
+          "value": "SOFTWARE"
+        },
+        {
+          "name": "gcp:is_active",
+          "value": "true"
+        },
+        {
+          "name": "pqc:quantum_status",
+          "value": "QUANTUM_RESISTANT_SYMMETRIC"
+        },
+        {
+          "name": "pqc:quantum_threat_model",
+          "value": "GROVER_QUADRATIC_SPEEDUP"
+        },
+        {
+          "name": "pqc:data_source",
+          "value": "LIVE_GCP_API"
+        }
+      ]
+    },
+    {
+      "type": "cryptographic-asset",
+      "bom-ref": "crypto-key:projects/fnlab-sec-mgmt-8fa913/locations/us-central1/keyRings/poc-keyring-sec/cryptoKeys/poc-key-database-hsm",
+      "name": "poc-keyring-sec/poc-key-database-hsm",
+      "description": "Cloud KMS CryptoKey GOOGLE_SYMMETRIC_ENCRYPTION in fnlab-sec-mgmt-8fa913/us-central1",
+      "cryptoProperties": {
+        "assetType": "algorithm",
+        "algorithmProperties": {
+          "primitive": "ae",
+          "parameterSetIdentifier": "256",
+          "executionEnvironment": "hardware-environment",
+          "implementationPlatform": "gcp-cloud-kms",
+          "cryptoFunctions": [
+            "encrypt",
+            "decrypt",
+            "keygen"
+          ],
+          "classicalSecurityLevel": 256,
+          "nistQuantumSecurityLevel": 5
+        },
+        "oid": "2.16.840.1.101.3.4.1.46"
+      },
+      "properties": [
+        {
+          "name": "gcp:resource_name",
+          "value": "projects/fnlab-sec-mgmt-8fa913/locations/us-central1/keyRings/poc-keyring-sec/cryptoKeys/poc-key-database-hsm"
+        },
+        {
+          "name": "gcp:protection_level",
+          "value": "HSM"
+        },
+        {
+          "name": "gcp:is_active",
+          "value": "true"
+        },
+        {
+          "name": "pqc:quantum_status",
+          "value": "QUANTUM_RESISTANT_SYMMETRIC"
+        },
+        {
+          "name": "pqc:quantum_threat_model",
+          "value": "GROVER_QUADRATIC_SPEEDUP"
+        },
+        {
+          "name": "pqc:data_source",
+          "value": "LIVE_GCP_API"
+        }
+      ]
+    },
+    {
+      "type": "cryptographic-asset",
+      "bom-ref": "crypto-key:projects/fnlab-sec-mgmt-8fa913/locations/us-central1/keyRings/poc-keyring-sec/cryptoKeys/poc-key-payments-hsm",
+      "name": "poc-keyring-sec/poc-key-payments-hsm",
+      "description": "Cloud KMS CryptoKey GOOGLE_SYMMETRIC_ENCRYPTION in fnlab-sec-mgmt-8fa913/us-central1",
+      "cryptoProperties": {
+        "assetType": "algorithm",
+        "algorithmProperties": {
+          "primitive": "ae",
+          "parameterSetIdentifier": "256",
+          "executionEnvironment": "hardware-environment",
+          "implementationPlatform": "gcp-cloud-kms",
+          "cryptoFunctions": [
+            "encrypt",
+            "decrypt",
+            "keygen"
+          ],
+          "classicalSecurityLevel": 256,
+          "nistQuantumSecurityLevel": 5
+        },
+        "oid": "2.16.840.1.101.3.4.1.46"
+      },
+      "properties": [
+        {
+          "name": "gcp:resource_name",
+          "value": "projects/fnlab-sec-mgmt-8fa913/locations/us-central1/keyRings/poc-keyring-sec/cryptoKeys/poc-key-payments-hsm"
+        },
+        {
+          "name": "gcp:protection_level",
+          "value": "HSM"
+        },
+        {
+          "name": "gcp:is_active",
+          "value": "true"
+        },
+        {
+          "name": "pqc:quantum_status",
+          "value": "QUANTUM_RESISTANT_SYMMETRIC"
+        },
+        {
+          "name": "pqc:quantum_threat_model",
+          "value": "GROVER_QUADRATIC_SPEEDUP"
+        },
+        {
+          "name": "pqc:data_source",
+          "value": "LIVE_GCP_API"
+        }
+      ]
+    },
+    {
+      "type": "cryptographic-asset",
+      "bom-ref": "crypto-key:projects/fnlab-sec-mgmt-8fa913/locations/us-central1/keyRings/poc-keyring-test/cryptoKeys/test-hsm-key",
+      "name": "poc-keyring-test/test-hsm-key",
+      "description": "Cloud KMS CryptoKey GOOGLE_SYMMETRIC_ENCRYPTION in fnlab-sec-mgmt-8fa913/us-central1",
+      "cryptoProperties": {
+        "assetType": "algorithm",
+        "algorithmProperties": {
+          "primitive": "ae",
+          "parameterSetIdentifier": "256",
+          "executionEnvironment": "hardware-environment",
+          "implementationPlatform": "gcp-cloud-kms",
+          "cryptoFunctions": [
+            "encrypt",
+            "decrypt",
+            "keygen"
+          ],
+          "classicalSecurityLevel": 256,
+          "nistQuantumSecurityLevel": 5
+        },
+        "oid": "2.16.840.1.101.3.4.1.46"
+      },
+      "properties": [
+        {
+          "name": "gcp:resource_name",
+          "value": "projects/fnlab-sec-mgmt-8fa913/locations/us-central1/keyRings/poc-keyring-test/cryptoKeys/test-hsm-key"
+        },
+        {
+          "name": "gcp:protection_level",
+          "value": "HSM"
+        },
+        {
+          "name": "gcp:is_active",
+          "value": "false"
+        },
+        {
+          "name": "pqc:quantum_status",
+          "value": "QUANTUM_RESISTANT_SYMMETRIC"
+        },
+        {
+          "name": "pqc:quantum_threat_model",
+          "value": "GROVER_QUADRATIC_SPEEDUP"
+        },
+        {
+          "name": "pqc:data_source",
+          "value": "LIVE_GCP_API"
+        }
+      ]
+    },
+    {
+      "type": "cryptographic-asset",
+      "bom-ref": "crypto-key:projects/pqc-inventory-agent-cd06/locations/global/keyRings/kr-pqc-audit-lab/cryptoKeys/cmek-aes256-datalake",
+      "name": "kr-pqc-audit-lab/cmek-aes256-datalake",
+      "description": "Cloud KMS CryptoKey GOOGLE_SYMMETRIC_ENCRYPTION in pqc-inventory-agent-cd06/global",
+      "cryptoProperties": {
+        "assetType": "algorithm",
+        "algorithmProperties": {
+          "primitive": "ae",
+          "parameterSetIdentifier": "256",
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "gcp-cloud-kms",
+          "cryptoFunctions": [
+            "encrypt",
+            "decrypt",
+            "keygen"
+          ],
+          "classicalSecurityLevel": 256,
+          "nistQuantumSecurityLevel": 5
+        },
+        "oid": "2.16.840.1.101.3.4.1.46"
+      },
+      "properties": [
+        {
+          "name": "gcp:resource_name",
+          "value": "projects/pqc-inventory-agent-cd06/locations/global/keyRings/kr-pqc-audit-lab/cryptoKeys/cmek-aes256-datalake"
+        },
+        {
+          "name": "gcp:protection_level",
+          "value": "SOFTWARE"
+        },
+        {
+          "name": "gcp:is_active",
+          "value": "true"
+        },
+        {
+          "name": "pqc:quantum_status",
+          "value": "QUANTUM_RESISTANT_SYMMETRIC"
+        },
+        {
+          "name": "pqc:quantum_threat_model",
+          "value": "GROVER_QUADRATIC_SPEEDUP"
+        },
+        {
+          "name": "pqc:data_source",
+          "value": "LIVE_GCP_API"
+        }
+      ]
+    },
+    {
+      "type": "cryptographic-asset",
+      "bom-ref": "crypto-key:projects/pqc-inventory-agent-cd06/locations/global/keyRings/kr-pqc-audit-lab/cryptoKeys/legacy-ecdsa-p256-sign",
+      "name": "kr-pqc-audit-lab/legacy-ecdsa-p256-sign",
+      "description": "Cloud KMS CryptoKey EC_SIGN_P256_SHA256 in pqc-inventory-agent-cd06/global",
+      "cryptoProperties": {
+        "assetType": "algorithm",
+        "algorithmProperties": {
+          "primitive": "signature",
+          "parameterSetIdentifier": "P-256",
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "gcp-cloud-kms",
+          "cryptoFunctions": [
+            "sign",
+            "verify"
+          ],
+          "classicalSecurityLevel": 128,
+          "nistQuantumSecurityLevel": 0
+        },
+        "oid": "1.2.840.10045.4.3.2"
+      },
+      "properties": [
+        {
+          "name": "gcp:resource_name",
+          "value": "projects/pqc-inventory-agent-cd06/locations/global/keyRings/kr-pqc-audit-lab/cryptoKeys/legacy-ecdsa-p256-sign"
+        },
+        {
+          "name": "gcp:protection_level",
+          "value": "SOFTWARE"
+        },
+        {
+          "name": "gcp:is_active",
+          "value": "true"
+        },
+        {
+          "name": "pqc:quantum_status",
+          "value": "QUANTUM_VULNERABLE_SHOR"
+        },
+        {
+          "name": "pqc:quantum_threat_model",
+          "value": "SHOR_ELLIPTIC_CURVE_DISCRETE_LOG"
+        },
+        {
+          "name": "pqc:data_source",
+          "value": "LIVE_GCP_API"
+        }
+      ]
+    },
+    {
+      "type": "cryptographic-asset",
+      "bom-ref": "crypto-key:projects/pqc-inventory-agent-cd06/locations/global/keyRings/kr-pqc-audit-lab/cryptoKeys/legacy-rsa-oaep-decrypt",
+      "name": "kr-pqc-audit-lab/legacy-rsa-oaep-decrypt",
+      "description": "Cloud KMS CryptoKey RSA_DECRYPT_OAEP_2048_SHA256 in pqc-inventory-agent-cd06/global",
+      "cryptoProperties": {
+        "assetType": "algorithm",
+        "algorithmProperties": {
+          "primitive": "pke",
+          "parameterSetIdentifier": "2048",
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "gcp-cloud-kms",
+          "cryptoFunctions": [
+            "encrypt",
+            "decrypt"
+          ],
+          "classicalSecurityLevel": 112,
+          "nistQuantumSecurityLevel": 0
+        },
+        "oid": "1.2.840.113549.1.1.7"
+      },
+      "properties": [
+        {
+          "name": "gcp:resource_name",
+          "value": "projects/pqc-inventory-agent-cd06/locations/global/keyRings/kr-pqc-audit-lab/cryptoKeys/legacy-rsa-oaep-decrypt"
+        },
+        {
+          "name": "gcp:protection_level",
+          "value": "SOFTWARE"
+        },
+        {
+          "name": "gcp:is_active",
+          "value": "true"
+        },
+        {
+          "name": "pqc:quantum_status",
+          "value": "QUANTUM_VULNERABLE_SHOR"
+        },
+        {
+          "name": "pqc:quantum_threat_model",
+          "value": "SHOR_INTEGER_FACTORIZATION"
+        },
+        {
+          "name": "pqc:data_source",
+          "value": "LIVE_GCP_API"
+        }
+      ]
+    },
+    {
+      "type": "cryptographic-asset",
+      "bom-ref": "crypto-key:projects/pqc-inventory-agent-cd06/locations/global/keyRings/kr-pqc-audit-lab/cryptoKeys/pqc-kem-xwing-hybrid",
+      "name": "kr-pqc-audit-lab/pqc-kem-xwing-hybrid",
+      "description": "Cloud KMS CryptoKey KEM_XWING in pqc-inventory-agent-cd06/global",
+      "cryptoProperties": {
+        "assetType": "algorithm",
+        "algorithmProperties": {
+          "primitive": "kem",
+          "parameterSetIdentifier": "X25519+ML-KEM-768",
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "gcp-cloud-kms",
+          "cryptoFunctions": [
+            "encapsulate",
+            "decapsulate"
+          ],
+          "classicalSecurityLevel": 192,
+          "nistQuantumSecurityLevel": 3
+        },
+        "oid": "1.3.6.1.4.1.62253.25722"
+      },
+      "properties": [
+        {
+          "name": "gcp:resource_name",
+          "value": "projects/pqc-inventory-agent-cd06/locations/global/keyRings/kr-pqc-audit-lab/cryptoKeys/pqc-kem-xwing-hybrid"
+        },
+        {
+          "name": "gcp:protection_level",
+          "value": "SOFTWARE"
+        },
+        {
+          "name": "gcp:is_active",
+          "value": "true"
+        },
+        {
+          "name": "pqc:quantum_status",
+          "value": "QUANTUM_SAFE_PQC"
+        },
+        {
+          "name": "pqc:quantum_threat_model",
+          "value": "NO_KNOWN_EFFICIENT_QUANTUM_ATTACK"
+        },
+        {
+          "name": "pqc:data_source",
+          "value": "LIVE_GCP_API"
+        }
+      ]
+    },
+    {
+      "type": "cryptographic-asset",
+      "bom-ref": "crypto-key:projects/pqc-inventory-agent-cd06/locations/global/keyRings/kr-pqc-audit-lab/cryptoKeys/pqc-sign-mldsa65",
+      "name": "kr-pqc-audit-lab/pqc-sign-mldsa65",
+      "description": "Cloud KMS CryptoKey PQ_SIGN_ML_DSA_65 in pqc-inventory-agent-cd06/global",
+      "cryptoProperties": {
+        "assetType": "algorithm",
+        "algorithmProperties": {
+          "primitive": "signature",
+          "parameterSetIdentifier": "65",
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "gcp-cloud-kms",
+          "cryptoFunctions": [
+            "sign",
+            "verify"
+          ],
+          "classicalSecurityLevel": 192,
+          "nistQuantumSecurityLevel": 3
+        },
+        "oid": "2.16.840.1.101.3.4.3.18"
+      },
+      "properties": [
+        {
+          "name": "gcp:resource_name",
+          "value": "projects/pqc-inventory-agent-cd06/locations/global/keyRings/kr-pqc-audit-lab/cryptoKeys/pqc-sign-mldsa65"
+        },
+        {
+          "name": "gcp:protection_level",
+          "value": "SOFTWARE"
+        },
+        {
+          "name": "gcp:is_active",
+          "value": "true"
+        },
+        {
+          "name": "pqc:quantum_status",
+          "value": "QUANTUM_SAFE_PQC"
+        },
+        {
+          "name": "pqc:quantum_threat_model",
+          "value": "NO_KNOWN_EFFICIENT_QUANTUM_ATTACK"
+        },
+        {
+          "name": "pqc:data_source",
+          "value": "LIVE_GCP_API"
+        }
+      ]
+    },
+    {
+      "type": "cryptographic-asset",
+      "bom-ref": "crypto-key:projects/pqc-inventory-agent-cd06/locations/global/keyRings/kr-pqc-enterprise-prod/cryptoKeys/cmek-aes256-datalake",
+      "name": "kr-pqc-enterprise-prod/cmek-aes256-datalake",
+      "description": "Cloud KMS CryptoKey GOOGLE_SYMMETRIC_ENCRYPTION in pqc-inventory-agent-cd06/global",
+      "cryptoProperties": {
+        "assetType": "algorithm",
+        "algorithmProperties": {
+          "primitive": "ae",
+          "parameterSetIdentifier": "256",
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "gcp-cloud-kms",
+          "cryptoFunctions": [
+            "encrypt",
+            "decrypt",
+            "keygen"
+          ],
+          "classicalSecurityLevel": 256,
+          "nistQuantumSecurityLevel": 5
+        },
+        "oid": "2.16.840.1.101.3.4.1.46"
+      },
+      "properties": [
+        {
+          "name": "gcp:resource_name",
+          "value": "projects/pqc-inventory-agent-cd06/locations/global/keyRings/kr-pqc-enterprise-prod/cryptoKeys/cmek-aes256-datalake"
+        },
+        {
+          "name": "gcp:protection_level",
+          "value": "SOFTWARE"
+        },
+        {
+          "name": "gcp:is_active",
+          "value": "true"
+        },
+        {
+          "name": "pqc:quantum_status",
+          "value": "QUANTUM_RESISTANT_SYMMETRIC"
+        },
+        {
+          "name": "pqc:quantum_threat_model",
+          "value": "GROVER_QUADRATIC_SPEEDUP"
+        },
+        {
+          "name": "pqc:data_source",
+          "value": "LIVE_GCP_API"
+        }
+      ]
+    },
+    {
+      "type": "cryptographic-asset",
+      "bom-ref": "crypto-key:projects/pqc-inventory-agent-cd06/locations/global/keyRings/kr-pqc-enterprise-prod/cryptoKeys/legacy-ecdsa-p256-sign",
+      "name": "kr-pqc-enterprise-prod/legacy-ecdsa-p256-sign",
+      "description": "Cloud KMS CryptoKey EC_SIGN_P256_SHA256 in pqc-inventory-agent-cd06/global",
+      "cryptoProperties": {
+        "assetType": "algorithm",
+        "algorithmProperties": {
+          "primitive": "signature",
+          "parameterSetIdentifier": "P-256",
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "gcp-cloud-kms",
+          "cryptoFunctions": [
+            "sign",
+            "verify"
+          ],
+          "classicalSecurityLevel": 128,
+          "nistQuantumSecurityLevel": 0
+        },
+        "oid": "1.2.840.10045.4.3.2"
+      },
+      "properties": [
+        {
+          "name": "gcp:resource_name",
+          "value": "projects/pqc-inventory-agent-cd06/locations/global/keyRings/kr-pqc-enterprise-prod/cryptoKeys/legacy-ecdsa-p256-sign"
+        },
+        {
+          "name": "gcp:protection_level",
+          "value": "SOFTWARE"
+        },
+        {
+          "name": "gcp:is_active",
+          "value": "true"
+        },
+        {
+          "name": "pqc:quantum_status",
+          "value": "QUANTUM_VULNERABLE_SHOR"
+        },
+        {
+          "name": "pqc:quantum_threat_model",
+          "value": "SHOR_ELLIPTIC_CURVE_DISCRETE_LOG"
+        },
+        {
+          "name": "pqc:data_source",
+          "value": "LIVE_GCP_API"
+        }
+      ]
+    },
+    {
+      "type": "cryptographic-asset",
+      "bom-ref": "crypto-key:projects/pqc-inventory-agent-cd06/locations/global/keyRings/kr-pqc-enterprise-prod/cryptoKeys/legacy-rsa-oaep-decrypt",
+      "name": "kr-pqc-enterprise-prod/legacy-rsa-oaep-decrypt",
+      "description": "Cloud KMS CryptoKey RSA_DECRYPT_OAEP_2048_SHA256 in pqc-inventory-agent-cd06/global",
+      "cryptoProperties": {
+        "assetType": "algorithm",
+        "algorithmProperties": {
+          "primitive": "pke",
+          "parameterSetIdentifier": "2048",
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "gcp-cloud-kms",
+          "cryptoFunctions": [
+            "encrypt",
+            "decrypt"
+          ],
+          "classicalSecurityLevel": 112,
+          "nistQuantumSecurityLevel": 0
+        },
+        "oid": "1.2.840.113549.1.1.7"
+      },
+      "properties": [
+        {
+          "name": "gcp:resource_name",
+          "value": "projects/pqc-inventory-agent-cd06/locations/global/keyRings/kr-pqc-enterprise-prod/cryptoKeys/legacy-rsa-oaep-decrypt"
+        },
+        {
+          "name": "gcp:protection_level",
+          "value": "SOFTWARE"
+        },
+        {
+          "name": "gcp:is_active",
+          "value": "true"
+        },
+        {
+          "name": "pqc:quantum_status",
+          "value": "QUANTUM_VULNERABLE_SHOR"
+        },
+        {
+          "name": "pqc:quantum_threat_model",
+          "value": "SHOR_INTEGER_FACTORIZATION"
+        },
+        {
+          "name": "pqc:data_source",
+          "value": "LIVE_GCP_API"
+        }
+      ]
+    },
+    {
+      "type": "cryptographic-asset",
+      "bom-ref": "crypto-key:projects/pqc-inventory-agent-cd06/locations/global/keyRings/kr-pqc-enterprise-prod/cryptoKeys/pqc-kem-xwing-hybrid",
+      "name": "kr-pqc-enterprise-prod/pqc-kem-xwing-hybrid",
+      "description": "Cloud KMS CryptoKey KEM_XWING in pqc-inventory-agent-cd06/global",
+      "cryptoProperties": {
+        "assetType": "algorithm",
+        "algorithmProperties": {
+          "primitive": "kem",
+          "parameterSetIdentifier": "X25519+ML-KEM-768",
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "gcp-cloud-kms",
+          "cryptoFunctions": [
+            "encapsulate",
+            "decapsulate"
+          ],
+          "classicalSecurityLevel": 192,
+          "nistQuantumSecurityLevel": 3
+        },
+        "oid": "1.3.6.1.4.1.62253.25722"
+      },
+      "properties": [
+        {
+          "name": "gcp:resource_name",
+          "value": "projects/pqc-inventory-agent-cd06/locations/global/keyRings/kr-pqc-enterprise-prod/cryptoKeys/pqc-kem-xwing-hybrid"
+        },
+        {
+          "name": "gcp:protection_level",
+          "value": "SOFTWARE"
+        },
+        {
+          "name": "gcp:is_active",
+          "value": "true"
+        },
+        {
+          "name": "pqc:quantum_status",
+          "value": "QUANTUM_SAFE_PQC"
+        },
+        {
+          "name": "pqc:quantum_threat_model",
+          "value": "NO_KNOWN_EFFICIENT_QUANTUM_ATTACK"
+        },
+        {
+          "name": "pqc:data_source",
+          "value": "LIVE_GCP_API"
+        }
+      ]
+    },
+    {
+      "type": "cryptographic-asset",
+      "bom-ref": "crypto-key:projects/pqc-inventory-agent-cd06/locations/global/keyRings/kr-pqc-enterprise-prod/cryptoKeys/pqc-sign-mldsa65",
+      "name": "kr-pqc-enterprise-prod/pqc-sign-mldsa65",
+      "description": "Cloud KMS CryptoKey PQ_SIGN_ML_DSA_65 in pqc-inventory-agent-cd06/global",
+      "cryptoProperties": {
+        "assetType": "algorithm",
+        "algorithmProperties": {
+          "primitive": "signature",
+          "parameterSetIdentifier": "65",
+          "executionEnvironment": "software-plain-ram",
+          "implementationPlatform": "gcp-cloud-kms",
+          "cryptoFunctions": [
+            "sign",
+            "verify"
+          ],
+          "classicalSecurityLevel": 192,
+          "nistQuantumSecurityLevel": 3
+        },
+        "oid": "2.16.840.1.101.3.4.3.18"
+      },
+      "properties": [
+        {
+          "name": "gcp:resource_name",
+          "value": "projects/pqc-inventory-agent-cd06/locations/global/keyRings/kr-pqc-enterprise-prod/cryptoKeys/pqc-sign-mldsa65"
+        },
+        {
+          "name": "gcp:protection_level",
+          "value": "SOFTWARE"
+        },
+        {
+          "name": "gcp:is_active",
+          "value": "true"
+        },
+        {
+          "name": "pqc:quantum_status",
+          "value": "QUANTUM_SAFE_PQC"
+        },
+        {
+          "name": "pqc:quantum_threat_model",
+          "value": "NO_KNOWN_EFFICIENT_QUANTUM_ATTACK"
+        },
+        {
+          "name": "pqc:data_source",
+          "value": "LIVE_GCP_API"
+        }
+      ]
+    },
+    {
+      "type": "application",
+      "bom-ref": "application://storage.googleapis.com/bkt-iso-compliant-records-a3540b",
+      "name": "bkt-iso-compliant-records-a3540b",
+      "properties": [
+        {
+          "name": "gcp:workload_resource",
+          "value": "//storage.googleapis.com/bkt-iso-compliant-records-a3540b"
+        },
+        {
+          "name": "pqc:evidence_level",
+          "value": "STRONG"
+        },
+        {
+          "name": "pqc:evidence",
+          "value": "Cloud Asset Inventory cmek_references on storage.googleapis.com/Bucket (//storage.googleapis.com/bkt-iso-compliant-records-a3540b)."
+        },
+        {
+          "name": "pqc:correlation_source",
+          "value": "agent_validated_correlation"
+        }
+      ]
+    }
+  ],
+  "dependencies": [
+    {
+      "ref": "gcp-scope:organizations/31564119954",
+      "dependsOn": [
+        "application://storage.googleapis.com/bkt-iso-compliant-records-a3540b",
+        "crypto-key:projects/api-sec-poc-1582/locations/us-central1/keyRings/hsm-keyring/cryptoKeys/etcd-encryption-key",
+        "crypto-key:projects/api-sec-poc-1582/locations/us-central1/keyRings/hsm-keyring/cryptoKeys/registry-encryption-key",
+        "crypto-key:projects/fnlab-apps-8fa913/locations/us-central1/keyRings/kr-iso-legacy-apps/cryptoKeys/jwt-signing-rsa2048",
+        "crypto-key:projects/fnlab-apps-8fa913/locations/us-central1/keyRings/kr-iso-legacy-apps/cryptoKeys/kms-key-legacy-insecure",
+        "crypto-key:projects/fnlab-apps-8fa913/locations/us-central1/keyRings/poc-keyring-apps/cryptoKeys/poc-key-app-data",
+        "crypto-key:projects/fnlab-apps-8fa913/locations/us-central1/keyRings/poc-keyring-apps/cryptoKeys/poc-key-backup-long",
+        "crypto-key:projects/fnlab-apps-8fa913/locations/us-central1/keyRings/poc-keyring-apps/cryptoKeys/poc-key-tokens-stale",
+        "crypto-key:projects/fnlab-sec-mgmt-8fa913/locations/us-central1/keyRings/kr-iso-compliance-mgmt/cryptoKeys/kms-key-fintech-compliant",
+        "crypto-key:projects/fnlab-sec-mgmt-8fa913/locations/us-central1/keyRings/kr-security-mgmt/cryptoKeys/key-root-database-encryption",
+        "crypto-key:projects/fnlab-sec-mgmt-8fa913/locations/us-central1/keyRings/poc-keyring-sec/cryptoKeys/poc-key-audit-software",
+        "crypto-key:projects/fnlab-sec-mgmt-8fa913/locations/us-central1/keyRings/poc-keyring-sec/cryptoKeys/poc-key-database-hsm",
+        "crypto-key:projects/fnlab-sec-mgmt-8fa913/locations/us-central1/keyRings/poc-keyring-sec/cryptoKeys/poc-key-payments-hsm",
+        "crypto-key:projects/fnlab-sec-mgmt-8fa913/locations/us-central1/keyRings/poc-keyring-test/cryptoKeys/test-hsm-key",
+        "crypto-key:projects/pqc-inventory-agent-cd06/locations/global/keyRings/kr-pqc-audit-lab/cryptoKeys/cmek-aes256-datalake",
+        "crypto-key:projects/pqc-inventory-agent-cd06/locations/global/keyRings/kr-pqc-audit-lab/cryptoKeys/legacy-ecdsa-p256-sign",
+        "crypto-key:projects/pqc-inventory-agent-cd06/locations/global/keyRings/kr-pqc-audit-lab/cryptoKeys/legacy-rsa-oaep-decrypt",
+        "crypto-key:projects/pqc-inventory-agent-cd06/locations/global/keyRings/kr-pqc-audit-lab/cryptoKeys/pqc-kem-xwing-hybrid",
+        "crypto-key:projects/pqc-inventory-agent-cd06/locations/global/keyRings/kr-pqc-audit-lab/cryptoKeys/pqc-sign-mldsa65",
+        "crypto-key:projects/pqc-inventory-agent-cd06/locations/global/keyRings/kr-pqc-enterprise-prod/cryptoKeys/cmek-aes256-datalake",
+        "crypto-key:projects/pqc-inventory-agent-cd06/locations/global/keyRings/kr-pqc-enterprise-prod/cryptoKeys/legacy-ecdsa-p256-sign",
+        "crypto-key:projects/pqc-inventory-agent-cd06/locations/global/keyRings/kr-pqc-enterprise-prod/cryptoKeys/legacy-rsa-oaep-decrypt",
+        "crypto-key:projects/pqc-inventory-agent-cd06/locations/global/keyRings/kr-pqc-enterprise-prod/cryptoKeys/pqc-kem-xwing-hybrid",
+        "crypto-key:projects/pqc-inventory-agent-cd06/locations/global/keyRings/kr-pqc-enterprise-prod/cryptoKeys/pqc-sign-mldsa65"
+      ]
+    },
+    {
+      "ref": "application://storage.googleapis.com/bkt-iso-compliant-records-a3540b",
+      "dependsOn": [
+        "crypto-key:projects/fnlab-sec-mgmt-8fa913/locations/us-central1/keyRings/kr-iso-compliance-mgmt/cryptoKeys/kms-key-fintech-compliant"
+      ]
+    }
+  ],
+  "export_notes": {
+    "data_source": "LIVE_GCP_API",
+    "rejected_correlations": []
+  }
+}
