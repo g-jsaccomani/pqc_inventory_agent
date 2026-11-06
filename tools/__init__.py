@@ -12,8 +12,11 @@ from tools.calibration_engine import (
 from tools.gcloud_bridge import (
     execute_gcloud_command,
     get_active_gcp_credentials,
+    get_current_tenant_user,
     get_gcp_connection_config,
     get_recent_gcloud_traces,
+    normalize_user_id,
+    set_current_tenant_user,
     set_gcp_connection_config,
     validate_gcloud_command,
 )
@@ -41,15 +44,19 @@ __all__ = [
     "execute_gcloud_command",
     "export_cyclonedx_cbom",
     "get_active_gcp_credentials",
+    "get_current_tenant_user",
     "get_gcp_connection_config",
     "get_historical_calibration_profile",
     "get_recent_gcloud_traces",
     "map_algorithm_to_quantum_profile",
+    "normalize_user_id",
     "read_uploaded_artifact",
     "register_uploaded_artifact_for_analysis",
     "render_styled_consulting_html",
     "run_quantum_cryptanalysis_simulation",
     "save_assessment_report",
+    "set_current_tenant_user",
     "set_gcp_connection_config",
     "validate_gcloud_command",
 ]
+

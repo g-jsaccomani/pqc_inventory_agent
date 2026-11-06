@@ -1095,6 +1095,107 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       overflow: auto;
       white-space: pre-wrap;
     }
+
+    /* Multi-Tenant User Profile Pill & Google Workspace Auth Modal */
+    .user-profile-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      background: var(--bg-pill);
+      border: 1px solid var(--border-subtle);
+      color: var(--text-primary);
+      padding: 4px 11px 4px 5px;
+      border-radius: 999px;
+      font-size: 12px;
+      cursor: pointer;
+      transition: background 0.14s ease, border-color 0.14s ease;
+    }
+
+    .user-profile-pill:hover {
+      background: #35373b;
+      border-color: rgba(138, 180, 248, 0.45);
+    }
+
+    .user-avatar-circle {
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, #4C8DF6, #1A73E8);
+      color: #ffffff;
+      font-size: 10.5px;
+      font-weight: 600;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      letter-spacing: 0.02em;
+      flex-shrink: 0;
+    }
+
+    .region-tag-pill {
+      font-size: 10px;
+      font-weight: 600;
+      padding: 1px 6px;
+      border-radius: 999px;
+      background: rgba(76, 141, 246, 0.16);
+      color: var(--gemini-link);
+      border: 1px solid rgba(76, 141, 246, 0.35);
+      letter-spacing: 0.03em;
+    }
+
+    .auth-google-badge {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: rgba(76, 141, 246, 0.09);
+      border: 1px solid rgba(76, 141, 246, 0.28);
+      font-size: 12px;
+      color: var(--text-secondary);
+      line-height: 1.45;
+    }
+
+    .region-selector-grid {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 6px;
+    }
+
+    .region-chip-btn {
+      padding: 7px 6px;
+      border-radius: 8px;
+      border: 1px solid var(--border-subtle);
+      background: var(--bg-banner);
+      color: var(--text-secondary);
+      font-family: inherit;
+      font-size: 11.5px;
+      font-weight: 500;
+      cursor: pointer;
+      text-align: center;
+      transition: all 0.12s ease;
+    }
+
+    .region-chip-btn:hover {
+      border-color: rgba(138, 180, 248, 0.45);
+      color: var(--text-primary);
+    }
+
+    .region-chip-btn.selected {
+      background: rgba(76, 141, 246, 0.18);
+      border-color: var(--gemini-blue);
+      color: #ffffff;
+      font-weight: 600;
+    }
+
+    .auth-error-banner {
+      display: none;
+      padding: 8px 11px;
+      border-radius: 8px;
+      border: 1px solid rgba(242, 139, 130, 0.45);
+      background: rgba(242, 139, 130, 0.1);
+      color: #f6aea9;
+      font-size: 12px;
+    }
   </style>
 </head>
 <body>
@@ -1165,12 +1266,18 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     <!-- Bottom Connection Card (#2c2c2c) -->
     <div class="sidebar-info-card" onclick="openGcloudModal()">
       <strong>GCP / gcloud Connection</strong>
-      <span>Org 31564119954 • <span id="conn-status-dot" style="color:var(--gemini-link);">ADC</span></span>
+      <span id="sidebar-conn-summary">Org 31564119954 • <span id="conn-status-dot" style="color:var(--gemini-link);">ADC</span></span>
     </div>
 
     <div class="sidebar-bottom-bar">
-      <span>Google Cloud Consulting</span>
+      <span id="sidebar-tenant-label" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="Active @google.com Tenant">Google Cloud Consulting</span>
       <div style="display:flex;gap:4px;">
+        <button class="icon-btn" onclick="openAuthModal()" title="Google Workspace (@google.com) Account &amp; Region">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+            <circle cx="12" cy="7" r="4"></circle>
+          </svg>
+        </button>
         <a class="icon-btn" href="/dev-ui/?app=pqc_agent" target="_blank" rel="noopener" title="/dev-ui/">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <polyline points="16 18 22 12 16 6"></polyline>
@@ -1192,9 +1299,14 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     <header class="topbar">
       <div class="topbar-title" onclick="goHome()" title="Return to home screen">Agentic PQC Workspace</div>
       <div style="display:flex;align-items:center;gap:8px;">
-        <button class="top-pill" id="header-conn-badge" onclick="openGcloudModal()">
+        <button class="top-pill" id="header-conn-badge" onclick="openGcloudModal()" title="Isolated GCP Connection for your account">
           <span class="status-dot"></span>
           <span id="header-conn-text">Org 31564119954 • ADC</span>
+        </button>
+        <button class="user-profile-pill" id="user-profile-pill" onclick="openAuthModal()" title="Multi-Tenant @google.com Session &amp; Region">
+          <span class="user-avatar-circle" id="user-avatar-initials">G</span>
+          <span id="user-email-label">Sign in (@google.com)</span>
+          <span class="region-tag-pill" id="user-region-badge">NorthAm</span>
         </button>
       </div>
     </header>
@@ -1282,11 +1394,78 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     </div>
   </main>
 
+  <!-- Google Workspace (@google.com) Multi-Tenant Sign-In & Region Modal -->
+  <div class="modal-backdrop" id="auth-modal">
+    <div class="modal-panel" style="width: 500px;">
+      <div class="modal-header">
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span class="user-avatar-circle">G</span>
+          <span>Google Workspace Multi-Tenant Session</span>
+        </div>
+        <button onclick="closeAuthModal()" style="background:transparent;border:none;color:var(--text-secondary);font-size:16px;cursor:pointer;">✕</button>
+      </div>
+      <form class="modal-body" onsubmit="submitGoogleWorkspaceSignIn(event)">
+        <div class="auth-google-badge">
+          <div>
+            <strong style="color:var(--text-primary);display:block;margin-bottom:2px;">Persistent Per-User Workspace (@google.com)</strong>
+            Sign in with your corporate <code>@google.com</code> identity. Your chat history, uploaded artifacts, and GCP connection settings are isolated and persisted across NorthAm, EMEA, India, APAC, and LATAM.
+          </div>
+        </div>
+
+        <div class="auth-error-banner" id="auth-error-banner"></div>
+
+        <div class="conn-grid-2">
+          <div class="conn-field">
+            <label for="auth-email-input">Google Corporate Email (@google.com)</label>
+            <input type="text" id="auth-email-input" placeholder="ldap@google.com" autocomplete="email" required />
+          </div>
+          <div class="conn-field">
+            <label for="auth-name-input">Display Name (Optional)</label>
+            <input type="text" id="auth-name-input" placeholder="e.g. Jane Doe" autocomplete="name" />
+          </div>
+        </div>
+
+        <div class="conn-field">
+          <label>Operating Region (NorthAm • EMEA • India • APAC • LATAM)</label>
+          <div class="region-selector-grid" id="region-selector-grid">
+            <button type="button" class="region-chip-btn" data-region="NorthAm" onclick="selectAuthRegion('NorthAm')">NorthAm</button>
+            <button type="button" class="region-chip-btn" data-region="EMEA" onclick="selectAuthRegion('EMEA')">EMEA</button>
+            <button type="button" class="region-chip-btn" data-region="India" onclick="selectAuthRegion('India')">India</button>
+            <button type="button" class="region-chip-btn" data-region="APAC" onclick="selectAuthRegion('APAC')">APAC</button>
+            <button type="button" class="region-chip-btn" data-region="LATAM" onclick="selectAuthRegion('LATAM')">LATAM</button>
+          </div>
+        </div>
+
+        <details style="font-size:12px;color:var(--text-secondary);">
+          <summary style="cursor:pointer;color:var(--text-muted);user-select:none;">Optional: Verify with OAuth Token (`gcloud auth print-access-token`)</summary>
+          <div class="conn-field" style="margin-top:8px;">
+            <input type="password" id="auth-oauth-token-input" placeholder="Paste Google OAuth access token (optional)" />
+            <label style="display:flex;align-items:center;gap:6px;margin-top:4px;cursor:pointer;">
+              <input type="checkbox" id="auth-bind-gcp-token" style="width:auto;" checked />
+              <span>Also use this token for my isolated GCP / gcloud connection</span>
+            </label>
+          </div>
+        </details>
+
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-top:4px;">
+          <button type="button" id="auth-signout-btn" onclick="signOutTenantUser()" style="display:none;background:transparent;border:1px solid var(--border-subtle);color:var(--text-secondary);padding:7px 12px;border-radius:999px;font-size:12px;cursor:pointer;">
+            Switch Account / Sign Out
+          </button>
+          <div style="display:flex;gap:8px;margin-left:auto;">
+            <button type="submit" class="btn-modal-primary" id="auth-submit-btn">
+              Continue with @google.com
+            </button>
+          </div>
+        </div>
+      </form>
+    </div>
+  </div>
+
   <!-- Unified Connection & gcloud CLI Modal -->
   <div class="modal-backdrop" id="gcloud-modal">
     <div class="modal-panel">
       <div class="modal-header">
-        <span>GCP / gcloud Connection &amp; CLI</span>
+        <span>GCP / gcloud Connection &amp; CLI (<span id="conn-modal-user-label">sec-architect</span>)</span>
         <button onclick="closeGcloudModal()" style="background:transparent;border:none;color:var(--text-secondary);font-size:16px;cursor:pointer;">✕</button>
       </div>
       <div class="modal-body">
@@ -1358,12 +1537,226 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     let MODEL_OPTIONS = [];
     let MODEL_CATALOG_META = { verification: null, unavailable: [], project: null, default_model: null };
 
+    function detectBrowserTimezone() {
+      try {
+        return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+      } catch (e) {
+        return "UTC";
+      }
+    }
+
+    function detectBrowserRegion() {
+      const tz = (detectBrowserTimezone() || "").toLowerCase();
+      if (tz.includes("kolkata") || tz.includes("calcutta") || tz.includes("mumbai") || tz.includes("chennai") || tz.includes("colombo")) {
+        return "India";
+      }
+      if (tz.startsWith("europe/") || tz.startsWith("africa/") || tz.startsWith("atlantic/") || tz.includes("dubai") || tz.includes("jerusalem") || tz.includes("riyadh")) {
+        return "EMEA";
+      }
+      if (tz.startsWith("asia/") || tz.startsWith("australia/") || tz.startsWith("pacific/")) {
+        return "APAC";
+      }
+      if (tz.includes("sao_paulo") || tz.includes("buenos_aires") || tz.includes("santiago") || tz.includes("bogota") || tz.includes("lima") || tz.includes("mexico")) {
+        return "LATAM";
+      }
+      return "NorthAm";
+    }
+
+    let currentAuthToken = localStorage.getItem("pqc_session_token") || "";
+    let currentUserProfile = null;
     let currentUserId = localStorage.getItem("pqc_user_id") || "sec-architect";
-    let currentSessionId = localStorage.getItem("pqc_active_session_id") || null;
+    let selectedAuthRegion = localStorage.getItem("pqc_user_region") || detectBrowserRegion();
+    let currentSessionId = localStorage.getItem(`pqc_active_session_id:${currentUserId}`) || localStorage.getItem("pqc_active_session_id") || null;
     let selectedModelId = localStorage.getItem("pqc_selected_model_id") || "";
     let allSessions = [];
     let pendingFiles = [];
     let assistantResponsesStore = {};
+
+    function getAuthHeaders(extra = {}) {
+      const headers = Object.assign({}, extra);
+      headers["X-PQC-User-Id"] = currentUserId;
+      headers["X-PQC-User-Timezone"] = detectBrowserTimezone();
+      headers["X-PQC-User-Region"] = selectedAuthRegion;
+      if (currentAuthToken) {
+        headers["X-PQC-User-Token"] = currentAuthToken;
+      }
+      return headers;
+    }
+
+    function computeInitials(nameOrEmail) {
+      const raw = String(nameOrEmail || "G").split("@")[0].trim();
+      const parts = raw.replace(/[._-]+/g, " ").split(" ").filter(Boolean);
+      if (parts.length >= 2) {
+        return (parts[0][0] + parts[1][0]).toUpperCase();
+      }
+      return raw.slice(0, 2).toUpperCase() || "G";
+    }
+
+    function updateTenantProfileUI(profile) {
+      currentUserProfile = profile || null;
+      const initialsEl = document.getElementById("user-avatar-initials");
+      const emailEl = document.getElementById("user-email-label");
+      const regEl = document.getElementById("user-region-badge");
+      const sidebarTenantEl = document.getElementById("sidebar-tenant-label");
+      const connModalUserEl = document.getElementById("conn-modal-user-label");
+      const signoutBtn = document.getElementById("auth-signout-btn");
+
+      if (profile && profile.email) {
+        currentUserId = profile.user_id || profile.email;
+        selectedAuthRegion = profile.region || selectedAuthRegion;
+        localStorage.setItem("pqc_user_id", currentUserId);
+        localStorage.setItem("pqc_user_region", selectedAuthRegion);
+        if (initialsEl) initialsEl.textContent = computeInitials(profile.name || profile.email);
+        if (emailEl) emailEl.textContent = profile.email;
+        if (regEl) regEl.textContent = selectedAuthRegion;
+        if (sidebarTenantEl) sidebarTenantEl.textContent = `${profile.email} (${selectedAuthRegion})`;
+        if (connModalUserEl) connModalUserEl.textContent = `${profile.email} • ${selectedAuthRegion}`;
+        if (signoutBtn) signoutBtn.style.display = profile.auth_method === "cloud_iap" ? "none" : "inline-flex";
+      } else {
+        if (initialsEl) initialsEl.textContent = "G";
+        if (emailEl) emailEl.textContent = "Sign in (@google.com)";
+        if (regEl) regEl.textContent = selectedAuthRegion;
+        if (sidebarTenantEl) sidebarTenantEl.textContent = "Google Cloud Consulting";
+        if (connModalUserEl) connModalUserEl.textContent = currentUserId;
+        if (signoutBtn) signoutBtn.style.display = "none";
+      }
+      selectAuthRegion(selectedAuthRegion);
+    }
+
+    function selectAuthRegion(regionId) {
+      selectedAuthRegion = regionId || "NorthAm";
+      const btns = document.querySelectorAll("#region-selector-grid .region-chip-btn");
+      btns.forEach((b) => {
+        b.classList.toggle("selected", b.getAttribute("data-region") === selectedAuthRegion);
+      });
+    }
+
+    function openAuthModal() {
+      const errEl = document.getElementById("auth-error-banner");
+      if (errEl) {
+        errEl.style.display = "none";
+        errEl.textContent = "";
+      }
+      const emailInput = document.getElementById("auth-email-input");
+      const nameInput = document.getElementById("auth-name-input");
+      if (currentUserProfile && currentUserProfile.email) {
+        emailInput.value = currentUserProfile.email;
+        nameInput.value = currentUserProfile.name || "";
+      } else if (currentUserId && currentUserId.includes("@")) {
+        emailInput.value = currentUserId;
+      }
+      selectAuthRegion(selectedAuthRegion);
+      document.getElementById("auth-modal").classList.add("open");
+      setTimeout(() => emailInput && emailInput.focus(), 60);
+    }
+
+    function closeAuthModal() {
+      document.getElementById("auth-modal").classList.remove("open");
+    }
+
+    async function loadCurrentTenantUser() {
+      try {
+        const res = await fetch("/api/auth/me", {
+          credentials: "same-origin",
+          headers: getAuthHeaders(),
+        });
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data.authenticated && data.user) {
+          updateTenantProfileUI(data.user);
+          currentSessionId = localStorage.getItem(`pqc_active_session_id:${currentUserId}`) || null;
+          if (data.connection) {
+            applyConnectionConfigToUI(data.connection);
+          }
+        } else {
+          updateTenantProfileUI(null);
+          openAuthModal();
+        }
+      } catch (e) {
+        console.warn("Tenant auth check warning:", e);
+      }
+    }
+
+    async function submitGoogleWorkspaceSignIn(event) {
+      if (event) event.preventDefault();
+      const errEl = document.getElementById("auth-error-banner");
+      if (errEl) {
+        errEl.style.display = "none";
+        errEl.textContent = "";
+      }
+      let rawEmail = (document.getElementById("auth-email-input").value || "").trim().toLowerCase();
+      if (rawEmail && !rawEmail.includes("@")) {
+        rawEmail = `${rawEmail}@google.com`;
+        document.getElementById("auth-email-input").value = rawEmail;
+      }
+      const displayName = (document.getElementById("auth-name-input").value || "").trim();
+      const oauthToken = (document.getElementById("auth-oauth-token-input").value || "").trim();
+      const bindGcp = Boolean(document.getElementById("auth-bind-gcp-token").checked);
+
+      try {
+        const res = await fetch("/api/auth/google", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            email: rawEmail,
+            name: displayName || undefined,
+            region: selectedAuthRegion,
+            timezone: detectBrowserTimezone(),
+            google_access_token: oauthToken || undefined,
+            use_token_for_gcp_connection: bindGcp,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.authenticated) {
+          if (errEl) {
+            errEl.textContent = (data && data.detail) || "Authentication failed. Please use a valid @google.com email.";
+            errEl.style.display = "block";
+          }
+          return;
+        }
+        currentAuthToken = data.token || "";
+        if (currentAuthToken) {
+          localStorage.setItem("pqc_session_token", currentAuthToken);
+        }
+        updateTenantProfileUI(data.user);
+        if (data.connection) {
+          applyConnectionConfigToUI(data.connection);
+        }
+        closeAuthModal();
+        currentSessionId = localStorage.getItem(`pqc_active_session_id:${currentUserId}`) || null;
+        await fetchSessions();
+        if (!currentSessionId && allSessions.length > 0) {
+          currentSessionId = allSessions[0].session_id;
+        }
+        if (currentSessionId) {
+          await loadSessionHistory(currentSessionId);
+        } else {
+          goHome();
+        }
+      } catch (err) {
+        if (errEl) {
+          errEl.textContent = `Sign-in error: ${err}`;
+          errEl.style.display = "block";
+        }
+      }
+    }
+
+    async function signOutTenantUser() {
+      try {
+        await fetch("/api/auth/logout", { method: "POST", credentials: "same-origin" });
+      } catch (e) {}
+      currentAuthToken = "";
+      currentUserProfile = null;
+      currentUserId = "sec-architect";
+      currentSessionId = null;
+      localStorage.removeItem("pqc_session_token");
+      localStorage.removeItem("pqc_user_id");
+      updateTenantProfileUI(null);
+      goHome();
+      await fetchSessions();
+      openAuthModal();
+    }
 
     async function loadModelCatalog(forceRefresh = false) {
       try {
@@ -1523,17 +1916,25 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       document.getElementById("conn-token-group").style.display = mode === "access_token" ? "flex" : "none";
     }
 
+    function applyConnectionConfigToUI(cfg) {
+      if (!cfg) return;
+      document.getElementById("conn-mode-select").value = cfg.mode || "adc";
+      document.getElementById("conn-org-input").value = cfg.organization_id || "31564119954";
+      document.getElementById("conn-proj-input").value = cfg.project_id || "pqc-inventory-agent-cd06";
+      document.getElementById("conn-sa-input").value = cfg.impersonated_service_account || "";
+      toggleConnectionModeFields();
+      updateHeaderConnectionBadge(cfg);
+    }
+
     async function loadConnectionConfig() {
       try {
-        const res = await fetch("/api/connection");
+        const res = await fetch(`/api/connection?user_id=${encodeURIComponent(currentUserId)}`, {
+          credentials: "same-origin",
+          headers: getAuthHeaders(),
+        });
         if (!res.ok) return;
         const cfg = await res.json();
-        document.getElementById("conn-mode-select").value = cfg.mode || "adc";
-        document.getElementById("conn-org-input").value = cfg.organization_id || "31564119954";
-        document.getElementById("conn-proj-input").value = cfg.project_id || "pqc-inventory-agent-cd06";
-        document.getElementById("conn-sa-input").value = cfg.impersonated_service_account || "";
-        toggleConnectionModeFields();
-        updateHeaderConnectionBadge(cfg);
+        applyConnectionConfigToUI(cfg);
       } catch (e) {
         console.warn("Connection status warning:", e);
       }
@@ -1542,11 +1943,15 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     function updateHeaderConnectionBadge(cfg) {
       const modeShort = cfg.mode === "impersonation" ? "Impersonated SA" : (cfg.mode === "access_token" ? "Token" : "ADC");
       document.getElementById("header-conn-text").textContent = `Org ${cfg.organization_id} • ${modeShort}`;
-      document.getElementById("conn-status-dot").textContent = modeShort;
+      const sidebarSummary = document.getElementById("sidebar-conn-summary");
+      if (sidebarSummary) {
+        sidebarSummary.innerHTML = `Org ${escapeHtml(cfg.organization_id)} • <span id="conn-status-dot" style="color:var(--gemini-link);">${escapeHtml(modeShort)}</span>`;
+      }
     }
 
     async function saveConnectionConfig() {
       const payload = {
+        user_id: currentUserId,
         mode: document.getElementById("conn-mode-select").value,
         organization_id: document.getElementById("conn-org-input").value.trim(),
         project_id: document.getElementById("conn-proj-input").value.trim(),
@@ -1555,7 +1960,8 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       };
       const res = await fetch("/api/connection", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        credentials: "same-origin",
+        headers: getAuthHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify(payload),
       });
       if (res.ok) {
@@ -1566,7 +1972,10 @@ PORTAL_HTML = r"""<!DOCTYPE html>
 
     async function fetchSessions() {
       try {
-        const res = await fetch(`/api/sessions?user_id=${encodeURIComponent(currentUserId)}`);
+        const res = await fetch(`/api/sessions?user_id=${encodeURIComponent(currentUserId)}`, {
+          credentials: "same-origin",
+          headers: getAuthHeaders(),
+        });
         if (!res.ok) return;
         const data = await res.json();
         allSessions = data.sessions || [];
@@ -1579,6 +1988,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
 
     function goHome() {
       currentSessionId = null;
+      localStorage.removeItem(`pqc_active_session_id:${currentUserId}`);
       localStorage.removeItem("pqc_active_session_id");
       document.getElementById("messages-container").innerHTML = "";
       document.getElementById("welcome-screen").style.display = "flex";
@@ -1624,7 +2034,8 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       const sessionTitle = (typeof customTitle === "string" && customTitle.trim()) ? customTitle.trim() : "New PQC Assessment";
       const res = await fetch("/api/sessions", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        credentials: "same-origin",
+        headers: getAuthHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({
           user_id: currentUserId,
           title: sessionTitle,
@@ -1634,6 +2045,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       if (res.ok) {
         const created = await res.json();
         currentSessionId = created.session_id;
+        localStorage.setItem(`pqc_active_session_id:${currentUserId}`, currentSessionId);
         localStorage.setItem("pqc_active_session_id", currentSessionId);
         document.getElementById("messages-container").innerHTML = "";
         document.getElementById("welcome-screen").style.display = "flex";
@@ -1643,9 +2055,13 @@ PORTAL_HTML = r"""<!DOCTYPE html>
 
     async function loadSessionHistory(sessionId) {
       currentSessionId = sessionId;
+      localStorage.setItem(`pqc_active_session_id:${currentUserId}`, sessionId);
       localStorage.setItem("pqc_active_session_id", sessionId);
       renderSessionList();
-      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}?user_id=${encodeURIComponent(currentUserId)}`);
+      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}?user_id=${encodeURIComponent(currentUserId)}`, {
+        credentials: "same-origin",
+        headers: getAuthHeaders(),
+      });
       if (!res.ok) return;
       const data = await res.json();
       const msgs = data.messages || [];
@@ -1670,10 +2086,13 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     async function deleteSessionById(sessionId) {
       const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}?user_id=${encodeURIComponent(currentUserId)}`, {
         method: "DELETE",
+        credentials: "same-origin",
+        headers: getAuthHeaders(),
       });
       if (res.ok) {
         if (currentSessionId === sessionId) {
           currentSessionId = null;
+          localStorage.removeItem(`pqc_active_session_id:${currentUserId}`);
           localStorage.removeItem("pqc_active_session_id");
           document.getElementById("messages-container").innerHTML = "";
           document.getElementById("welcome-screen").style.display = "flex";
@@ -1901,6 +2320,8 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       try {
         const res = await fetch("/api/chat", {
           method: "POST",
+          credentials: "same-origin",
+          headers: getAuthHeaders(),
           body: formData,
         });
         loadingRow.remove();
@@ -1912,6 +2333,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
         }
         if (data && data.session_id) {
           currentSessionId = data.session_id;
+          localStorage.setItem(`pqc_active_session_id:${currentUserId}`, currentSessionId);
           localStorage.setItem("pqc_active_session_id", currentSessionId);
         }
         if (!res.ok || !data || data.status !== "OK") {
@@ -1966,8 +2388,9 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       try {
         const res = await fetch("/api/gcloud", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ command: cmd }),
+          credentials: "same-origin",
+          headers: getAuthHeaders({ "Content-Type": "application/json" }),
+          body: JSON.stringify({ command: cmd, user_id: currentUserId }),
         });
         const data = await res.json();
         if (data.status === "SUCCESS") {
@@ -1998,13 +2421,14 @@ PORTAL_HTML = r"""<!DOCTYPE html>
 
     window.addEventListener("DOMContentLoaded", async () => {
       const linkedSession = new URLSearchParams(window.location.search).get("session");
+      renderModelDropdown();
+      await loadModelCatalog();
+      await loadCurrentTenantUser();
+      await loadConnectionConfig();
+      await fetchSessions();
       if (linkedSession) {
         currentSessionId = linkedSession;
       }
-      renderModelDropdown();
-      await loadModelCatalog();
-      await loadConnectionConfig();
-      await fetchSessions();
       if (currentSessionId) {
         await loadSessionHistory(currentSessionId);
       }

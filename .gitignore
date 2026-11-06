@@ -21,5 +21,6 @@ build/
 
 # OS files & local SQLite session databases
 .DS_Store
-data/*.db*
+data/
+
 

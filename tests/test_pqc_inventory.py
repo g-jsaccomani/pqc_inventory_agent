@@ -613,6 +613,144 @@ def test_tools_smoke_runner_never_invokes_the_llm():
     assert result["kms_inventory_summary"]["data_source"] == "SIMULATED_DEMO_DATASET"
 
 
+def test_multi_tenant_google_auth_regional_sessions_and_isolated_connections(tmp_path):
+    from fastapi.testclient import TestClient
+
+    app_instance = _make_app(tmp_path)
+    with TestClient(app_instance) as client:
+        # 1. Unauthorized external domain must be rejected
+        bad_auth = client.post("/api/auth/google", json={"email": "attacker@evil.example.com", "region": "NorthAm"})
+        assert bad_auth.status_code == 403
+
+        # 2. Sign in 4 Googlers across NorthAm, EMEA, India, and APAC
+        alice_login = client.post(
+            "/api/auth/google",
+            json={"email": "alice@google.com", "name": "Alice NorthAm", "timezone": "America/New_York"},
+        )
+        assert alice_login.status_code == 200
+        alice_data = alice_login.json()
+        assert alice_data["authenticated"] is True
+        assert alice_data["user"]["email"] == "alice@google.com"
+        assert alice_data["user"]["region"] == "NorthAm"
+        alice_token = alice_data["token"]
+
+        rahul_login = client.post(
+            "/api/auth/google",
+            json={"email": "rahul@google.com", "name": "Rahul India", "timezone": "Asia/Kolkata"},
+        )
+        assert rahul_login.status_code == 200
+        rahul_data = rahul_login.json()
+        assert rahul_data["user"]["region"] == "India"
+        rahul_token = rahul_data["token"]
+
+        anna_login = client.post(
+            "/api/auth/google",
+            json={"email": "anna@google.com", "name": "Anna EMEA", "timezone": "Europe/London"},
+        )
+        assert anna_login.status_code == 200
+        assert anna_login.json()["user"]["region"] == "EMEA"
+        anna_token = anna_login.json()["token"]
+
+        kenji_login = client.post(
+            "/api/auth/google",
+            json={"email": "kenji@google.com", "name": "Kenji APAC", "timezone": "Asia/Tokyo"},
+        )
+        assert kenji_login.status_code == 200
+        assert kenji_login.json()["user"]["region"] == "APAC"
+        kenji_token = kenji_login.json()["token"]
+
+        # 3. Isolated GCP Connection Config per @google.com user
+        client.post(
+            "/api/connection",
+            headers={"X-PQC-User-Token": alice_token},
+            json={
+                "mode": "impersonation",
+                "organization_id": "111111111111",
+                "project_id": "alice-northam-proj",
+                "impersonated_service_account": "pqc-sa@alice-northam-proj.iam.gserviceaccount.com",
+            },
+        )
+        client.post(
+            "/api/connection",
+            headers={"X-PQC-User-Token": rahul_token},
+            json={
+                "mode": "adc",
+                "organization_id": "222222222222",
+                "project_id": "rahul-india-proj",
+            },
+        )
+
+        alice_conn = client.get("/api/connection", headers={"X-PQC-User-Token": alice_token}).json()
+        rahul_conn = client.get("/api/connection", headers={"X-PQC-User-Token": rahul_token}).json()
+        anna_conn = client.get("/api/connection", headers={"X-PQC-User-Token": anna_token}).json()
+
+        assert alice_conn["user_id"] == "alice@google.com"
+        assert alice_conn["mode"] == "impersonation"
+        assert alice_conn["organization_id"] == "111111111111"
+        assert alice_conn["project_id"] == "alice-northam-proj"
+
+        assert rahul_conn["user_id"] == "rahul@google.com"
+        assert rahul_conn["mode"] == "adc"
+        assert rahul_conn["organization_id"] == "222222222222"
+        assert rahul_conn["project_id"] == "rahul-india-proj"
+
+        # Anna in EMEA still has the default demo connection untouched
+        assert anna_conn["user_id"] == "anna@google.com"
+        assert anna_conn["mode"] == "adc"
+        assert anna_conn["organization_id"] == "31564119954"
+
+        # 4. Isolated Persistent Sessions per @google.com user
+        alice_sess = client.post(
+            "/api/sessions",
+            headers={"X-PQC-User-Token": alice_token},
+            json={"title": "NorthAm Banking PQC Review"},
+        ).json()
+        rahul_sess = client.post(
+            "/api/sessions",
+            headers={"X-PQC-User-Token": rahul_token},
+            json={"title": "India Telecom PQC Review"},
+        ).json()
+
+        assert alice_sess["user_id"] == "alice@google.com"
+        assert alice_sess["scope"] == "organizations/111111111111"
+        assert rahul_sess["user_id"] == "rahul@google.com"
+        assert rahul_sess["scope"] == "organizations/222222222222"
+
+        alice_list = client.get("/api/sessions", headers={"X-PQC-User-Token": alice_token}).json()
+        rahul_list = client.get("/api/sessions", headers={"X-PQC-User-Token": rahul_token}).json()
+        assert [s["title"] for s in alice_list["sessions"]] == ["NorthAm Banking PQC Review"]
+        assert [s["title"] for s in rahul_list["sessions"]] == ["India Telecom PQC Review"]
+
+        # Rahul cannot read or delete Alice's session (strict tenant boundary)
+        cross_read = client.get(
+            f"/api/sessions/{alice_sess['session_id']}",
+            headers={"X-PQC-User-Token": rahul_token},
+        )
+        assert cross_read.status_code == 404
+
+        cross_delete = client.delete(
+            f"/api/sessions/{alice_sess['session_id']}",
+            headers={"X-PQC-User-Token": rahul_token},
+        )
+        assert cross_delete.status_code == 404
+
+        # 5. Cloud IAP Header auto-authentication & persistent restoration
+        iap_me = client.get(
+            "/api/auth/me",
+            headers={"X-Goog-Authenticated-User-Email": "accounts.google.com:alice@google.com"},
+        ).json()
+        assert iap_me["authenticated"] is True
+        assert iap_me["iap_active"] is True
+        assert iap_me["user"]["email"] == "alice@google.com"
+        assert iap_me["session_count"] == 1
+        assert iap_me["connection"]["organization_id"] == "111111111111"
+
+        # 6. Tenants summary shows all 4 regions
+        tenants_summary = client.get("/api/auth/tenants").json()
+        for reg in ("NorthAm", "EMEA", "India", "APAC"):
+            assert tenants_summary["by_region"].get(reg, 0) >= 1
+
+
 @pytest.mark.skipif(os.getenv("PQC_LIVE_LLM_TEST") != "1", reason="Set PQC_LIVE_LLM_TEST=1 with Vertex AI access to run.")
 def test_live_vertex_gemini_turn_reports_model_telemetry():
     import main
@@ -621,3 +759,4 @@ def test_live_vertex_gemini_turn_reports_model_telemetry():
     assert result["status"] == "OK", result["error"]
     assert result["served_by"]["models_used"]
     assert result["served_by"]["prompt_tokens"] > 0
+

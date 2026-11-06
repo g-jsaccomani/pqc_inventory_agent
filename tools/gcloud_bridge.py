@@ -11,6 +11,7 @@ verb allowlisting/denylisting and shell-injection prevention.
 
 from __future__ import annotations
 
+import contextvars
 import datetime
 import json
 import logging
@@ -25,6 +26,38 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_TENANT_USER_ID = "sec-architect"
+_CURRENT_USER_ID: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "pqc_current_user_id", default=DEFAULT_TENANT_USER_ID
+)
+
+
+def normalize_user_id(user_id: Optional[str]) -> str:
+    """Normalizes a user identifier or @google.com email (stripping Cloud IAP prefixes if present)."""
+    if not user_id:
+        return DEFAULT_TENANT_USER_ID
+    cleaned = str(user_id).strip()
+    if cleaned.lower().startswith("accounts.google.com:"):
+        cleaned = cleaned.split(":", 1)[1].strip()
+    if not cleaned:
+        return DEFAULT_TENANT_USER_ID
+    if "@" in cleaned:
+        return cleaned.lower()
+    return cleaned
+
+
+def set_current_tenant_user(user_id: Optional[str]) -> str:
+    """Sets the active tenant user ID in the current async/thread execution context."""
+    norm = normalize_user_id(user_id)
+    _CURRENT_USER_ID.set(norm)
+    return norm
+
+
+def get_current_tenant_user() -> str:
+    """Returns the active tenant user ID for the current async/thread execution context."""
+    return normalize_user_id(_CURRENT_USER_ID.get())
+
 
 # Allowed connection mode identifiers and human-readable labels
 CONNECTION_MODES: Dict[str, str] = {
@@ -120,17 +153,65 @@ _FORBIDDEN_SHELL_PATTERNS = re.compile(r"[;&|`$><\n\r]")
 
 _LOCK = threading.RLock()
 
-_CONNECTION_STATE: Dict[str, Any] = {
-    "mode": os.getenv("PQC_CONNECTION_MODE", "adc"),
-    "organization_id": os.getenv("GCP_ORGANIZATION_ID", "31564119954"),
-    "project_id": os.getenv("GOOGLE_CLOUD_PROJECT", "pqc-inventory-agent-cd06"),
-    "location": os.getenv("PQC_DEFAULT_LOCATION", "all"),
-    "impersonated_service_account": os.getenv("PQC_IMPERSONATED_SERVICE_ACCOUNT", ""),
-    "access_token": os.getenv("PQC_USER_ACCESS_TOKEN", ""),
-    "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-}
+
+def _default_connection_template() -> Dict[str, Any]:
+    return {
+        "mode": os.getenv("PQC_CONNECTION_MODE", "adc"),
+        "organization_id": os.getenv("GCP_ORGANIZATION_ID", "31564119954"),
+        "project_id": os.getenv("GOOGLE_CLOUD_PROJECT", "pqc-inventory-agent-cd06"),
+        "location": os.getenv("PQC_DEFAULT_LOCATION", "all"),
+        "impersonated_service_account": os.getenv("PQC_IMPERSONATED_SERVICE_ACCOUNT", ""),
+        "access_token": os.getenv("PQC_USER_ACCESS_TOKEN", ""),
+        "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+
+
+_CONNECTION_STATE: Dict[str, Any] = _default_connection_template()
+_USER_CONNECTIONS: Dict[str, Dict[str, Any]] = {}
+_USER_CONNECTIONS_LOADED = False
 
 _GCLOUD_EXECUTION_LOG: List[Dict[str, Any]] = []
+
+
+def _get_user_connections_path() -> str:
+    if os.path.isdir("/data") and os.access("/data", os.W_OK):
+        return "/data/pqc_user_connections.json"
+    os.makedirs("data", exist_ok=True)
+    return os.path.join("data", "pqc_user_connections.json")
+
+
+def _ensure_user_connections_loaded() -> None:
+    global _USER_CONNECTIONS_LOADED
+    if _USER_CONNECTIONS_LOADED:
+        return
+    _USER_CONNECTIONS_LOADED = True
+    path = _get_user_connections_path()
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if isinstance(raw, dict):
+            for k, v in raw.items():
+                if isinstance(v, dict):
+                    _USER_CONNECTIONS[normalize_user_id(k)] = dict(v)
+    except Exception:
+        pass
+
+
+def _persist_user_connections() -> None:
+    path = _get_user_connections_path()
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        # Do not persist raw transient OAuth access tokens to disk for security; keep mode/org/project/SA
+        serializable: Dict[str, Dict[str, Any]] = {}
+        for uid, cfg in _USER_CONNECTIONS.items():
+            copy_cfg = dict(cfg)
+            serializable[uid] = copy_cfg
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(serializable, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
 
 
 def normalize_connection_mode(raw_mode: Optional[str]) -> str:
@@ -141,6 +222,16 @@ def normalize_connection_mode(raw_mode: Optional[str]) -> str:
     return _MODE_ALIASES.get(cleaned, "adc")
 
 
+def _get_mutable_user_state(user_id: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
+    uid = normalize_user_id(user_id or get_current_tenant_user())
+    _ensure_user_connections_loaded()
+    if uid == DEFAULT_TENANT_USER_ID:
+        return uid, _CONNECTION_STATE
+    if uid not in _USER_CONNECTIONS:
+        _USER_CONNECTIONS[uid] = _default_connection_template()
+    return uid, _USER_CONNECTIONS[uid]
+
+
 def set_gcp_connection_config(
     mode: Optional[str] = None,
     organization_id: Optional[str] = None,
@@ -148,37 +239,49 @@ def set_gcp_connection_config(
     location: Optional[str] = None,
     impersonated_service_account: Optional[str] = None,
     access_token: Optional[str] = None,
+    user_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Updates the active GCP / gcloud connection configuration and returns its sanitized state."""
+    """Updates the active GCP / gcloud connection configuration for the current tenant user and returns its sanitized state."""
     with _LOCK:
+        uid, target_state = _get_mutable_user_state(user_id)
         if mode is not None:
-            _CONNECTION_STATE["mode"] = normalize_connection_mode(mode)
+            target_state["mode"] = normalize_connection_mode(mode)
         if organization_id is not None and str(organization_id).strip():
             clean_org = str(organization_id).strip().replace("organizations/", "")
-            _CONNECTION_STATE["organization_id"] = clean_org
-            os.environ["GCP_ORGANIZATION_ID"] = clean_org
+            target_state["organization_id"] = clean_org
+            if uid == DEFAULT_TENANT_USER_ID:
+                os.environ["GCP_ORGANIZATION_ID"] = clean_org
         if project_id is not None and str(project_id).strip():
             clean_proj = str(project_id).strip().replace("projects/", "")
-            _CONNECTION_STATE["project_id"] = clean_proj
+            target_state["project_id"] = clean_proj
         if location is not None and str(location).strip():
-            _CONNECTION_STATE["location"] = str(location).strip()
+            target_state["location"] = str(location).strip()
         if impersonated_service_account is not None:
-            _CONNECTION_STATE["impersonated_service_account"] = str(impersonated_service_account).strip()
+            target_state["impersonated_service_account"] = str(impersonated_service_account).strip()
         if access_token is not None:
             # Strip 'Bearer ' prefix if pasted by user
             tok = str(access_token).strip()
             if tok.lower().startswith("bearer "):
                 tok = tok[7:].strip()
-            _CONNECTION_STATE["access_token"] = tok
+            target_state["access_token"] = tok
 
-        _CONNECTION_STATE["updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        return get_gcp_connection_config(mask_token=True)
+        target_state["updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        _USER_CONNECTIONS[uid] = dict(target_state)
+        _persist_user_connections()
+        return get_gcp_connection_config(mask_token=True, user_id=uid)
 
 
-def get_gcp_connection_config(mask_token: bool = True) -> Dict[str, Any]:
-    """Returns the current GCP / gcloud connection state (with masked token by default)."""
+def get_gcp_connection_config(mask_token: bool = True, user_id: Optional[str] = None) -> Dict[str, Any]:
+    """Returns the current GCP / gcloud connection state for the active tenant user (with masked token by default)."""
     with _LOCK:
-        state = dict(_CONNECTION_STATE)
+        uid = normalize_user_id(user_id or get_current_tenant_user())
+        _ensure_user_connections_loaded()
+        if uid == DEFAULT_TENANT_USER_ID:
+            state = dict(_CONNECTION_STATE)
+        elif uid in _USER_CONNECTIONS:
+            state = dict(_USER_CONNECTIONS[uid])
+        else:
+            state = _default_connection_template()
     mode = normalize_connection_mode(state.get("mode"))
     raw_token = state.get("access_token") or ""
     has_token = bool(raw_token)
@@ -190,6 +293,7 @@ def get_gcp_connection_config(mask_token: bool = True) -> Dict[str, Any]:
             masked_token = "***REDACTED***"
 
     return {
+        "user_id": uid,
         "mode": mode,
         "mode_label": CONNECTION_MODES.get(mode, CONNECTION_MODES["adc"]),
         "organization_id": state.get("organization_id", "31564119954"),
@@ -203,18 +307,18 @@ def get_gcp_connection_config(mask_token: bool = True) -> Dict[str, Any]:
     }
 
 
-def get_active_gcp_credentials() -> Any:
-    """Returns google.auth credentials matching the active connection mode, or None for Default ADC.
+def get_active_gcp_credentials(user_id: Optional[str] = None) -> Any:
+    """Returns google.auth credentials matching the active tenant user's connection mode, or None for Default ADC.
 
     Returning None in 'adc' mode allows Google Cloud client libraries (`kms_v1`, `asset_v1`,
     `compute_v1`, `storage`) to use standard Application Default Credentials seamlessly and preserves
     compatibility with unit test mocks.
     """
-    with _LOCK:
-        mode = normalize_connection_mode(_CONNECTION_STATE.get("mode"))
-        impersonated_sa = (_CONNECTION_STATE.get("impersonated_service_account") or "").strip()
-        access_token = (_CONNECTION_STATE.get("access_token") or "").strip()
-        quota_project = (_CONNECTION_STATE.get("project_id") or "").strip() or None
+    conn = get_gcp_connection_config(mask_token=False, user_id=user_id)
+    mode = normalize_connection_mode(conn.get("mode"))
+    impersonated_sa = (conn.get("impersonated_service_account") or "").strip()
+    access_token = (conn.get("access_token_preview") or "").strip()
+    quota_project = (conn.get("project_id") or "").strip() or None
 
     if mode == "access_token" and access_token:
         from google.oauth2 import credentials as oauth2_credentials
@@ -484,13 +588,19 @@ def _record_gcloud_trace(entry: Dict[str, Any]) -> None:
     """Stores recent gcloud executions in a bounded ring buffer for the UI Execution Trace drawer."""
     with _LOCK:
         trace_item = dict(entry)
+        trace_item.setdefault("user_id", get_current_tenant_user())
         trace_item["timestamp_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
         _GCLOUD_EXECUTION_LOG.append(trace_item)
-        if len(_GCLOUD_EXECUTION_LOG) > 100:
-            del _GCLOUD_EXECUTION_LOG[:-100]
+        if len(_GCLOUD_EXECUTION_LOG) > 200:
+            del _GCLOUD_EXECUTION_LOG[:-200]
 
 
-def get_recent_gcloud_traces(limit: int = 25) -> List[Dict[str, Any]]:
-    """Returns the most recent gcloud CLI execution trace records."""
+def get_recent_gcloud_traces(limit: int = 25, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Returns the most recent gcloud CLI execution trace records, optionally filtered by tenant user_id."""
     with _LOCK:
+        if user_id:
+            norm = normalize_user_id(user_id)
+            filtered = [t for t in _GCLOUD_EXECUTION_LOG if normalize_user_id(t.get("user_id")) == norm]
+            return list(filtered[-limit:])
         return list(_GCLOUD_EXECUTION_LOG[-limit:])
+

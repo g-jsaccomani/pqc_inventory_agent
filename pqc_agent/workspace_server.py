@@ -12,12 +12,18 @@ Guarantees implemented here:
 from __future__ import annotations
 
 import asyncio
+import base64
 import datetime
+import hashlib
+import hmac
 import json
 import logging
 import mimetypes
 import os
+import secrets
 import time
+import urllib.parse
+import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -42,6 +48,8 @@ from tools.gcloud_bridge import (
     execute_gcloud_command,
     get_gcp_connection_config,
     get_recent_gcloud_traces,
+    normalize_user_id,
+    set_current_tenant_user,
     set_gcp_connection_config,
 )
 
@@ -49,6 +57,25 @@ logger = logging.getLogger(__name__)
 
 APP_NAME = "pqc_agent"
 DEFAULT_USER_ID = "sec-architect"
+SESSION_COOKIE_NAME = "pqc_session_token"
+SESSION_TOKEN_TTL_SECONDS = 30 * 24 * 3600  # 30 days
+ALLOWED_AUTH_DOMAINS = tuple(
+    d.strip().lower()
+    for d in os.getenv(
+        "PQC_ALLOWED_AUTH_DOMAINS",
+        "google.com,jsaccomani.altostrat.com,altostrat.com",
+    ).split(",")
+    if d.strip()
+)
+SUPPORTED_REGIONS: List[Dict[str, str]] = [
+    {"id": "NorthAm", "label": "NorthAm (US & Canada)"},
+    {"id": "EMEA", "label": "EMEA (Europe, Middle East & Africa)"},
+    {"id": "India", "label": "India (Bengaluru / Hyderabad / Mumbai)"},
+    {"id": "APAC", "label": "APAC (Singapore / Tokyo / Sydney / Seoul)"},
+    {"id": "LATAM", "label": "LATAM (São Paulo / Mexico City / Bogotá)"},
+]
+VALID_REGION_IDS = {r["id"].lower(): r["id"] for r in SUPPORTED_REGIONS}
+
 DEFAULT_STAGING_BUCKET = os.getenv(
     "PQC_ARTIFACT_BUCKET",
     os.getenv("PQC_EXPORT_GCS_BUCKET", "gs://pqc-inventory-agent-cd06-pqc-agent-staging"),
@@ -207,11 +234,15 @@ class ResilientGcsArtifactService(GcsArtifactService):
 
 
 # Sidecar metadata store in SQLite/JSON for custom session titles, attachments, and tool traces
-def _get_metadata_store_path() -> str:
+def _get_data_dir() -> str:
     if os.path.isdir("/data") and os.access("/data", os.W_OK):
-        return "/data/pqc_session_metadata.json"
+        return "/data"
     os.makedirs("data", exist_ok=True)
-    return os.path.join("data", "pqc_session_metadata.json")
+    return "data"
+
+
+def _get_metadata_store_path() -> str:
+    return os.path.join(_get_data_dir(), "pqc_session_metadata.json")
 
 
 def _load_session_metadata_map() -> Dict[str, Dict[str, Any]]:
@@ -235,14 +266,364 @@ def _save_session_metadata_map(meta_map: Dict[str, Dict[str, Any]]) -> None:
         pass
 
 
+# =============================================================================
+# Multi-Tenant @google.com Identity, Region & Persistent Session Token Manager
+# =============================================================================
+
+
+def _get_tenant_users_path() -> str:
+    return os.path.join(_get_data_dir(), "pqc_tenant_users.json")
+
+
+def _load_tenant_users_map() -> Dict[str, Dict[str, Any]]:
+    path = _get_tenant_users_path()
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_tenant_users_map(users_map: Dict[str, Dict[str, Any]]) -> None:
+    path = _get_tenant_users_path()
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(users_map, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
+_AUTH_SECRET_CACHE: Optional[bytes] = None
+
+
+def _get_auth_secret() -> bytes:
+    """Returns a persistent 256-bit HMAC secret stored on `/data` so signed cookies survive restarts."""
+    global _AUTH_SECRET_CACHE
+    if _AUTH_SECRET_CACHE is not None:
+        return _AUTH_SECRET_CACHE
+    env_secret = os.getenv("PQC_AUTH_SECRET", "").strip()
+    if env_secret:
+        _AUTH_SECRET_CACHE = env_secret.encode("utf-8")
+        return _AUTH_SECRET_CACHE
+    secret_path = os.path.join(_get_data_dir(), ".pqc_auth_secret")
+    try:
+        if os.path.exists(secret_path):
+            with open(secret_path, "r", encoding="utf-8") as f:
+                raw = f.read().strip()
+                if len(raw) >= 32:
+                    _AUTH_SECRET_CACHE = raw.encode("utf-8")
+                    return _AUTH_SECRET_CACHE
+        generated = secrets.token_hex(32)
+        with open(secret_path, "w", encoding="utf-8") as f:
+            f.write(generated)
+        try:
+            os.chmod(secret_path, 0o600)
+        except OSError:
+            pass
+        _AUTH_SECRET_CACHE = generated.encode("utf-8")
+        return _AUTH_SECRET_CACHE
+    except OSError:
+        _AUTH_SECRET_CACHE = b"pqc-workspace-fallback-hmac-key-2026"
+        return _AUTH_SECRET_CACHE
+
+
+def infer_region_from_timezone(timezone_str: Optional[str] = None, explicit_region: Optional[str] = None) -> str:
+    """Normalizes an explicit region ('NorthAm', 'EMEA', 'India', 'APAC', 'LATAM') or infers it from IANA timezone."""
+    if explicit_region:
+        clean_r = str(explicit_region).strip().lower()
+        if clean_r in VALID_REGION_IDS:
+            return VALID_REGION_IDS[clean_r]
+        if clean_r in ("us", "usa", "na", "namer", "north america", "northam"):
+            return "NorthAm"
+        if clean_r in ("eu", "europe", "uk", "mea", "emea"):
+            return "EMEA"
+        if clean_r in ("in", "ind", "india", "bengaluru", "hyderabad", "mumbai"):
+            return "India"
+        if clean_r in ("apac", "japa", "asia", "au", "sg", "jp", "kr"):
+            return "APAC"
+        if clean_r in ("latam", "br", "brazil", "mx", "ar", "co", "cl"):
+            return "LATAM"
+
+    tz = (timezone_str or "").strip()
+    tz_lower = tz.lower()
+    if any(k in tz_lower for k in ("kolkata", "calcutta", "mumbai", "chennai", "delhi", "colombo")):
+        return "India"
+    if tz_lower.startswith(("europe/", "africa/", "atlantic/")) or any(
+        k in tz_lower for k in ("dubai", "riyadh", "jerusalem", "tel_aviv", "istanbul", "cairo", "johannesburg")
+    ):
+        return "EMEA"
+    if tz_lower.startswith(("asia/", "australia/", "pacific/")):
+        return "APAC"
+    if any(
+        k in tz_lower
+        for k in (
+            "sao_paulo",
+            "buenos_aires",
+            "santiago",
+            "bogota",
+            "lima",
+            "mexico",
+            "montevideo",
+            "caracas",
+            "recife",
+            "fortaleza",
+            "manaus",
+        )
+    ):
+        return "LATAM"
+    return "NorthAm"
+
+
+def is_allowed_corporate_email(email: str) -> Tuple[bool, str]:
+    """Validates that an email belongs to @google.com (or an explicitly configured corporate domain)."""
+    clean = normalize_user_id(email)
+    if "@" not in clean:
+        return False, "Please provide a valid corporate email address (e.g., username@google.com)."
+    local_part, domain = clean.rsplit("@", 1)
+    if not local_part or not domain:
+        return False, "Invalid email address format."
+    if domain not in ALLOWED_AUTH_DOMAINS:
+        allowed_str = ", ".join(f"@{d}" for d in ALLOWED_AUTH_DOMAINS)
+        return False, f"Access restricted to authorized corporate accounts ({allowed_str}). '{clean}' is not permitted."
+    return True, clean
+
+
+def _format_display_name(email: str, provided_name: Optional[str] = None) -> str:
+    if provided_name and str(provided_name).strip():
+        return str(provided_name).strip()
+    local = email.split("@", 1)[0]
+    parts = [p.capitalize() for p in local.replace("_", ".").replace("-", ".").split(".") if p]
+    return " ".join(parts) if parts else local
+
+
+def sign_tenant_session_token(user_profile: Dict[str, Any]) -> str:
+    """Creates an HMAC-SHA256 signed session token encoding the authenticated @google.com user profile."""
+    now_ts = int(time.time())
+    payload = {
+        "uid": normalize_user_id(user_profile["email"]),
+        "email": normalize_user_id(user_profile["email"]),
+        "name": user_profile.get("name") or _format_display_name(user_profile["email"]),
+        "region": user_profile.get("region") or "NorthAm",
+        "auth_method": user_profile.get("auth_method") or "google_workspace_signin",
+        "iat": now_ts,
+        "exp": now_ts + SESSION_TOKEN_TTL_SECONDS,
+    }
+    raw_bytes = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    b64_payload = base64.urlsafe_b64encode(raw_bytes).decode("ascii").rstrip("=")
+    sig = hmac.new(_get_auth_secret(), b64_payload.encode("ascii"), hashlib.sha256).hexdigest()
+    return f"{b64_payload}.{sig}"
+
+
+def verify_tenant_session_token(token: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Verifies an HMAC-SHA256 signed session token and returns its decoded payload if valid and unexpired."""
+    if not token or "." not in str(token):
+        return None
+    raw = str(token).strip()
+    if raw.lower().startswith("bearer "):
+        raw = raw[7:].strip()
+    parts = raw.split(".", 1)
+    if len(parts) != 2:
+        return None
+    b64_payload, provided_sig = parts
+    expected_sig = hmac.new(_get_auth_secret(), b64_payload.encode("ascii"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(provided_sig, expected_sig):
+        return None
+    try:
+        padding = "=" * (-len(b64_payload) % 4)
+        decoded = json.loads(base64.urlsafe_b64decode(b64_payload + padding).decode("utf-8"))
+        if int(decoded.get("exp", 0)) < int(time.time()):
+            return None
+        email = normalize_user_id(decoded.get("email") or decoded.get("uid"))
+        ok, _ = is_allowed_corporate_email(email)
+        if not ok:
+            return None
+        return decoded
+    except Exception:
+        return None
+
+
+def _verify_google_oauth_or_id_token(
+    id_token_jwt: Optional[str] = None,
+    google_access_token: Optional[str] = None,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Verifies a Google Identity Services ID token (JWT) or Google OAuth access token via Google's tokeninfo/userinfo APIs."""
+    if id_token_jwt:
+        tok = id_token_jwt.strip()
+        try:
+            url = f"https://oauth2.googleapis.com/tokeninfo?id_token={urllib.parse.quote(tok)}"
+            req = urllib.request.Request(url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                info = json.loads(resp.read().decode("utf-8"))
+            email = normalize_user_id(info.get("email"))
+            if not email or info.get("email_verified") not in (True, "true", "True", "1"):
+                return None, "Google ID token does not contain a verified email address."
+            ok, msg = is_allowed_corporate_email(email)
+            if not ok:
+                return None, msg
+            return {
+                "email": email,
+                "name": info.get("name") or _format_display_name(email),
+                "picture": info.get("picture") or "",
+                "hd": info.get("hd") or email.split("@")[-1],
+                "auth_method": "google_id_token",
+            }, None
+        except Exception as exc:
+            return None, f"Google ID token verification failed: {exc}"
+
+    if google_access_token:
+        tok = google_access_token.strip()
+        if tok.lower().startswith("bearer "):
+            tok = tok[7:].strip()
+        try:
+            url = f"https://oauth2.googleapis.com/tokeninfo?access_token={urllib.parse.quote(tok)}"
+            req = urllib.request.Request(url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                info = json.loads(resp.read().decode("utf-8"))
+            email = normalize_user_id(info.get("email"))
+            if not email:
+                return None, "Google access token did not return a user email scope."
+            ok, msg = is_allowed_corporate_email(email)
+            if not ok:
+                return None, msg
+            return {
+                "email": email,
+                "name": _format_display_name(email),
+                "picture": "",
+                "hd": email.split("@")[-1],
+                "auth_method": "google_access_token",
+            }, None
+        except Exception as exc:
+            return None, f"Google OAuth access token verification failed: {exc}"
+
+    return None, "No token provided."
+
+
+def upsert_tenant_user_profile(
+    email: str,
+    name: Optional[str] = None,
+    region: Optional[str] = None,
+    timezone_str: Optional[str] = None,
+    auth_method: str = "google_workspace_signin",
+    picture: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Creates or updates a persistent @google.com tenant user profile in `/data/pqc_tenant_users.json`."""
+    clean_email = normalize_user_id(email)
+    users_map = _load_tenant_users_map()
+    existing = users_map.get(clean_email, {})
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    resolved_region = infer_region_from_timezone(
+        timezone_str=timezone_str or existing.get("timezone"),
+        explicit_region=region or existing.get("region"),
+    )
+    resolved_name = _format_display_name(clean_email, name or existing.get("name"))
+    domain = clean_email.split("@", 1)[-1] if "@" in clean_email else "google.com"
+
+    profile = {
+        "user_id": clean_email,
+        "email": clean_email,
+        "name": resolved_name,
+        "domain": domain,
+        "region": resolved_region,
+        "timezone": timezone_str or existing.get("timezone") or "UTC",
+        "auth_method": auth_method or existing.get("auth_method") or "google_workspace_signin",
+        "picture": picture if picture is not None else existing.get("picture", ""),
+        "created_at": existing.get("created_at") or now_iso,
+        "last_login_at": now_iso,
+    }
+    users_map[clean_email] = profile
+    _save_tenant_users_map(users_map)
+    return profile
+
+
+def resolve_authenticated_tenant_from_request(request: Request) -> Tuple[Optional[Dict[str, Any]], bool]:
+    """Inspects Cloud IAP headers, Bearer/X-PQC-User-Token headers, and cookies for an authenticated @google.com user.
+
+    Returns:
+        (user_profile_or_None, iap_active_bool)
+    """
+    # 1. Check Cloud Identity-Aware Proxy (IAP) header first
+    iap_email_raw = (request.headers.get("X-Goog-Authenticated-User-Email") or "").strip()
+    if iap_email_raw:
+        clean_iap_email = normalize_user_id(iap_email_raw)
+        ok, _ = is_allowed_corporate_email(clean_iap_email)
+        if ok:
+            profile = upsert_tenant_user_profile(
+                email=clean_iap_email,
+                region=request.headers.get("X-PQC-User-Region"),
+                timezone_str=request.headers.get("X-PQC-User-Timezone"),
+                auth_method="cloud_iap",
+            )
+            return profile, True
+
+    # 2. Check signed session token in X-PQC-User-Token, Authorization Bearer, or Cookie
+    candidate_token = (
+        request.headers.get("X-PQC-User-Token")
+        or request.headers.get("Authorization")
+        or request.cookies.get(SESSION_COOKIE_NAME)
+    )
+    decoded = verify_tenant_session_token(candidate_token)
+    if decoded:
+        email = normalize_user_id(decoded.get("email") or decoded.get("uid"))
+        users_map = _load_tenant_users_map()
+        profile = users_map.get(email)
+        if not profile:
+            profile = upsert_tenant_user_profile(
+                email=email,
+                name=decoded.get("name"),
+                region=decoded.get("region"),
+                auth_method=decoded.get("auth_method", "google_workspace_signin"),
+            )
+        return profile, False
+
+    return None, False
+
+
+def activate_request_tenant_user(request: Request, explicit_user_id: Optional[str] = None) -> str:
+    """Resolves the active user_id for a request and binds it to the current execution context (`ContextVar`)."""
+    auth_profile, _ = resolve_authenticated_tenant_from_request(request)
+    header_uid = (request.headers.get("X-PQC-User-Id") or "").strip()
+
+    # If the request has an authenticated @google.com session and the caller didn't pass a custom non-default user_id
+    if auth_profile and (not explicit_user_id or explicit_user_id == DEFAULT_USER_ID):
+        resolved = auth_profile["user_id"]
+    elif explicit_user_id and explicit_user_id != DEFAULT_USER_ID:
+        resolved = normalize_user_id(explicit_user_id)
+    elif header_uid and header_uid != DEFAULT_USER_ID:
+        resolved = normalize_user_id(header_uid)
+    elif auth_profile:
+        resolved = auth_profile["user_id"]
+    else:
+        resolved = normalize_user_id(explicit_user_id or DEFAULT_USER_ID)
+
+    set_current_tenant_user(resolved)
+    return resolved
+
+
+class GoogleAuthSignInPayload(BaseModel):
+    email: Optional[str] = None
+    name: Optional[str] = None
+    region: Optional[str] = None
+    timezone: Optional[str] = None
+    credential: Optional[str] = None  # Google Identity Services JWT id_token
+    id_token: Optional[str] = None
+    google_access_token: Optional[str] = None
+    use_token_for_gcp_connection: bool = False
+
+
 class CreateSessionPayload(BaseModel):
     user_id: str = DEFAULT_USER_ID
     title: Optional[str] = None
-    scope: Optional[str] = "organizations/31564119954"
+    scope: Optional[str] = None
     session_id: Optional[str] = None
 
 
 class ConnectionConfigPayload(BaseModel):
+    user_id: Optional[str] = None
     mode: Optional[str] = None
     organization_id: Optional[str] = None
     project_id: Optional[str] = None
@@ -253,6 +634,7 @@ class ConnectionConfigPayload(BaseModel):
 
 class GcloudCommandPayload(BaseModel):
     command: str
+    user_id: Optional[str] = None
 
 
 def _guess_gemini_mime_type(filename: str, declared_mime: Optional[str]) -> Tuple[str, bool]:
@@ -504,16 +886,20 @@ def create_workspace_app(
         return registry_obj.catalog()
 
     @app.get("/api/health")
-    async def api_health() -> Dict[str, Any]:
+    async def api_health(request: Request) -> Dict[str, Any]:
+        uid = activate_request_tenant_user(request)
         catalog = registry_obj.catalog()
         return {
             "status": "HEALTHY",
             "app_name": APP_NAME,
+            "multi_tenant_enabled": True,
+            "supported_regions": [r["id"] for r in SUPPORTED_REGIONS],
+            "allowed_auth_domains": list(ALLOWED_AUTH_DOMAINS),
             "session_service": type(session_service).__name__,
             "session_db_url": resolved_db_url,
             "artifact_service": type(artifact_service).__name__,
             "artifact_bucket": f"gs://{resolved_bucket}",
-            "connection": get_gcp_connection_config(mask_token=True),
+            "connection": get_gcp_connection_config(mask_token=True, user_id=uid),
             "simulation_mode": os.getenv("PQC_SIMULATION_MODE", "FALSE"),
             "verified_models": [m["id"] for m in catalog["models"]],
             "model_verification": catalog["verification"],
@@ -522,14 +908,144 @@ def create_workspace_app(
         }
 
     # =========================================================================
+    # Multi-Tenant @google.com Authentication & Regional Profile (/api/auth/*)
+    # =========================================================================
+
+    @app.get("/api/auth/me")
+    async def auth_me(request: Request) -> Dict[str, Any]:
+        profile, iap_active = resolve_authenticated_tenant_from_request(request)
+        uid = profile["user_id"] if profile else DEFAULT_USER_ID
+        set_current_tenant_user(uid)
+        conn = get_gcp_connection_config(mask_token=True, user_id=uid)
+        session_count = 0
+        if profile:
+            try:
+                sess_resp = await session_service.list_sessions(app_name=APP_NAME, user_id=uid)
+                session_count = len(sess_resp.sessions)
+            except Exception:
+                session_count = 0
+        return {
+            "authenticated": profile is not None,
+            "iap_active": iap_active,
+            "google_oauth_client_id": os.getenv("GOOGLE_OAUTH_CLIENT_ID", ""),
+            "allowed_domains": list(ALLOWED_AUTH_DOMAINS),
+            "supported_regions": SUPPORTED_REGIONS,
+            "user": profile,
+            "user_id": uid,
+            "session_count": session_count,
+            "connection": conn,
+        }
+
+    @app.post("/api/auth/google")
+    async def auth_google_signin(request: Request, payload: GoogleAuthSignInPayload) -> JSONResponse:
+        """Authenticates a @google.com user (via ID token, OAuth token, or Google Workspace corporate sign-in),
+        persists their regional profile in `/data/pqc_tenant_users.json`, and sets a 30-day signed session cookie.
+        """
+        verified_info: Optional[Dict[str, Any]] = None
+        id_jwt = payload.credential or payload.id_token
+        if id_jwt or payload.google_access_token:
+            verified_info, err_msg = await asyncio.to_thread(
+                _verify_google_oauth_or_id_token,
+                id_jwt,
+                payload.google_access_token,
+            )
+            if not verified_info:
+                raise HTTPException(status_code=401, detail=err_msg or "Google token verification failed.")
+            target_email = verified_info["email"]
+            display_name = payload.name or verified_info.get("name")
+            auth_method = verified_info.get("auth_method", "google_id_token")
+            picture = verified_info.get("picture", "")
+        else:
+            raw_email = (payload.email or "").strip()
+            ok, validated_or_err = is_allowed_corporate_email(raw_email)
+            if not ok:
+                raise HTTPException(status_code=403, detail=validated_or_err)
+            target_email = validated_or_err
+            display_name = payload.name
+            auth_method = "google_workspace_signin"
+            picture = None
+
+        profile = upsert_tenant_user_profile(
+            email=target_email,
+            name=display_name,
+            region=payload.region,
+            timezone_str=payload.timezone,
+            auth_method=auth_method,
+            picture=picture,
+        )
+        uid = profile["user_id"]
+        set_current_tenant_user(uid)
+
+        # If the user signed in with a Google OAuth token and asked to use it for their GCP connection, bind it to their isolated state
+        if payload.google_access_token and payload.use_token_for_gcp_connection:
+            set_gcp_connection_config(
+                mode="access_token",
+                access_token=payload.google_access_token,
+                user_id=uid,
+            )
+
+        signed_token = sign_tenant_session_token(profile)
+        conn = get_gcp_connection_config(mask_token=True, user_id=uid)
+        sess_resp = await session_service.list_sessions(app_name=APP_NAME, user_id=uid)
+
+        resp = JSONResponse(
+            content={
+                "authenticated": True,
+                "user": profile,
+                "user_id": uid,
+                "token": signed_token,
+                "session_count": len(sess_resp.sessions),
+                "connection": conn,
+                "supported_regions": SUPPORTED_REGIONS,
+            }
+        )
+        is_https = (request.headers.get("x-forwarded-proto") or request.url.scheme) == "https"
+        resp.set_cookie(
+            key=SESSION_COOKIE_NAME,
+            value=signed_token,
+            max_age=SESSION_TOKEN_TTL_SECONDS,
+            httponly=True,
+            samesite="lax",
+            secure=is_https,
+            path="/",
+        )
+        return resp
+
+    @app.post("/api/auth/logout")
+    async def auth_logout() -> JSONResponse:
+        resp = JSONResponse(content={"authenticated": False, "status": "logged_out"})
+        resp.delete_cookie(key=SESSION_COOKIE_NAME, path="/")
+        return resp
+
+    @app.get("/api/auth/tenants")
+    async def list_registered_tenants() -> Dict[str, Any]:
+        users_map = _load_tenant_users_map()
+        tenants = sorted(
+            users_map.values(),
+            key=lambda u: u.get("last_login_at", ""),
+            reverse=True,
+        )
+        by_region: Dict[str, int] = {}
+        for t in tenants:
+            reg = t.get("region", "NorthAm")
+            by_region[reg] = by_region.get(reg, 0) + 1
+        return {
+            "total_tenants": len(tenants),
+            "by_region": by_region,
+            "tenants": tenants,
+        }
+
+    # =========================================================================
     # Persistent conversation history (/api/sessions)
     # =========================================================================
 
     @app.get("/api/sessions")
     async def list_persistent_sessions(
-        user_id: str = Query(default=DEFAULT_USER_ID, description="User identifier"),
+        request: Request,
+        user_id: Optional[str] = Query(default=None, description="User identifier"),
     ) -> Dict[str, Any]:
-        resp = await session_service.list_sessions(app_name=APP_NAME, user_id=user_id)
+        resolved_uid = activate_request_tenant_user(request, explicit_user_id=user_id)
+        resp = await session_service.list_sessions(app_name=APP_NAME, user_id=resolved_uid)
         meta_map = _load_session_metadata_map()
         items: List[Dict[str, Any]] = []
         for s in resp.sessions:
@@ -561,14 +1077,18 @@ def create_workspace_app(
                 }
             )
         items.sort(key=lambda x: x["timestamp"], reverse=True)
-        return {"user_id": user_id, "total": len(items), "total_sessions": len(items), "sessions": items}
+        return {"user_id": resolved_uid, "total": len(items), "total_sessions": len(items), "sessions": items}
 
     @app.post("/api/sessions")
-    async def create_persistent_session(payload: Optional[CreateSessionPayload] = None) -> Dict[str, Any]:
+    async def create_persistent_session(
+        request: Request,
+        payload: Optional[CreateSessionPayload] = None,
+    ) -> Dict[str, Any]:
         req = payload or CreateSessionPayload()
-        user_id = (req.user_id or DEFAULT_USER_ID).strip()
+        user_id = activate_request_tenant_user(request, explicit_user_id=req.user_id)
         title = (req.title or "New PQC Assessment").strip()
-        scope = (req.scope or "organizations/31564119954").strip()
+        conn_org = get_gcp_connection_config(mask_token=True, user_id=user_id).get("organization_id", "31564119954")
+        scope = (req.scope or f"organizations/{conn_org}").strip()
         now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
         session = await session_service.create_session(
             app_name=APP_NAME,
@@ -601,20 +1121,29 @@ def create_workspace_app(
         }
 
     async def _locate_session(session_id: str, user_id: Optional[str] = None) -> Tuple[Optional[Any], str]:
-        candidate_user = (user_id or DEFAULT_USER_ID).strip()
+        candidate_user = normalize_user_id(user_id or DEFAULT_USER_ID)
         sess = await session_service.get_session(app_name=APP_NAME, user_id=candidate_user, session_id=session_id)
         if sess is not None:
             return sess, candidate_user
+        # Strict multi-tenant boundary: if candidate_user is an authenticated corporate email (@google.com),
+        # never fall back to scanning other users' sessions!
+        if "@" in candidate_user:
+            return None, candidate_user
         all_resp = await session_service.list_sessions(app_name=APP_NAME, user_id=None)
         for s in all_resp.sessions:
-            if s.id == session_id:
+            if s.id == session_id and "@" not in str(s.user_id):
                 found = await session_service.get_session(app_name=APP_NAME, user_id=s.user_id, session_id=session_id)
                 return found, s.user_id
         return None, candidate_user
 
     @app.get("/api/sessions/{session_id}")
-    async def get_persistent_session_detail(session_id: str, user_id: Optional[str] = Query(default=None)) -> Dict[str, Any]:
-        sess, resolved_user = await _locate_session(session_id, user_id)
+    async def get_persistent_session_detail(
+        request: Request,
+        session_id: str,
+        user_id: Optional[str] = Query(default=None),
+    ) -> Dict[str, Any]:
+        active_uid = activate_request_tenant_user(request, explicit_user_id=user_id)
+        sess, resolved_user = await _locate_session(session_id, active_uid)
         if sess is None:
             raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
         extra = _load_session_metadata_map().get(session_id, {})
@@ -648,8 +1177,13 @@ def create_workspace_app(
         }
 
     @app.delete("/api/sessions/{session_id}")
-    async def delete_persistent_session(session_id: str, user_id: Optional[str] = Query(default=None)) -> Dict[str, Any]:
-        sess, resolved_user = await _locate_session(session_id, user_id)
+    async def delete_persistent_session(
+        request: Request,
+        session_id: str,
+        user_id: Optional[str] = Query(default=None),
+    ) -> Dict[str, Any]:
+        active_uid = activate_request_tenant_user(request, explicit_user_id=user_id)
+        sess, resolved_user = await _locate_session(session_id, active_uid)
         if sess is None:
             raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
         await session_service.delete_session(app_name=APP_NAME, user_id=resolved_user, session_id=session_id)
@@ -695,6 +1229,8 @@ def create_workspace_app(
             impersonated_sa = body_json.get("impersonated_sa") or impersonated_sa
             access_token = body_json.get("access_token") or access_token
 
+        user_id = activate_request_tenant_user(request, explicit_user_id=user_id)
+
         requested_model = model or model_id
         entry = await asyncio.to_thread(registry_obj.resolve, requested_model)
         if entry is None:
@@ -718,7 +1254,12 @@ def create_workspace_app(
         model_label = f"{entry['label']} {entry.get('tier', '')}".strip()
 
         if any(x is not None for x in (connection_mode, impersonated_sa, access_token)):
-            set_gcp_connection_config(mode=connection_mode, impersonated_service_account=impersonated_sa, access_token=access_token)
+            set_gcp_connection_config(
+                mode=connection_mode,
+                impersonated_service_account=impersonated_sa,
+                access_token=access_token,
+                user_id=user_id,
+            )
 
         user_text = (message or prompt or "").strip()
         uploaded_files = [f for f in (files or []) if f and f.filename]
@@ -730,6 +1271,7 @@ def create_workspace_app(
         sess = None
         if session_id:
             sess, user_id = await _locate_session(session_id, user_id)
+            set_current_tenant_user(user_id)
         if sess is None:
             sess = await session_service.create_session(
                 app_name=APP_NAME,
@@ -874,21 +1416,29 @@ def create_workspace_app(
             "uploaded_artifacts": saved_artifacts_meta,
             "tool_calls": tool_calls_trace,
             "tool_traces": tool_calls_trace,
-            "connection": get_gcp_connection_config(mask_token=True),
+            "connection": get_gcp_connection_config(mask_token=True, user_id=user_id),
             "updated_at": now_iso,
         }
         return JSONResponse(status_code=200 if status == "OK" else 502, content=payload)
 
     # =========================================================================
-    # gcloud CLI and dynamic credential bridge
+    # gcloud CLI and dynamic credential bridge (isolated per tenant user)
     # =========================================================================
 
     @app.get("/api/connection")
-    async def get_connection_endpoint() -> Dict[str, Any]:
-        return get_gcp_connection_config(mask_token=True)
+    async def get_connection_endpoint(
+        request: Request,
+        user_id: Optional[str] = Query(default=None),
+    ) -> Dict[str, Any]:
+        uid = activate_request_tenant_user(request, explicit_user_id=user_id)
+        return get_gcp_connection_config(mask_token=True, user_id=uid)
 
     @app.post("/api/connection")
-    async def update_connection_endpoint(payload: ConnectionConfigPayload) -> Dict[str, Any]:
+    async def update_connection_endpoint(
+        request: Request,
+        payload: ConnectionConfigPayload,
+    ) -> Dict[str, Any]:
+        uid = activate_request_tenant_user(request, explicit_user_id=payload.user_id)
         return set_gcp_connection_config(
             mode=payload.mode,
             organization_id=payload.organization_id,
@@ -896,15 +1446,25 @@ def create_workspace_app(
             location=payload.location,
             impersonated_service_account=payload.impersonated_service_account,
             access_token=payload.access_token,
+            user_id=uid,
         )
 
     @app.post("/api/gcloud")
-    async def execute_gcloud_endpoint(payload: GcloudCommandPayload) -> JSONResponse:
+    async def execute_gcloud_endpoint(
+        request: Request,
+        payload: GcloudCommandPayload,
+    ) -> JSONResponse:
+        activate_request_tenant_user(request, explicit_user_id=payload.user_id)
         return JSONResponse(content=json.loads(execute_gcloud_command(payload.command)))
 
     @app.get("/api/gcloud/traces")
-    async def list_gcloud_traces_endpoint() -> Dict[str, Any]:
-        return {"traces": get_recent_gcloud_traces()}
+    async def list_gcloud_traces_endpoint(
+        request: Request,
+        user_id: Optional[str] = Query(default=None),
+    ) -> Dict[str, Any]:
+        uid = activate_request_tenant_user(request, explicit_user_id=user_id)
+        filter_uid = uid if "@" in uid else user_id
+        return {"user_id": uid, "traces": get_recent_gcloud_traces(user_id=filter_uid)}
 
     return app
 

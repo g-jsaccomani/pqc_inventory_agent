@@ -200,15 +200,33 @@ def _get_client_kwargs() -> Dict[str, Any]:
     return {}
 
 
+def _cache_scope_prefix() -> str:
+    """Returns a cache key prefix isolating non-default credential modes per tenant user."""
+    try:
+        from tools.gcloud_bridge import get_gcp_connection_config
+
+        cfg = get_gcp_connection_config(mask_token=True)
+        mode = cfg.get("mode", "adc")
+        if mode == "impersonation":
+            return f"imp:{cfg.get('impersonated_service_account', '')}"
+        if mode == "access_token":
+            return f"tok:{cfg.get('user_id', '')}:{cfg.get('access_token_preview', '')}"
+    except Exception:
+        pass
+    return "adc"
+
+
 def _cache_get(key: str) -> Optional[str]:
-    cached = _SCAN_CACHE.get(key)
+    scoped_key = f"{_cache_scope_prefix()}:{key}"
+    cached = _SCAN_CACHE.get(scoped_key)
     if cached and (time.monotonic() - cached[0]) < _CACHE_TTL_SECONDS:
         return cached[1]
     return None
 
 
 def _cache_put(key: str, value: str) -> str:
-    _SCAN_CACHE[key] = (time.monotonic(), value)
+    scoped_key = f"{_cache_scope_prefix()}:{key}"
+    _SCAN_CACHE[scoped_key] = (time.monotonic(), value)
     return value
 
 
@@ -235,15 +253,29 @@ def _is_internal_runtime_tenant_project(proj_id: str) -> bool:
     return bool(re.match(r"^project-[0-9a-f]{6,}-[0-9a-f]{4}-", clean))
 
 
+def _active_tenant_org_id() -> str:
+    """Returns the active tenant user's configured Organization ID, falling back to DEFAULT_ORGANIZATION_ID."""
+    try:
+        from tools.gcloud_bridge import get_gcp_connection_config
+
+        org = (get_gcp_connection_config(mask_token=True).get("organization_id") or "").strip()
+        if org:
+            return org.replace("organizations/", "")
+    except Exception:
+        pass
+    return DEFAULT_ORGANIZATION_ID
+
+
 def _resolve_scope(target: Optional[str] = None) -> Tuple[str, str, str]:
     """Resolves the requested scope into (mode, scope_uri, clean_id)."""
     raw = (target or "").strip()
     lower = raw.lower()
+    active_org = _active_tenant_org_id()
 
     if lower in ORG_MODE_TOKENS:
-        return ("ORG", f"organizations/{DEFAULT_ORGANIZATION_ID}", DEFAULT_ORGANIZATION_ID)
+        return ("ORG", f"organizations/{active_org}", active_org)
     if lower.startswith("organizations/"):
-        org_id = raw.split("/", 1)[1].strip() or DEFAULT_ORGANIZATION_ID
+        org_id = raw.split("/", 1)[1].strip() or active_org
         return ("ORG", f"organizations/{org_id}", org_id)
     if raw.isdigit() and len(raw) >= 8:
         return ("ORG", f"organizations/{raw}", raw)
@@ -254,7 +286,7 @@ def _resolve_scope(target: Optional[str] = None) -> Tuple[str, str, str]:
     proj_id = raw.split("/", 1)[1].strip() if lower.startswith("projects/") else raw
     if _is_internal_runtime_tenant_project(proj_id):
         logger.info("Redirecting internal runtime tenant project '%s' to the configured organization.", proj_id)
-        return ("ORG", f"organizations/{DEFAULT_ORGANIZATION_ID}", DEFAULT_ORGANIZATION_ID)
+        return ("ORG", f"organizations/{active_org}", active_org)
     return ("PROJECT", f"projects/{proj_id}", proj_id)
 
 
