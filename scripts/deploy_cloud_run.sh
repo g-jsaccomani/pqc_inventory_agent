@@ -11,6 +11,10 @@ LOCATION="${2:-us-central1}"
 SERVICE_NAME="${3:-pqc-inventory-agent}"
 BUCKET_NAME="${PROJECT_ID}-pqc-agent-staging"
 
+if [[ -z "${CLOUDSDK_PYTHON:-}" && -x "$(pwd)/.venv/bin/python" ]]; then
+  export CLOUDSDK_PYTHON="$(pwd)/.venv/bin/python"
+fi
+
 echo "=================================================================="
 echo "🚀 Deploying ${SERVICE_NAME} to Cloud Run (${LOCATION})"
 echo "   Project      : ${PROJECT_ID}"
