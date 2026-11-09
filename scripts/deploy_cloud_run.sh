@@ -24,6 +24,7 @@ unset CLOUDSDK_CONTEXT_AWARE_USE_ECP_HTTP_PROXY
 unset CLOUDSDK_CONTEXT_AWARE_USE_MTLS_FOR_GRPC
 unset CLOUDSDK_CONTEXT_AWARE_CERTIFICATE_CONFIG_FILE_PATH
 unset GOOGLE_API_CERTIFICATE_CONFIG
+unset GOOGLE_AUTH_WEBAUTHN_PLUGIN
 
 export CLOUDSDK_CONFIG="${CLOUDSDK_CONFIG:-$HOME/.config/gcloud-argolis}"
 mkdir -p "${CLOUDSDK_CONFIG}"
@@ -40,7 +41,9 @@ fi
 
 if [[ "${TOKEN_EMAIL}" != "${ARGOLIS_ACCOUNT}" ]]; then
   echo "⚠️  Active token is '${TOKEN_EMAIL:-expired/missing}' (expected '${ARGOLIS_ACCOUNT}')."
-  echo "👉 Opening clean Argolis login (--no-launch-browser so you can open the link in your Argolis Chrome profile)..."
+  rm -f "${CLOUDSDK_CONFIG}/credentials.db" "${CLOUDSDK_CONFIG}/access_tokens.db"
+  rm -rf "${CLOUDSDK_CONFIG}/legacy_credentials/${ARGOLIS_ACCOUNT}"
+  echo "👉 Open the URL below in your Argolis Chrome window (${ARGOLIS_ACCOUNT}) and paste the verification code:"
   gcloud auth login "${ARGOLIS_ACCOUNT}" --no-launch-browser
 fi
 
