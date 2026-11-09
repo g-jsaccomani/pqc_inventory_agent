@@ -1196,6 +1196,89 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       color: #f6aea9;
       font-size: 12px;
     }
+
+    /* ADK ToolContext 3-Legged OAuth (3LO) In-Chat Consent Card */
+    .oauth-consent-card {
+      margin-top: 12px;
+      border-radius: 14px;
+      border: 1px solid rgba(76, 141, 246, 0.42);
+      background: linear-gradient(180deg, rgba(26, 115, 232, 0.11) 0%, rgba(19, 20, 21, 0.92) 100%);
+      padding: 16px 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 11px;
+    }
+
+    .oauth-consent-card.authorized {
+      border-color: rgba(129, 201, 149, 0.48);
+      background: linear-gradient(180deg, rgba(52, 168, 83, 0.12) 0%, rgba(19, 20, 21, 0.92) 100%);
+    }
+
+    .oauth-consent-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .oauth-consent-title {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      font-size: 13.5px;
+      font-weight: 600;
+      color: #f8fafc;
+    }
+
+    .oauth-consent-pill {
+      font-size: 10.5px;
+      font-weight: 600;
+      padding: 2px 9px;
+      border-radius: 999px;
+      background: rgba(76, 141, 246, 0.18);
+      border: 1px solid rgba(76, 141, 246, 0.4);
+      color: #8ab4f8;
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    .oauth-consent-scopes {
+      background: rgba(0, 0, 0, 0.35);
+      border: 1px solid var(--border-subtle);
+      border-radius: 10px;
+      padding: 9px 12px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11.5px;
+      color: var(--text-secondary);
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .oauth-consent-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .btn-oauth-popup {
+      padding: 8px 14px;
+      border-radius: 999px;
+      border: none;
+      background: #4285F4;
+      color: #ffffff;
+      font-size: 12.5px;
+      font-weight: 600;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+    }
+
+    .btn-oauth-popup:hover {
+      background: #3b78e7;
+    }
   </style>
 </head>
 <body>
@@ -1475,7 +1558,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
             <select id="conn-mode-select" onchange="toggleConnectionModeFields()">
               <option value="adc">Service Account (Default ADC)</option>
               <option value="impersonation">Service Account Impersonation</option>
-              <option value="access_token">User gcloud Access Token</option>
+              <option value="access_token">OAuth 2.0 (3LO — Act on behalf of User)</option>
             </select>
           </div>
           <div class="conn-field">
@@ -1495,8 +1578,13 @@ PORTAL_HTML = r"""<!DOCTYPE html>
         </div>
 
         <div class="conn-field" id="conn-token-group" style="display: none;">
-          <label for="conn-token-input">Access Token</label>
-          <input type="password" id="conn-token-input" placeholder="gcloud auth print-access-token" />
+          <label for="conn-token-input">Delegated User OAuth 2.0 Access Token (Optional — leave blank to trigger In-Chat ADK Consent Card)</label>
+          <div style="display:flex;gap:8px;">
+            <input type="password" id="conn-token-input" placeholder="Leave blank for In-Chat Consent Card, or paste ya29... token" />
+            <button type="button" class="btn-oauth-popup" onclick="openOAuth3LOPopup()" style="white-space:nowrap;">
+              Authorize (OAuth 2.0)
+            </button>
+          </div>
         </div>
 
         <div style="display:flex;justify-content:flex-end;">
@@ -1941,7 +2029,12 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     }
 
     function updateHeaderConnectionBadge(cfg) {
-      const modeShort = cfg.mode === "impersonation" ? "Impersonated SA" : (cfg.mode === "access_token" ? "Token" : "ADC");
+      let modeShort = "ADC";
+      if (cfg.mode === "impersonation") {
+        modeShort = "Impersonated SA";
+      } else if (cfg.mode === "access_token") {
+        modeShort = cfg.has_access_token ? "OAuth 3LO ✓" : "OAuth 3LO (Consent On-Demand)";
+      }
       document.getElementById("header-conn-text").textContent = `Org ${cfg.organization_id} • ${modeShort}`;
       const sidebarSummary = document.getElementById("sidebar-conn-summary");
       if (sidebarSummary) {
@@ -1950,13 +2043,15 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     }
 
     async function saveConnectionConfig() {
+      const selectedMode = document.getElementById("conn-mode-select").value;
+      const rawTok = document.getElementById("conn-token-input").value.trim();
       const payload = {
         user_id: currentUserId,
-        mode: document.getElementById("conn-mode-select").value,
+        mode: selectedMode,
         organization_id: document.getElementById("conn-org-input").value.trim(),
         project_id: document.getElementById("conn-proj-input").value.trim(),
         impersonated_service_account: document.getElementById("conn-sa-input").value.trim(),
-        access_token: document.getElementById("conn-token-input").value.trim() || undefined,
+        access_token: selectedMode === "access_token" ? rawTok : (rawTok || undefined),
       };
       const res = await fetch("/api/connection", {
         method: "POST",
@@ -1967,7 +2062,137 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       if (res.ok) {
         const updated = await res.json();
         updateHeaderConnectionBadge(updated);
+        closeGcloudModal();
       }
+    }
+
+    let activeOAuthConsentCardId = null;
+    let activeOAuthResumePrompt = "";
+
+    function openOAuth3LOPopup(customAuthUri, cardDomId, resumePrompt) {
+      if (cardDomId) activeOAuthConsentCardId = cardDomId;
+      if (resumePrompt) activeOAuthResumePrompt = resumePrompt;
+      const orgId = (document.getElementById("conn-org-input").value || "31564119954").trim();
+      const targetUri = customAuthUri || `/api/auth/oauth/authorize?user_id=${encodeURIComponent(currentUserId)}&session_id=${encodeURIComponent(currentSessionId || "")}&scope=${encodeURIComponent("organizations/" + orgId.replace("organizations/", ""))}`;
+      const w = 520, h = 640;
+      const left = Math.max(0, Math.round((window.screen.width - w) / 2));
+      const top = Math.max(0, Math.round((window.screen.height - h) / 2));
+      window.open(targetUri, "pqc_oauth_3lo_popup", `width=${w},height=${h},left=${left},top=${top},resizable=yes,scrollbars=yes`);
+    }
+
+    async function submitInlineToolConsent(cardDomId, toolName, targetScope, resumePrompt) {
+      const inputEl = document.getElementById(`consent-tok-${cardDomId}`);
+      const statusEl = document.getElementById(`consent-status-${cardDomId}`);
+      const rawToken = inputEl ? inputEl.value.trim() : "";
+      if (!rawToken) {
+        if (statusEl) statusEl.textContent = "Please paste a Google OAuth 2.0 access token or use the OAuth Popup button.";
+        return;
+      }
+      try {
+        const res = await fetch("/api/auth/tool-consent", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: getAuthHeaders({ "Content-Type": "application/json" }),
+          body: JSON.stringify({
+            user_id: currentUserId,
+            session_id: currentSessionId,
+            access_token: rawToken,
+            tool_name: toolName,
+            target_scope: targetScope,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          if (statusEl) statusEl.textContent = (data && data.detail) || "Token authorization failed.";
+          return;
+        }
+        await handleOAuth3LOAuthorized(data, cardDomId, resumePrompt);
+      } catch (err) {
+        if (statusEl) statusEl.textContent = `Authorization error: ${err}`;
+      }
+    }
+
+    async function handleOAuth3LOAuthorized(data, cardDomId, resumePrompt) {
+      if (data && data.connection) {
+        applyConnectionConfigToUI(data.connection);
+      } else {
+        await loadConnectionConfig();
+      }
+      const targetCardId = cardDomId || activeOAuthConsentCardId;
+      if (targetCardId) {
+        const cardEl = document.getElementById(targetCardId);
+        if (cardEl) {
+          cardEl.classList.add("authorized");
+        }
+        const pillEl = document.getElementById(`consent-pill-${targetCardId}`);
+        if (pillEl) {
+          pillEl.textContent = "AUTHORIZED • Token Injected into ADK ToolContext ✓";
+          pillEl.style.color = "#81c995";
+          pillEl.style.borderColor = "rgba(129, 201, 149, 0.5)";
+        }
+        const statusEl = document.getElementById(`consent-status-${targetCardId}`);
+        if (statusEl) {
+          statusEl.style.color = "#81c995";
+          statusEl.textContent = "Delegated OAuth 2.0 credential injected into ADK ToolContext. Resuming agent execution...";
+        }
+      }
+      const promptToResume = resumePrompt || activeOAuthResumePrompt;
+      activeOAuthConsentCardId = null;
+      activeOAuthResumePrompt = "";
+      if (promptToResume) {
+        document.getElementById("chat-input").value = promptToResume;
+        await sendChatMessage({ isPhaseScan: true });
+      }
+    }
+
+    window.addEventListener("message", async (event) => {
+      if (event.origin !== window.location.origin) return;
+      if (event.data && event.data.type === "PQC_OAUTH_3LO_AUTHORIZED") {
+        await handleOAuth3LOAuthorized(event.data.payload, activeOAuthConsentCardId, activeOAuthResumePrompt);
+      }
+    });
+
+    function buildOAuthConsentCardHtml(consentCard, cardDomId) {
+      if (!consentCard) return "";
+      const toolName = consentCard.tool_name || "collect_kms_inventory";
+      const targetScope = consentCard.target_scope || "organizations/31564119954";
+      const authUri = consentCard.auth_uri || `/api/auth/oauth/authorize?user_id=${encodeURIComponent(currentUserId)}&session_id=${encodeURIComponent(currentSessionId || "")}&scope=${encodeURIComponent(targetScope)}`;
+      const scopes = consentCard.scopes || ["openid", "email", "profile", "https://www.googleapis.com/auth/cloud-platform.read-only"];
+      const resumePrompt = consentCard.original_prompt || `Please continue executing ${toolName} on ${targetScope}.`;
+      const isAuthorized = consentCard.status === "AUTHORIZED";
+
+      return `
+        <div class="oauth-consent-card${isAuthorized ? " authorized" : ""}" id="${escapeHtml(cardDomId)}">
+          <div class="oauth-consent-head">
+            <div class="oauth-consent-title">
+              <span>🔐</span>
+              <span>${escapeHtml(consentCard.title || "Google Cloud OAuth 2.0 (3LO) Authorization Required")}</span>
+            </div>
+            <span class="oauth-consent-pill" id="consent-pill-${escapeHtml(cardDomId)}">
+              ${isAuthorized ? "AUTHORIZED • ADK ToolContext ✓" : "ADK ToolContext.request_credential • 3LO"}
+            </span>
+          </div>
+          <div style="font-size:12.5px;color:var(--text-secondary);line-height:1.5;">
+            ${escapeHtml(consentCard.description || `Allow the agent to run '${toolName}' on '${targetScope}' on behalf of '${currentUserId}'.`)}
+          </div>
+          <div class="oauth-consent-scopes">
+            <div><strong style="color:var(--text-primary);">Tool:</strong> ${escapeHtml(toolName)} &nbsp;•&nbsp; <strong style="color:var(--text-primary);">Target:</strong> ${escapeHtml(targetScope)}</div>
+            <div><strong style="color:var(--text-primary);">OAuth 2.0 Scopes:</strong> ${escapeHtml(scopes.join(" "))}</div>
+          </div>
+          <div class="oauth-consent-actions">
+            <button type="button" class="btn-oauth-popup" onclick='openOAuth3LOPopup(${JSON.stringify(authUri)}, ${JSON.stringify(cardDomId)}, ${JSON.stringify(resumePrompt)})'>
+              <span>Authorize with Google Cloud (OAuth 2.0 Popup)</span>
+            </button>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;margin-top:2px;">
+            <input type="password" id="consent-tok-${escapeHtml(cardDomId)}" placeholder="Or paste ya29... token from: gcloud auth print-access-token" style="flex:1;padding:7px 10px;border-radius:8px;border:1px solid var(--border-subtle);background:var(--bg-canvas);color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:11.5px;" />
+            <button type="button" class="btn-minimal-action" onclick='submitInlineToolConsent(${JSON.stringify(cardDomId)}, ${JSON.stringify(toolName)}, ${JSON.stringify(targetScope)}, ${JSON.stringify(resumePrompt)})' style="padding:7px 12px;border:1px solid rgba(76,141,246,0.4);color:var(--gemini-link);">
+              Inject into ToolContext &amp; Resume
+            </button>
+          </div>
+          <div id="consent-status-${escapeHtml(cardDomId)}" style="font-size:11.5px;color:var(--text-muted);"></div>
+        </div>
+      `;
     }
 
     async function fetchSessions() {
@@ -2076,7 +2301,15 @@ PORTAL_HTML = r"""<!DOCTYPE html>
           if (m.role === "user") {
             appendUserMessageUI(m.content, m.attachments || []);
           } else {
-            appendAssistantMessageUI(m.content, m.tool_calls || [], m.model_label, m.served_by || null, m.error || null, Boolean(m.legacy_template_response));
+            appendAssistantMessageUI(
+              m.content,
+              m.tool_calls || [],
+              m.model_label,
+              m.served_by || null,
+              m.error || null,
+              Boolean(m.legacy_template_response),
+              m.oauth_consent_required || null
+            );
           }
         });
       }
@@ -2163,7 +2396,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
         </div>`;
     }
 
-    function appendAssistantMessageUI(markdownText, toolCalls = [], modelLabel = "", servedBy = null, errorInfo = null, legacyTemplate = false) {
+    function appendAssistantMessageUI(markdownText, toolCalls = [], modelLabel = "", servedBy = null, errorInfo = null, legacyTemplate = false, oauthConsentCard = null) {
       const container = document.getElementById("messages-container");
       const msgId = "msg-" + Math.random().toString(36).slice(2, 10);
       assistantResponsesStore[msgId] = markdownText || "";
@@ -2176,7 +2409,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
         const itemsHtml = toolCalls.map((tc) => {
           const argsStr = typeof tc.args === "string" ? tc.args : JSON.stringify(tc.args || {});
           const outStr = typeof tc.output_preview === "string" ? tc.output_preview : JSON.stringify(tc.output_preview || "");
-          const kindLabel = tc.kind === "specialist_agent" ? "Specialist agent" : "Tool";
+          const kindLabel = tc.kind === "specialist_agent" ? "Specialist agent" : (tc.kind === "oauth_consent_request" ? "ADK ToolContext Auth" : "Tool");
           return `
             <div class="trace-item">
               <div class="trace-item-head">
@@ -2213,6 +2446,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       const bodyHtml = errorInfo
         ? `<div class="msg-error-card"><strong>The model did not return an answer.</strong> Nothing was generated or substituted for this turn.<br/><code>${escapeHtml(String(errorInfo.code || "ERROR"))}</code>${escapeHtml(String(errorInfo.message || ""))}</div>`
         : `<div class="markdown-body" id="md-${msgId}">${renderMarkdownSafe(markdownText)}</div>`;
+      const consentHtml = oauthConsentCard ? buildOAuthConsentCardHtml(oauthConsentCard, `consent-card-${msgId}`) : "";
 
       row.innerHTML = `
         <div class="msg-assistant-card">
@@ -2227,6 +2461,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
           ${buildServedByHtml(servedBy, legacyTemplate)}
           ${traceDrawerHtml}
           ${bodyHtml}
+          ${consentHtml}
         </div>
       `;
       container.appendChild(row);
@@ -2336,14 +2571,19 @@ PORTAL_HTML = r"""<!DOCTYPE html>
           localStorage.setItem(`pqc_active_session_id:${currentUserId}`, currentSessionId);
           localStorage.setItem("pqc_active_session_id", currentSessionId);
         }
-        if (!res.ok || !data || data.status !== "OK") {
+        if (data && data.connection) {
+          updateHeaderConnectionBadge(data.connection);
+        }
+        if (!res.ok || !data || (data.status !== "OK" && data.status !== "OAUTH_CONSENT_REQUIRED")) {
           const errorInfo = (data && data.error) || { code: `HTTP ${res.status}`, message: "Unexpected server response." };
           appendAssistantMessageUI(
             "",
             (data && (data.tool_calls || data.tool_traces)) || [],
             (data && data.model_label) || getModelDisplayLabel(selectedModelId),
             (data && data.served_by) || null,
-            errorInfo
+            errorInfo,
+            false,
+            (data && data.oauth_consent_required) || null
           );
           if (data && data.status === "MODEL_NOT_AVAILABLE") {
             await loadModelCatalog(true);
@@ -2354,7 +2594,9 @@ PORTAL_HTML = r"""<!DOCTYPE html>
             data.tool_calls || data.tool_traces || [],
             data.model_label || getModelDisplayLabel(selectedModelId),
             data.served_by || null,
-            null
+            null,
+            false,
+            data.oauth_consent_required || null
           );
         }
         await fetchSessions();

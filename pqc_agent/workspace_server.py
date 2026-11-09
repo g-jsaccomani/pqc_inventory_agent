@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextvars
 import datetime
 import hashlib
 import hmac
@@ -29,13 +30,26 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from google.adk.apps import App
 from google.adk.artifacts.gcs_artifact_service import GcsArtifactService
+from google.adk.auth import (
+    AuthConfig,
+    AuthCredential,
+    AuthCredentialTypes,
+    OAuth2Auth,
+    OpenIdConnectWithConfig,
+)
+from google.adk.auth.credential_service.session_state_credential_service import (
+    SessionStateCredentialService,
+)
 from google.adk.cli.fast_api import get_fast_api_app
 from google.adk.cli.service_registry import get_service_registry
+from google.adk.plugins.base_plugin import BasePlugin
 from google.adk.runners import Runner
 from google.adk.sessions.database_session_service import DatabaseSessionService
+from google.adk.tools.base_tool import BaseTool
+from google.adk.tools.tool_context import ToolContext
 from google.genai import types
 from pydantic import BaseModel
 
@@ -604,6 +618,351 @@ def activate_request_tenant_user(request: Request, explicit_user_id: Optional[st
     return resolved
 
 
+# =============================================================================
+# ADK Native 3-Legged OAuth (3LO) & ToolContext Consent Manager
+# =============================================================================
+
+GCP_OAUTH_CREDENTIAL_KEY = "gcp_pqc_oauth_3lo_credential"
+GCP_OAUTH_SCOPES: Tuple[str, ...] = (
+    "openid",
+    "email",
+    "profile",
+    "https://www.googleapis.com/auth/cloud-platform.read-only",
+)
+PROTECTED_GCP_TOOLS = frozenset({
+    "collect_kms_inventory",
+    "collect_tls_policies",
+    "collect_cas_hierarchies",
+    "collect_Compute_and_GKE_crypto",
+    "collect_workspace_cse_configs",
+    "execute_gcloud_command",
+    "fetch_live_gcp_context",
+})
+
+_TURN_OAUTH_CONSENT_CARDS: contextvars.ContextVar[Optional[List[Dict[str, Any]]]] = contextvars.ContextVar(
+    "pqc_turn_oauth_consent_cards", default=None
+)
+
+
+def _record_turn_oauth_consent_card(card: Dict[str, Any]) -> None:
+    cards = _TURN_OAUTH_CONSENT_CARDS.get()
+    if cards is not None:
+        cards.append(card)
+
+
+def _get_oauth_config_path() -> str:
+    return os.path.join(_get_data_dir(), "pqc_oauth_config.json")
+
+
+def load_oauth_client_config() -> Dict[str, Any]:
+    """Loads the Google OAuth 2.0 3LO Client configuration from `/data/pqc_oauth_config.json` or env vars."""
+    cfg: Dict[str, Any] = {
+        "client_id": os.getenv("GOOGLE_OAUTH_CLIENT_ID", "").strip(),
+        "client_secret": os.getenv("GOOGLE_OAUTH_CLIENT_SECRET", "").strip(),
+        "authorization_endpoint": "https://accounts.google.com/o/oauth2/v2/auth",
+        "token_endpoint": "https://oauth2.googleapis.com/token",
+        "userinfo_endpoint": "https://openidconnect.googleapis.com/v1/userinfo",
+        "scopes": list(GCP_OAUTH_SCOPES),
+    }
+    path = _get_oauth_config_path()
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            if isinstance(saved, dict):
+                if saved.get("client_id"):
+                    cfg["client_id"] = str(saved["client_id"]).strip()
+                if saved.get("client_secret"):
+                    cfg["client_secret"] = str(saved["client_secret"]).strip()
+        except Exception:
+            pass
+    return cfg
+
+
+def save_oauth_client_config(client_id: Optional[str] = None, client_secret: Optional[str] = None) -> Dict[str, Any]:
+    """Persists Google OAuth 2.0 Client ID (and optional Client Secret) in `/data/pqc_oauth_config.json`."""
+    current = load_oauth_client_config()
+    if client_id is not None:
+        current["client_id"] = str(client_id).strip()
+        os.environ["GOOGLE_OAUTH_CLIENT_ID"] = current["client_id"]
+    if client_secret is not None:
+        current["client_secret"] = str(client_secret).strip()
+        os.environ["GOOGLE_OAUTH_CLIENT_SECRET"] = current["client_secret"]
+    path = _get_oauth_config_path()
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "client_id": current["client_id"],
+                    "client_secret": current["client_secret"],
+                    "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+    except OSError:
+        pass
+    return {
+        "client_id": current["client_id"],
+        "has_client_secret": bool(current["client_secret"]),
+        "scopes": current["scopes"],
+        "authorization_endpoint": current["authorization_endpoint"],
+    }
+
+
+def build_oauth_authorize_uri(
+    user_id: str,
+    session_id: Optional[str] = None,
+    target_scope: Optional[str] = None,
+    redirect_uri: Optional[str] = None,
+) -> str:
+    """Builds the 3-Legged OAuth (3LO) authorization URI for the user/session."""
+    params = {
+        "user_id": normalize_user_id(user_id),
+        "session_id": session_id or "",
+        "scope": target_scope or "organizations/31564119954",
+    }
+    if redirect_uri:
+        params["redirect_uri"] = redirect_uri
+    return f"/api/auth/oauth/authorize?{urllib.parse.urlencode(params)}"
+
+
+def build_gcp_oauth_auth_config(
+    user_id: str = DEFAULT_USER_ID,
+    session_id: Optional[str] = None,
+    target_scope: Optional[str] = None,
+    access_token: Optional[str] = None,
+) -> AuthConfig:
+    """Constructs a native Google ADK `AuthConfig` for 3-Legged OAuth 2.0 (`ToolContext.request_credential`)."""
+    oauth_cfg = load_oauth_client_config()
+    auth_uri = build_oauth_authorize_uri(user_id=user_id, session_id=session_id, target_scope=target_scope)
+    scheme = OpenIdConnectWithConfig(
+        openIdConnectUrl="https://accounts.google.com/.well-known/openid-configuration",
+        authorization_endpoint=oauth_cfg["authorization_endpoint"],
+        token_endpoint=oauth_cfg["token_endpoint"],
+        userinfo_endpoint=oauth_cfg["userinfo_endpoint"],
+        scopes=list(GCP_OAUTH_SCOPES),
+    )
+    oauth2_cred = OAuth2Auth(
+        client_id=oauth_cfg["client_id"] or "pqc-workspace-3lo-client",
+        client_secret=oauth_cfg["client_secret"] or None,
+        auth_uri=auth_uri,
+        access_token=access_token,
+    )
+    raw_cred = AuthCredential(
+        auth_type=AuthCredentialTypes.OAUTH2,
+        oauth2=oauth2_cred,
+    )
+    return AuthConfig(
+        auth_scheme=scheme,
+        raw_auth_credential=raw_cred,
+        exchanged_auth_credential=raw_cred.model_copy(deep=True),
+        credential_key=GCP_OAUTH_CREDENTIAL_KEY,
+    )
+
+
+class PqcOAuth3LOPlugin(BasePlugin):
+    """ADK Plugin that integrates `ToolContext` 3-Legged OAuth (3LO) credentials with GCP discovery tools.
+
+    Responsibilities:
+    1. Synchronizes delegated OAuth 2.0 tokens between ADK's `ToolContext` (`SessionStateCredentialService`)
+       and the isolated per-user `gcloud_bridge` connection state.
+    2. When a user is in 3-Legged OAuth mode (`mode == 'access_token'`) and has not yet granted a token,
+       calls `tool_context.request_credential(auth_config)` before the tool executes and emits an interactive
+       In-Chat OAuth 2.0 Consent Card.
+    3. When a tool running in default Service Account (`adc`) mode encounters a `403 PermissionDenied` error
+       on an external project/organization, automatically triggers `tool_context.request_credential(auth_config)`
+       so the user can authorize with their own `@google.com` credentials right in the chat.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(name="pqc_oauth_3lo_plugin")
+
+    async def before_tool_callback(
+        self,
+        *,
+        tool: BaseTool,
+        tool_args: dict[str, Any],
+        tool_context: ToolContext,
+    ) -> Optional[dict[str, Any]]:
+        inv_ctx = getattr(tool_context, "_invocation_context", None)
+        inv_uid = getattr(inv_ctx, "user_id", None)
+        inv_sess = getattr(getattr(inv_ctx, "session", None), "id", None)
+        if inv_uid:
+            set_current_tenant_user(inv_uid)
+        uid = normalize_user_id(inv_uid)
+
+        if tool.name not in PROTECTED_GCP_TOOLS:
+            return None
+
+        target_scope = str(
+            (tool_args or {}).get("scope")
+            or (tool_args or {}).get("project_id")
+            or (tool_args or {}).get("command")
+            or "organizations/31564119954"
+        )
+        conn = get_gcp_connection_config(mask_token=False, user_id=uid)
+        auth_config = build_gcp_oauth_auth_config(
+            user_id=uid,
+            session_id=inv_sess,
+            target_scope=target_scope,
+        )
+
+        # 1. Check if ADK ToolContext already holds a delegated OAuth 2.0 token
+        try:
+            loaded_cred = await tool_context.load_credential(auth_config)
+            if (
+                loaded_cred
+                and loaded_cred.oauth2
+                and loaded_cred.oauth2.access_token
+                and not conn.get("has_access_token")
+            ):
+                set_gcp_connection_config(
+                    mode="access_token",
+                    access_token=loaded_cred.oauth2.access_token,
+                    user_id=uid,
+                )
+                conn = get_gcp_connection_config(mask_token=False, user_id=uid)
+            elif conn.get("has_access_token") and conn.get("access_token_preview"):
+                save_cfg = build_gcp_oauth_auth_config(
+                    user_id=uid,
+                    session_id=inv_sess,
+                    target_scope=target_scope,
+                    access_token=conn["access_token_preview"],
+                )
+                await tool_context.save_credential(save_cfg)
+        except Exception as exc:
+            logger.debug("ToolContext credential sync skipped: %s", exc)
+
+        # 2. If the user is in 3-Legged OAuth mode ('access_token') and no token is present, request consent!
+        if conn.get("mode") == "access_token" and not conn.get("has_access_token"):
+            try:
+                tool_context.request_credential(auth_config)
+            except Exception as exc:
+                logger.debug("tool_context.request_credential note: %s", exc)
+
+            auth_uri = build_oauth_authorize_uri(user_id=uid, session_id=inv_sess, target_scope=target_scope)
+            consent_card = {
+                "consent_id": tool_context.function_call_id or f"consent-{uuid.uuid4().hex[:10]}",
+                "function_call_id": tool_context.function_call_id,
+                "credential_key": GCP_OAUTH_CREDENTIAL_KEY,
+                "status": "PENDING_USER_CONSENT",
+                "reason": "oauth_3lo_mode_missing_token",
+                "tool_name": tool.name,
+                "tool_args": dict(tool_args or {}),
+                "target_scope": target_scope,
+                "user_id": uid,
+                "session_id": inv_sess,
+                "auth_flow": "oauth2_3lo",
+                "auth_uri": auth_uri,
+                "scopes": list(GCP_OAUTH_SCOPES),
+                "title": "Google Cloud OAuth 2.0 (3LO) Authorization Required",
+                "description": (
+                    f"The agent requires your delegated Google Cloud consent to execute '{tool.name}' "
+                    f"on '{target_scope}' on behalf of '{uid}'."
+                ),
+                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            }
+            try:
+                tool_context.state["pending_oauth_consent"] = consent_card
+            except Exception:
+                pass
+            _record_turn_oauth_consent_card(consent_card)
+            return {
+                "status": "OAUTH_3LO_CONSENT_REQUIRED",
+                "oauth_consent_required": True,
+                "tool_name": tool.name,
+                "target_scope": target_scope,
+                "user_id": uid,
+                "required_scopes": list(GCP_OAUTH_SCOPES),
+                "auth_uri": auth_uri,
+                "consent_card": consent_card,
+                "message": (
+                    f"3-Legged OAuth (3LO) user consent is required before '{tool.name}' can inspect "
+                    f"'{target_scope}' on behalf of '{uid}'. An interactive Google Cloud OAuth 2.0 Consent Card "
+                    "has been displayed in the chat. Please ask the user to authorize access in the card to continue."
+                ),
+            }
+
+        return None
+
+    async def after_tool_callback(
+        self,
+        *,
+        tool: BaseTool,
+        tool_args: dict[str, Any],
+        tool_context: ToolContext,
+        result: dict[str, Any],
+    ) -> Optional[dict[str, Any]]:
+        if tool.name not in PROTECTED_GCP_TOOLS:
+            return None
+
+        inv_ctx = getattr(tool_context, "_invocation_context", None)
+        inv_uid = getattr(inv_ctx, "user_id", None)
+        inv_sess = getattr(getattr(inv_ctx, "session", None), "id", None)
+        uid = normalize_user_id(inv_uid)
+        conn = get_gcp_connection_config(mask_token=False, user_id=uid)
+
+        serialized = json.dumps(result, ensure_ascii=False, default=str) if result is not None else ""
+        permission_failure = any(
+            marker in serialized
+            for marker in (
+                "ACCESS_TOKEN_REQUIRED",
+                "PermissionDenied",
+                "PERMISSION_DENIED",
+                "does not have required permission",
+                "Caller does not have permission",
+            )
+        )
+        if permission_failure and not conn.get("has_access_token"):
+            target_scope = str(
+                (tool_args or {}).get("scope")
+                or (tool_args or {}).get("project_id")
+                or (tool_args or {}).get("command")
+                or conn.get("organization_id")
+                or "organizations/31564119954"
+            )
+            auth_config = build_gcp_oauth_auth_config(
+                user_id=uid,
+                session_id=inv_sess,
+                target_scope=target_scope,
+            )
+            try:
+                tool_context.request_credential(auth_config)
+            except Exception:
+                pass
+            auth_uri = build_oauth_authorize_uri(user_id=uid, session_id=inv_sess, target_scope=target_scope)
+            consent_card = {
+                "consent_id": tool_context.function_call_id or f"consent-{uuid.uuid4().hex[:10]}",
+                "function_call_id": tool_context.function_call_id,
+                "credential_key": GCP_OAUTH_CREDENTIAL_KEY,
+                "status": "PENDING_USER_CONSENT",
+                "reason": "permission_denied_fallback_to_3lo",
+                "tool_name": tool.name,
+                "tool_args": dict(tool_args or {}),
+                "target_scope": target_scope,
+                "user_id": uid,
+                "session_id": inv_sess,
+                "auth_flow": "oauth2_3lo",
+                "auth_uri": auth_uri,
+                "scopes": list(GCP_OAUTH_SCOPES),
+                "title": "Additional Google Cloud Permissions Required (OAuth 2.0 3LO)",
+                "description": (
+                    f"The default Service Account could not access '{target_scope}' during '{tool.name}'. "
+                    f"Authorize with your personal Google Cloud credentials ({uid}) to continue."
+                ),
+                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            }
+            try:
+                tool_context.state["pending_oauth_consent"] = consent_card
+            except Exception:
+                pass
+            _record_turn_oauth_consent_card(consent_card)
+        return None
+
+
 class GoogleAuthSignInPayload(BaseModel):
     email: Optional[str] = None
     name: Optional[str] = None
@@ -613,6 +972,21 @@ class GoogleAuthSignInPayload(BaseModel):
     id_token: Optional[str] = None
     google_access_token: Optional[str] = None
     use_token_for_gcp_connection: bool = False
+
+
+class ToolConsentPayload(BaseModel):
+    user_id: Optional[str] = None
+    session_id: Optional[str] = None
+    access_token: str
+    function_call_id: Optional[str] = None
+    tool_name: Optional[str] = None
+    target_scope: Optional[str] = None
+    verify_with_google: bool = False
+
+
+class OAuthClientConfigPayload(BaseModel):
+    client_id: Optional[str] = None
+    client_secret: Optional[str] = None
 
 
 class CreateSessionPayload(BaseModel):
@@ -789,10 +1163,11 @@ def _extract_messages_and_traces_from_session(
                 {
                     "role": "assistant",
                     "content": combined_text,
-                    "status": "OK",
+                    "status": telemetry.get("status", "OK"),
                     "tool_calls": list(pending_turn_tools),
                     "served_by": telemetry.get("served_by") or _event_usage_block(ev),
                     "model_label": telemetry.get("model_label"),
+                    "oauth_consent_required": telemetry.get("oauth_consent_required"),
                     "timestamp": iso_ts,
                 }
             )
@@ -822,6 +1197,7 @@ def create_workspace_app(
 
     session_service = DatabaseSessionService(db_url=resolved_db_url)
     artifact_service = ResilientGcsArtifactService(bucket_name=resolved_bucket)
+    credential_service = SessionStateCredentialService()
     registry_obj = model_registry or ModelRegistry()
 
     registry = get_service_registry()
@@ -840,6 +1216,7 @@ def create_workspace_app(
 
     app.state.session_service = session_service
     app.state.artifact_service = artifact_service
+    app.state.credential_service = credential_service
     app.state.session_db_url = resolved_db_url
     app.state.artifact_bucket = resolved_bucket
     app.state.model_registry = registry_obj
@@ -850,6 +1227,7 @@ def create_workspace_app(
         registry_obj.start_background_verification()
 
     telemetry_plugin = LlmCallTelemetryPlugin()
+    oauth_3lo_plugin = PqcOAuth3LOPlugin()
     runners_by_key: Dict[str, Runner] = {}
 
     def _get_runner(model_name: str, thinking_level: Optional[str]) -> Runner:
@@ -859,10 +1237,11 @@ def create_workspace_app(
                 app=App(
                     name=APP_NAME,
                     root_agent=create_pqc_agent(model_name=model_name, thinking_level=thinking_level),
-                    plugins=[telemetry_plugin],
+                    plugins=[telemetry_plugin, oauth_3lo_plugin],
                 ),
                 session_service=session_service,
                 artifact_service=artifact_service,
+                credential_service=credential_service,
                 auto_create_session=True,
             )
         return runners_by_key[cache_key]
@@ -889,16 +1268,20 @@ def create_workspace_app(
     async def api_health(request: Request) -> Dict[str, Any]:
         uid = activate_request_tenant_user(request)
         catalog = registry_obj.catalog()
+        oauth_cfg = load_oauth_client_config()
         return {
             "status": "HEALTHY",
             "app_name": APP_NAME,
             "multi_tenant_enabled": True,
+            "oauth_3lo_enabled": True,
+            "google_oauth_client_configured": bool(oauth_cfg.get("client_id")),
             "supported_regions": [r["id"] for r in SUPPORTED_REGIONS],
             "allowed_auth_domains": list(ALLOWED_AUTH_DOMAINS),
             "session_service": type(session_service).__name__,
             "session_db_url": resolved_db_url,
             "artifact_service": type(artifact_service).__name__,
             "artifact_bucket": f"gs://{resolved_bucket}",
+            "credential_service": type(credential_service).__name__,
             "connection": get_gcp_connection_config(mask_token=True, user_id=uid),
             "simulation_mode": os.getenv("PQC_SIMULATION_MODE", "FALSE"),
             "verified_models": [m["id"] for m in catalog["models"]],
@@ -917,6 +1300,7 @@ def create_workspace_app(
         uid = profile["user_id"] if profile else DEFAULT_USER_ID
         set_current_tenant_user(uid)
         conn = get_gcp_connection_config(mask_token=True, user_id=uid)
+        oauth_cfg = load_oauth_client_config()
         session_count = 0
         if profile:
             try:
@@ -927,7 +1311,9 @@ def create_workspace_app(
         return {
             "authenticated": profile is not None,
             "iap_active": iap_active,
-            "google_oauth_client_id": os.getenv("GOOGLE_OAUTH_CLIENT_ID", ""),
+            "google_oauth_client_id": oauth_cfg.get("client_id", ""),
+            "oauth_3lo_enabled": True,
+            "oauth_scopes": list(GCP_OAUTH_SCOPES),
             "allowed_domains": list(ALLOWED_AUTH_DOMAINS),
             "supported_regions": SUPPORTED_REGIONS,
             "user": profile,
@@ -1033,6 +1419,332 @@ def create_workspace_app(
             "total_tenants": len(tenants),
             "by_region": by_region,
             "tenants": tenants,
+        }
+
+    # =========================================================================
+    # 3-Legged OAuth (3LO) Consent & ADK ToolContext Credential Injection
+    # =========================================================================
+
+    @app.get("/api/auth/oauth/config")
+    async def get_oauth_config_endpoint() -> Dict[str, Any]:
+        cfg = load_oauth_client_config()
+        return {
+            "client_id": cfg["client_id"],
+            "has_client_secret": bool(cfg["client_secret"]),
+            "scopes": cfg["scopes"],
+            "authorization_endpoint": cfg["authorization_endpoint"],
+            "credential_key": GCP_OAUTH_CREDENTIAL_KEY,
+        }
+
+    @app.post("/api/auth/oauth/config")
+    async def update_oauth_config_endpoint(payload: OAuthClientConfigPayload) -> Dict[str, Any]:
+        return save_oauth_client_config(client_id=payload.client_id, client_secret=payload.client_secret)
+
+    @app.get("/api/auth/oauth/authorize")
+    async def oauth_3lo_authorize_endpoint(
+        request: Request,
+        user_id: Optional[str] = Query(default=None),
+        session_id: Optional[str] = Query(default=None),
+        scope: Optional[str] = Query(default="organizations/31564119954"),
+        redirect_uri: Optional[str] = Query(default=None),
+        format: Optional[str] = Query(default=None),
+    ) -> Any:
+        """Initiates the 3-Legged OAuth 2.0 (3LO) authorization flow for Google Cloud APIs.
+        - If `format=json`, returns the OAuth 2.0 authorization URL and metadata.
+        - If `GOOGLE_OAUTH_CLIENT_ID` is configured, redirects (`302`) directly to Google's official OAuth 2.0 consent screen.
+        - Otherwise renders an interactive Google Cloud OAuth 2.0 (3LO) Authorization popup window.
+        """
+        uid = activate_request_tenant_user(request, explicit_user_id=user_id)
+        oauth_cfg = load_oauth_client_config()
+        client_id = oauth_cfg.get("client_id", "")
+        has_secret = bool(oauth_cfg.get("client_secret"))
+        proto = request.headers.get("x-forwarded-proto") or request.url.scheme
+        host = request.headers.get("host") or request.url.netloc
+        cb_uri = redirect_uri or f"{proto}://{host}/api/auth/oauth/callback"
+
+        state_obj = {
+            "uid": uid,
+            "session_id": session_id or "",
+            "target_scope": scope or "organizations/31564119954",
+            "nonce": secrets.token_hex(8),
+        }
+        encoded_state = base64.urlsafe_b64encode(json.dumps(state_obj).encode("utf-8")).decode("ascii").rstrip("=")
+
+        google_auth_url = ""
+        if client_id:
+            params = {
+                "client_id": client_id,
+                "redirect_uri": cb_uri,
+                "response_type": "code" if has_secret else "token",
+                "scope": " ".join(GCP_OAUTH_SCOPES),
+                "include_granted_scopes": "true",
+                "prompt": "consent",
+                "state": encoded_state,
+            }
+            if has_secret:
+                params["access_type"] = "offline"
+            if "@" in uid:
+                params["login_hint"] = uid
+            google_auth_url = f"{oauth_cfg['authorization_endpoint']}?{urllib.parse.urlencode(params)}"
+
+        if format == "json":
+            return JSONResponse(
+                content={
+                    "user_id": uid,
+                    "session_id": session_id,
+                    "target_scope": scope,
+                    "client_id_configured": bool(client_id),
+                    "client_id": client_id,
+                    "redirect_uri": cb_uri,
+                    "scopes": list(GCP_OAUTH_SCOPES),
+                    "google_auth_url": google_auth_url,
+                    "state": encoded_state,
+                }
+            )
+
+        if google_auth_url and request.query_params.get("direct") == "1":
+            return RedirectResponse(url=google_auth_url, status_code=302)
+
+        # Render the interactive Google Cloud OAuth 2.0 (3LO) Consent Popup Window
+        popup_html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Sign in with Google — PQC Inventory Agent (OAuth 2.0 3LO)</title>
+<style>
+  body {{ margin:0; font-family:'Google Sans','Inter',system-ui,sans-serif; background:#0b0f17; color:#e2e8f0; display:flex; align-items:center; justify-content:center; min-height:100vh; padding:16px; box-sizing:border-box; }}
+  .card {{ width:100%; max-width:460px; background:#111827; border:1px solid #1e293b; border-radius:16px; padding:26px; box-shadow:0 24px 60px rgba(0,0,0,0.65); }}
+  .hdr {{ display:flex; align-items:center; gap:12px; margin-bottom:14px; }}
+  .badge {{ font-size:11px; font-weight:600; color:#8ab4f8; background:rgba(66,133,244,0.14); border:1px solid rgba(66,133,244,0.35); padding:3px 9px; border-radius:999px; }}
+  h2 {{ margin:0 0 6px 0; font-size:18px; color:#f8fafc; }}
+  p {{ margin:0 0 14px 0; font-size:13px; color:#94a3b8; line-height:1.5; }}
+  .scope-box {{ background:#0b1120; border:1px solid #1e293b; border-radius:10px; padding:12px; margin-bottom:16px; font-size:12px; }}
+  .scope-item {{ display:flex; align-items:center; gap:8px; color:#cbd5e1; margin:5px 0; font-family:'JetBrains Mono',monospace; font-size:11.5px; }}
+  .btn {{ width:100%; padding:11px 14px; border-radius:9px; border:none; font-weight:600; font-size:13px; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:8px; margin-bottom:10px; }}
+  .btn-google {{ background:#4285F4; color:#fff; }}
+  .btn-google:hover {{ background:#3b78e7; }}
+  .btn-sec {{ background:#1e293b; color:#e2e8f0; border:1px solid #334155; }}
+  input {{ width:100%; box-sizing:border-box; padding:10px 12px; border-radius:8px; border:1px solid #334155; background:#0b0f17; color:#f8fafc; font-family:'JetBrains Mono',monospace; font-size:12px; margin-bottom:10px; }}
+  .err {{ color:#f87171; font-size:12px; margin-bottom:10px; display:none; }}
+  .cmd {{ background:#070b12; border:1px solid #1e293b; padding:7px 10px; border-radius:6px; font-family:'JetBrains Mono',monospace; font-size:11px; color:#93c5fd; margin-bottom:10px; word-break:break-all; }}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="hdr">
+    <svg width="26" height="26" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>
+    <div>
+      <span class="badge">3-Legged OAuth 2.0 • ADK ToolContext</span>
+    </div>
+  </div>
+  <h2>Authorize PQC Inventory Agent</h2>
+  <p>Allow the agent to inspect <b>{scope}</b> on behalf of <b>{uid}</b> using read-only Google Cloud permissions:</p>
+  <div class="scope-box">
+    <div style="font-size:11px;color:#64748b;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.05em;">Requested OAuth 2.0 Scopes</div>
+    <div class="scope-item">✓ openid email profile (@google.com identity)</div>
+    <div class="scope-item">✓ https://www.googleapis.com/auth/cloud-platform.read-only</div>
+  </div>
+  <div id="errBox" class="err"></div>
+  {"<a href='" + google_auth_url + "' style='text-decoration:none;'><button type='button' class='btn btn-google'>Continue to Google Consent Screen (accounts.google.com)</button></a>" if google_auth_url else ""}
+  <div style="font-size:12px;color:#cbd5e1;margin:10px 0 6px 0;font-weight:600;">Authorize with your Google Cloud OAuth Token:</div>
+  <div class="cmd">gcloud auth print-access-token</div>
+  <input id="tokInput" type="password" placeholder="Paste ya29... OAuth 2.0 access token" autofocus />
+  <button type="button" class="btn btn-google" onclick="submitConsent()">Allow & Inject into ADK ToolContext</button>
+  <details style="margin-top:10px;font-size:11.5px;color:#94a3b8;">
+    <summary style="cursor:pointer;color:#8ab4f8;">Configure Google OAuth 2.0 Web Client ID (Optional)</summary>
+    <div style="margin-top:8px;">
+      <input id="cidInput" type="text" placeholder="123456-abc.apps.googleusercontent.com" value="{client_id}" />
+      <button type="button" class="btn btn-sec" onclick="saveClientId()">Save OAuth Client ID & Redirect to Google</button>
+    </div>
+  </details>
+</div>
+<script>
+async function submitConsent() {{
+  const tok = document.getElementById('tokInput').value.trim();
+  const err = document.getElementById('errBox');
+  err.style.display = 'none';
+  if (!tok) {{ err.textContent = 'Please paste a valid Google OAuth 2.0 access token.'; err.style.display = 'block'; return; }}
+  try {{
+    const res = await fetch('/api/auth/tool-consent', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{
+        user_id: {json.dumps(uid)},
+        session_id: {json.dumps(session_id or "")},
+        access_token: tok,
+        target_scope: {json.dumps(scope or "organizations/31564119954")}
+      }})
+    }});
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Consent authorization failed.');
+    if (window.opener) {{
+      window.opener.postMessage({{ type: 'PQC_OAUTH_3LO_AUTHORIZED', payload: data }}, window.location.origin);
+      window.close();
+    }} else {{
+      window.location.href = '/';
+    }}
+  }} catch (e) {{
+    err.textContent = e.message;
+    err.style.display = 'block';
+  }}
+}}
+async function saveClientId() {{
+  const cid = document.getElementById('cidInput').value.trim();
+  if (!cid) return;
+  await fetch('/api/auth/oauth/config', {{
+    method: 'POST',
+    headers: {{ 'Content-Type': 'application/json' }},
+    body: JSON.stringify({{ client_id: cid }})
+  }});
+  window.location.href = window.location.pathname + window.location.search + '&direct=1';
+}}
+</script>
+</body>
+</html>"""
+        return HTMLResponse(content=popup_html)
+
+    @app.get("/api/auth/oauth/callback", response_class=HTMLResponse)
+    async def oauth_3lo_callback_endpoint(
+        request: Request,
+        code: Optional[str] = Query(default=None),
+        state: Optional[str] = Query(default=None),
+        error: Optional[str] = Query(default=None),
+    ) -> HTMLResponse:
+        """Handles the Google OAuth 2.0 3LO redirect callback (both authorization code exchange and implicit token fragment)."""
+        decoded_state: Dict[str, Any] = {}
+        if state:
+            try:
+                pad = "=" * (-len(state) % 4)
+                decoded_state = json.loads(base64.urlsafe_b64decode(state + pad).decode("utf-8"))
+            except Exception:
+                decoded_state = {}
+        uid = normalize_user_id(decoded_state.get("uid") or DEFAULT_USER_ID)
+        sess_id = decoded_state.get("session_id") or ""
+        target_scope = decoded_state.get("target_scope") or "organizations/31564119954"
+
+        exchanged_token = ""
+        exchange_err = error or ""
+        if code and not exchange_err:
+            oauth_cfg = load_oauth_client_config()
+            proto = request.headers.get("x-forwarded-proto") or request.url.scheme
+            host = request.headers.get("host") or request.url.netloc
+            cb_uri = f"{proto}://{host}/api/auth/oauth/callback"
+            try:
+                form_data = urllib.parse.urlencode(
+                    {
+                        "code": code,
+                        "client_id": oauth_cfg.get("client_id", ""),
+                        "client_secret": oauth_cfg.get("client_secret", ""),
+                        "redirect_uri": cb_uri,
+                        "grant_type": "authorization_code",
+                    }
+                ).encode("utf-8")
+                req = urllib.request.Request(
+                    oauth_cfg["token_endpoint"],
+                    data=form_data,
+                    headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    tok_data = json.loads(resp.read().decode("utf-8"))
+                exchanged_token = tok_data.get("access_token", "")
+            except Exception as exc:
+                exchange_err = f"OAuth code exchange failed: {exc}"
+
+        callback_html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Completing Google OAuth 2.0 Authorization...</title></head>
+<body style="background:#0b0f17;color:#e2e8f0;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;">
+<div id="msg">Completing Google Cloud OAuth 2.0 (3LO) authorization...</div>
+<script>
+(async function() {{
+  const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+  const accessToken = {json.dumps(exchanged_token)} || hashParams.get('access_token') || '';
+  const err = {json.dumps(exchange_err)} || hashParams.get('error') || '';
+  if (err || !accessToken) {{
+    document.getElementById('msg').textContent = 'Authorization did not complete: ' + (err || 'missing access_token');
+    return;
+  }}
+  const res = await fetch('/api/auth/tool-consent', {{
+    method: 'POST',
+    headers: {{ 'Content-Type': 'application/json' }},
+    body: JSON.stringify({{
+      user_id: {json.dumps(uid)},
+      session_id: {json.dumps(sess_id)},
+      access_token: accessToken,
+      target_scope: {json.dumps(target_scope)}
+    }})
+  }});
+  const data = await res.json();
+  if (window.opener) {{
+    window.opener.postMessage({{ type: 'PQC_OAUTH_3LO_AUTHORIZED', payload: data }}, window.location.origin);
+    window.close();
+  }} else {{
+    window.location.href = '/';
+  }}
+}})();
+</script></body></html>"""
+        return HTMLResponse(content=callback_html)
+
+    @app.post("/api/auth/tool-consent")
+    async def grant_tool_oauth_consent_endpoint(
+        request: Request,
+        payload: ToolConsentPayload,
+    ) -> Dict[str, Any]:
+        """Injects a user's 3-Legged OAuth 2.0 access token into:
+        1. The ADK session's `SessionStateCredentialService` (`ToolContext` credential store)
+        2. The isolated per-user `gcloud_bridge` connection configuration (`mode = 'access_token'`)
+        so the paused ADK tool can immediately resume execution on behalf of the user.
+        """
+        uid = activate_request_tenant_user(request, explicit_user_id=payload.user_id)
+        raw_token = (payload.access_token or "").strip()
+        if raw_token.lower().startswith("bearer "):
+            raw_token = raw_token[7:].strip()
+        if not raw_token:
+            raise HTTPException(status_code=400, detail="A valid OAuth 2.0 access_token is required.")
+
+        verified_email = uid
+        if payload.verify_with_google:
+            info, err_msg = await asyncio.to_thread(_verify_google_oauth_or_id_token, None, raw_token)
+            if not info:
+                raise HTTPException(status_code=401, detail=err_msg or "Invalid Google OAuth access token.")
+            verified_email = info["email"]
+            uid = set_current_tenant_user(verified_email)
+
+        conn = set_gcp_connection_config(
+            mode="access_token",
+            access_token=raw_token,
+            user_id=uid,
+        )
+
+        # Also persist the credential inside the ADK session state so `tool_context.load_credential()` finds it
+        session_updated = False
+        if payload.session_id:
+            sess, resolved_uid = await _locate_session(payload.session_id, uid)
+            if sess is not None:
+                auth_cfg = build_gcp_oauth_auth_config(
+                    user_id=resolved_uid,
+                    session_id=sess.id,
+                    target_scope=payload.target_scope,
+                    access_token=raw_token,
+                )
+                cred_dict = auth_cfg.exchanged_auth_credential.model_dump(exclude_none=True) if auth_cfg.exchanged_auth_credential else {}
+                sess.state[f"auth_{GCP_OAUTH_CREDENTIAL_KEY}"] = cred_dict
+                sess.state[GCP_OAUTH_CREDENTIAL_KEY] = cred_dict
+                if isinstance(sess.state.get("pending_oauth_consent"), dict):
+                    sess.state["pending_oauth_consent"]["status"] = "AUTHORIZED"
+                session_updated = True
+
+        return {
+            "status": "AUTHORIZED",
+            "authenticated": True,
+            "user_id": uid,
+            "verified_email": verified_email,
+            "session_id": payload.session_id,
+            "session_credential_injected": session_updated,
+            "credential_key": GCP_OAUTH_CREDENTIAL_KEY,
+            "tool_name": payload.tool_name,
+            "target_scope": payload.target_scope,
+            "connection": conn,
         }
 
     # =========================================================================
@@ -1328,7 +2040,9 @@ def create_workspace_app(
         tool_calls_trace: List[Dict[str, Any]] = []
         error_events: List[Dict[str, Any]] = []
         final_text_parts: List[str] = []
+        turn_consent_cards: List[Dict[str, Any]] = []
         invocation_id: Optional[str] = None
+        consent_ctx_token = _TURN_OAUTH_CONSENT_CARDS.set(turn_consent_cards)
 
         with capture_llm_calls() as ledger:
             try:
@@ -1343,9 +2057,13 @@ def create_workspace_app(
                                 {
                                     "id": getattr(fc, "id", None) or str(uuid.uuid4()),
                                     "name": name,
-                                    "kind": "specialist_agent" if name.endswith("_agent") else "tool",
+                                    "kind": (
+                                        "oauth_consent_request"
+                                        if name == "adk_request_credential"
+                                        else ("specialist_agent" if name.endswith("_agent") else "tool")
+                                    ),
                                     "args": dict(getattr(fc, "args", {}) or {}),
-                                    "status": "EXECUTED",
+                                    "status": "CONSENT_REQUIRED" if name == "adk_request_credential" else "EXECUTED",
                                 }
                             )
                         for fr in event.get_function_responses() or []:
@@ -1364,12 +2082,28 @@ def create_workspace_app(
             except Exception as exc:
                 logger.warning("Model turn failed on '%s': %s: %s", entry["model"], type(exc).__name__, exc)
                 error_events.append({"code": type(exc).__name__, "message": str(exc)[:600]})
+            finally:
+                _TURN_OAUTH_CONSENT_CARDS.reset(consent_ctx_token)
+
+        active_consent_card: Optional[Dict[str, Any]] = turn_consent_cards[-1] if turn_consent_cards else None
+        if active_consent_card:
+            active_consent_card["original_prompt"] = user_text
 
         served_by = _compact_served_by(summarize_llm_calls(ledger))
         assistant_text = "\n".join(final_text_parts).strip()
-        status = "OK" if assistant_text else "MODEL_ERROR"
+        if not assistant_text and active_consent_card:
+            assistant_text = (
+                f"### 🔐 Google Cloud OAuth 2.0 (3-Legged OAuth) Consent Required\n\n"
+                f"To execute **`{active_consent_card.get('tool_name')}`** on **`{active_consent_card.get('target_scope')}`** "
+                f"in your name (**`{user_id}`**), ADK `ToolContext.request_credential` paused tool execution and "
+                f"requested delegated OAuth 2.0 authorization (`cloud-platform.read-only`).\n\n"
+                f"Please click **Authorize with Google Cloud (OAuth 2.0)** in the consent card below to inject your "
+                f"delegated credential into `ToolContext` and automatically resume this scan."
+            )
+
+        status = "OAUTH_CONSENT_REQUIRED" if active_consent_card else ("OK" if assistant_text else "MODEL_ERROR")
         error: Optional[Dict[str, Any]] = None
-        if not assistant_text:
+        if not assistant_text and not active_consent_card:
             if error_events:
                 error = error_events[-1]
             elif served_by["errors"]:
@@ -1398,6 +2132,7 @@ def create_workspace_app(
                 "model_label": model_label,
                 "status": status,
                 "error": error,
+                "oauth_consent_required": active_consent_card,
             }
         _save_session_metadata_map(meta_map)
 
@@ -1412,6 +2147,8 @@ def create_workspace_app(
             "thinking_level": entry.get("thinking_level"),
             "response": assistant_text,
             "error": error,
+            "oauth_consent_required": active_consent_card,
+            "oauth_consent_cards": turn_consent_cards,
             "served_by": served_by,
             "uploaded_artifacts": saved_artifacts_meta,
             "tool_calls": tool_calls_trace,
@@ -1419,7 +2156,7 @@ def create_workspace_app(
             "connection": get_gcp_connection_config(mask_token=True, user_id=user_id),
             "updated_at": now_iso,
         }
-        return JSONResponse(status_code=200 if status == "OK" else 502, content=payload)
+        return JSONResponse(status_code=200 if status in ("OK", "OAUTH_CONSENT_REQUIRED") else 502, content=payload)
 
     # =========================================================================
     # gcloud CLI and dynamic credential bridge (isolated per tenant user)

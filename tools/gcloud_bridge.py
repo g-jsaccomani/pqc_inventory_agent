@@ -82,6 +82,13 @@ _MODE_ALIASES: Dict[str, str] = {
     "gcloud_token": "access_token",
     "user_token": "access_token",
     "user gcloud access token": "access_token",
+    "oauth": "access_token",
+    "oauth2": "access_token",
+    "oauth_token": "access_token",
+    "oauth_3lo": "access_token",
+    "3lo": "access_token",
+    "user_oauth": "access_token",
+    "user oauth 2.0 (3lo)": "access_token",
 }
 
 # Read-only verbs allowed in `execute_gcloud_command`
@@ -296,6 +303,8 @@ def get_gcp_connection_config(mask_token: bool = True, user_id: Optional[str] = 
         "user_id": uid,
         "mode": mode,
         "mode_label": CONNECTION_MODES.get(mode, CONNECTION_MODES["adc"]),
+        "auth_flow": "oauth2_3lo" if mode == "access_token" else mode,
+        "oauth_consent_required": bool(mode == "access_token" and not has_token),
         "organization_id": state.get("organization_id", "31564119954"),
         "project_id": state.get("project_id", "pqc-inventory-agent-cd06"),
         "location": state.get("location", "all"),

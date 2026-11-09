@@ -751,6 +751,129 @@ def test_multi_tenant_google_auth_regional_sessions_and_isolated_connections(tmp
             assert tenants_summary["by_region"].get(reg, 0) >= 1
 
 
+def test_oauth_3lo_tool_context_consent_card_and_credential_injection(tmp_path):
+    from unittest.mock import MagicMock
+
+    from fastapi.testclient import TestClient
+
+    from pqc_agent.workspace_server import (
+        GCP_OAUTH_CREDENTIAL_KEY,
+        PqcOAuth3LOPlugin,
+        _TURN_OAUTH_CONSENT_CARDS,
+        build_gcp_oauth_auth_config,
+    )
+
+    app_instance = _make_app(tmp_path)
+    with TestClient(app_instance) as client:
+        # 1. Sign in an EMEA Googler and switch their connection mode to 3-Legged OAuth (with empty token)
+        login_res = client.post(
+            "/api/auth/google",
+            json={"email": "emea.arch@google.com", "name": "EMEA Architect", "region": "EMEA"},
+        ).json()
+        token = login_res["token"]
+
+        conn_res = client.post(
+            "/api/connection",
+            headers={"X-PQC-User-Token": token},
+            json={"mode": "oauth_3lo", "organization_id": "9988776655", "access_token": ""},
+        ).json()
+        assert conn_res["mode"] == "access_token"
+        assert conn_res["auth_flow"] == "oauth2_3lo"
+        assert conn_res["has_access_token"] is False
+        assert conn_res["oauth_consent_required"] is True
+
+        # 2. Configure an OAuth Client ID and inspect `/api/auth/oauth/authorize?format=json`
+        cfg_res = client.post(
+            "/api/auth/oauth/config",
+            json={"client_id": "777888999-test.apps.googleusercontent.com"},
+        ).json()
+        assert cfg_res["client_id"] == "777888999-test.apps.googleusercontent.com"
+
+        authz_json = client.get(
+            "/api/auth/oauth/authorize",
+            headers={"X-PQC-User-Token": token},
+            params={"format": "json", "scope": "organizations/9988776655"},
+        ).json()
+        assert authz_json["client_id_configured"] is True
+        assert "https://accounts.google.com/o/oauth2/v2/auth" in authz_json["google_auth_url"]
+        assert "cloud-platform.read-only" in authz_json["google_auth_url"]
+
+        # 3. Verify PqcOAuth3LOPlugin pauses protected tool execution and calls ToolContext.request_credential
+        plugin = PqcOAuth3LOPlugin()
+        fake_tool = MagicMock()
+        fake_tool.name = "collect_kms_inventory"
+
+        fake_inv_ctx = MagicMock()
+        fake_inv_ctx.user_id = "emea.arch@google.com"
+        fake_inv_ctx.session.id = "sess-3lo-1"
+
+        fake_tool_ctx = MagicMock()
+        fake_tool_ctx._invocation_context = fake_inv_ctx
+        fake_tool_ctx.function_call_id = "fc-kms-3lo-001"
+        fake_tool_ctx.state = {}
+
+        async def _fake_load_cred(_cfg):
+            return None
+
+        async def _fake_save_cred(_cfg):
+            return None
+
+        fake_tool_ctx.load_credential = _fake_load_cred
+        fake_tool_ctx.save_credential = _fake_save_cred
+
+        cards_bucket = []
+        tok_ctx = _TURN_OAUTH_CONSENT_CARDS.set(cards_bucket)
+        try:
+            gate_result = asyncio.run(
+                plugin.before_tool_callback(
+                    tool=fake_tool,
+                    tool_args={"scope": "organizations/9988776655"},
+                    tool_context=fake_tool_ctx,
+                )
+            )
+        finally:
+            _TURN_OAUTH_CONSENT_CARDS.reset(tok_ctx)
+
+        assert gate_result is not None
+        assert gate_result["status"] == "OAUTH_3LO_CONSENT_REQUIRED"
+        assert gate_result["oauth_consent_required"] is True
+        assert fake_tool_ctx.request_credential.called
+        assert len(cards_bucket) == 1
+        assert cards_bucket[0]["tool_name"] == "collect_kms_inventory"
+        assert cards_bucket[0]["target_scope"] == "organizations/9988776655"
+
+        # 4. User grants consent via `/api/auth/tool-consent` -> injects token into ADK session & connection
+        sess_created = client.post(
+            "/api/sessions",
+            headers={"X-PQC-User-Token": token},
+            json={"title": "EMEA 3LO Session"},
+        ).json()
+        consent_res = client.post(
+            "/api/auth/tool-consent",
+            headers={"X-PQC-User-Token": token},
+            json={
+                "session_id": sess_created["session_id"],
+                "access_token": "ya29.emea_delegated_oauth_3lo_token_123456",
+                "tool_name": "collect_kms_inventory",
+                "target_scope": "organizations/9988776655",
+            },
+        ).json()
+        assert consent_res["status"] == "AUTHORIZED"
+        assert consent_res["credential_key"] == GCP_OAUTH_CREDENTIAL_KEY
+        assert consent_res["connection"]["has_access_token"] is True
+        assert consent_res["connection"]["oauth_consent_required"] is False
+
+        # 5. Now `before_tool_callback` allows the tool to proceed (`None`)
+        gate_after_consent = asyncio.run(
+            plugin.before_tool_callback(
+                tool=fake_tool,
+                tool_args={"scope": "organizations/9988776655"},
+                tool_context=fake_tool_ctx,
+            )
+        )
+        assert gate_after_consent is None
+
+
 @pytest.mark.skipif(os.getenv("PQC_LIVE_LLM_TEST") != "1", reason="Set PQC_LIVE_LLM_TEST=1 with Vertex AI access to run.")
 def test_live_vertex_gemini_turn_reports_model_telemetry():
     import main
@@ -759,4 +882,5 @@ def test_live_vertex_gemini_turn_reports_model_telemetry():
     assert result["status"] == "OK", result["error"]
     assert result["served_by"]["models_used"]
     assert result["served_by"]["prompt_tokens"] > 0
+
 
