@@ -449,19 +449,22 @@ def test_model_registry_offers_only_verified_gemini_models():
     assert registry.resolve("gemini-b")["thinking_level"] == "MEDIUM"
 
 
-def test_api_models_and_chat_report_real_model_telemetry(tmp_path):
+def test_api_models_and_chat_report_real_model_telemetry(tmp_path, signin):
     from fastapi.testclient import TestClient
 
     with TestClient(_make_app(tmp_path)) as client:
-        models = client.get("/api/models", params={"refresh": "true"}).json()
+        assert client.get("/api/models", params={"refresh": "true"}).status_code == 401  # billed probes need sign-in
+        auth = {"X-PQC-User-Token": signin(client, "tester@google.com")}
+        models = client.get("/api/models", params={"refresh": "true"}, headers=auth).json()
         assert [m["id"] for m in models["models"]] == ["fake-ok-model", "fake-fail-model"]
         assert models["default_model"] == "fake-ok-model"
         assert [u["model"] for u in models["unavailable_candidates"]] == ["fake-missing-model"]
 
-        resp = client.post("/api/chat", json={"user_id": "tester", "message": "Can you summarize?", "model": "fake-ok-model"})
+        resp = client.post("/api/chat", headers=auth, json={"message": "Can you summarize?", "model": "fake-ok-model"})
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "OK"
+        assert data["user_id"] == "tester@google.com"
         assert data["response"].startswith("Fake model answer to: Can you summarize?")
         served = data["served_by"]
         assert served["models_used"] == ["fake-ok-model-001"]
@@ -469,16 +472,17 @@ def test_api_models_and_chat_report_real_model_telemetry(tmp_path):
         assert (served["prompt_tokens"], served["output_tokens"], served["thinking_tokens"]) == (11, 7, 3)
         assert served["agents_involved"] == ["pqc_inventory_agent"]
 
-        history = client.get(f"/api/sessions/{data['session_id']}", params={"user_id": "tester"}).json()
+        history = client.get(f"/api/sessions/{data['session_id']}", headers=auth).json()
         assistant = [m for m in history["messages"] if m["role"] == "assistant"]
         assert assistant[-1]["served_by"]["models_used"] == ["fake-ok-model-001"]
 
 
-def test_chat_model_failure_is_explicit_and_never_replaced_by_templates(tmp_path):
+def test_chat_model_failure_is_explicit_and_never_replaced_by_templates(tmp_path, signin):
     from fastapi.testclient import TestClient
 
     with TestClient(_make_app(tmp_path)) as client:
-        resp = client.post("/api/chat", json={"user_id": "tester", "message": "Can you resume more?", "model": "fake-fail-model"})
+        auth = {"X-PQC-User-Token": signin(client, "tester@google.com")}
+        resp = client.post("/api/chat", headers=auth, json={"message": "Can you resume more?", "model": "fake-fail-model"})
         assert resp.status_code == 502
         data = resp.json()
         assert data["status"] == "MODEL_ERROR"
@@ -490,19 +494,20 @@ def test_chat_model_failure_is_explicit_and_never_replaced_by_templates(tmp_path
             assert canned not in blob
 
 
-def test_chat_rejects_unverified_and_legacy_model_ids(tmp_path):
+def test_chat_rejects_unverified_and_legacy_model_ids(tmp_path, signin):
     from fastapi.testclient import TestClient
 
     with TestClient(_make_app(tmp_path)) as client:
-        for model_id in ("fake-missing-model", "claude-opus-5.5-max", "gemini-4-argon-high"):
-            resp = client.post("/api/chat", json={"user_id": "tester", "message": "hello", "model": model_id})
+        auth = {"X-PQC-User-Token": signin(client, "tester@google.com")}
+        for model_id in ("fake-missing-model", "claude-opus-5.5-max", "gemini-4-argon-high", "gemini-2.5-flash"):
+            resp = client.post("/api/chat", headers=auth, json={"message": "hello", "model": model_id})
             assert resp.status_code == 400, model_id
             body = resp.json()
             assert body["status"] == "MODEL_NOT_AVAILABLE"
             assert "fake-ok-model" in body["available_models"]
 
 
-def test_persistent_session_service_and_sessions_api(tmp_path):
+def test_persistent_session_service_and_sessions_api(tmp_path, signin):
     from fastapi.testclient import TestClient
     from pqc_agent.workspace_server import DatabaseSessionService, ResilientGcsArtifactService
 
@@ -511,24 +516,28 @@ def test_persistent_session_service_and_sessions_api(tmp_path):
     assert isinstance(app_instance.state.artifact_service, ResilientGcsArtifactService)
 
     with TestClient(app_instance) as client:
-        created = client.post("/api/sessions", json={"user_id": "ciso", "title": "Executive PQC Review"}).json()
+        auth = {"X-PQC-User-Token": signin(client, "ciso@google.com")}
+        created = client.post("/api/sessions", headers=auth, json={"title": "Executive PQC Review"}).json()
         session_id = created["session_id"]
-        listed = client.get("/api/sessions", params={"user_id": "ciso"}).json()
+        assert created["user_id"] == "ciso@google.com"
+        listed = client.get("/api/sessions", headers=auth, params={"user_id": "ciso@google.com"}).json()
         assert any(s["session_id"] == session_id and s["title"] == "Executive PQC Review" for s in listed["sessions"])
-        detail = client.get(f"/api/sessions/{session_id}", params={"user_id": "ciso"}).json()
+        detail = client.get(f"/api/sessions/{session_id}", headers=auth).json()
         assert detail["messages"] == []
-        assert client.delete(f"/api/sessions/{session_id}", params={"user_id": "ciso"}).json()["deleted"] is True
-        assert client.get(f"/api/sessions/{session_id}", params={"user_id": "ciso"}).status_code == 404
+        assert client.delete(f"/api/sessions/{session_id}", headers=auth).json()["deleted"] is True
+        assert client.get(f"/api/sessions/{session_id}", headers=auth).status_code == 404
 
 
-def test_multimodal_upload_is_attached_for_the_model_without_pre_analysis(tmp_path):
+def test_multimodal_upload_is_attached_for_the_model_without_pre_analysis(tmp_path, signin):
     from fastapi.testclient import TestClient
 
     questionnaire = "# Discovery\n- Industry: banking\n- Data shelf-life (X): 15 years\n".encode("utf-8")
     with TestClient(_make_app(tmp_path)) as client:
+        auth = {"X-PQC-User-Token": signin(client, "tester@google.com")}
         resp = client.post(
             "/api/chat",
-            data={"user_id": "tester", "message": "What does this file say?", "model_id": "fake-ok-model"},
+            headers=auth,
+            data={"message": "What does this file say?", "model_id": "fake-ok-model"},
             files=[("files", ("discovery.md", questionnaire, "text/markdown"))],
         )
         assert resp.status_code == 200
@@ -536,7 +545,7 @@ def test_multimodal_upload_is_attached_for_the_model_without_pre_analysis(tmp_pa
         assert data["status"] == "OK"
         assert data["uploaded_artifacts"][0]["filename"] == "discovery.md"
         assert all(tc["name"] != "analyze_uploaded_pqc_artifact" for tc in data["tool_calls"])
-        detail = client.get(f"/api/sessions/{data['session_id']}", params={"user_id": "tester"}).json()
+        detail = client.get(f"/api/sessions/{data['session_id']}", headers=auth).json()
         assert "discovery.md" in detail["artifacts"]
 
 
@@ -567,12 +576,13 @@ def test_gcloud_bridge_connection_modes_and_safe_command_execution():
     assert get_gcp_connection_config()["mode"] == "adc"
 
 
-def test_portal_ui_is_gemini_only_dynamic_and_transparent(tmp_path):
+def test_portal_ui_is_gemini_only_dynamic_and_transparent(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
 
+    monkeypatch.delenv("K_SERVICE", raising=False)  # local development: ADK dev UI enabled by default
     with TestClient(_make_app(tmp_path)) as client:
         html = client.get("/").text
-        for removed in ("Claude", "Gemini 4 Argon", "Gemini 3.8 Flash", "Gemini Pro Next", "PHASE 01", "🛡️"):
+        for removed in ("Claude", "Gemini 4 Argon", "Gemini 3.8 Flash", "Gemini Pro Next", "PHASE 01", "🛡️", "X-PQC-User-Id"):
             assert removed not in html, removed
         for required in (
             "loadModelCatalog",
@@ -583,6 +593,9 @@ def test_portal_ui_is_gemini_only_dynamic_and_transparent(tmp_path):
             "await createNewSession(PHASE_TITLES[index]",
             "Running specialist agents on",
             "Thinking (",
+            "/api/auth/config",
+            "gcloud auth print-access-token",
+            "PQC_SIGNIN_COMPLETE",
         ):
             assert required in html, required
         for chip in ("P1", "P2", "P3", "P4", "P5"):
@@ -602,6 +615,11 @@ def test_deployment_configuration_disables_simulation_and_keeps_persistence():
         assert "PQC_SIMULATION_MODE=AUTO" not in script
         assert "name=pqc-data,type=cloud-storage,bucket=" in script
         assert "volume=pqc-data,mount-path=/data" in script
+        # Hardened auth on Cloud Run: verified sign-in only, ADK DevServer and ADK REST API off.
+        assert "PQC_ALLOW_UNVERIFIED_SIGNIN=false" in script
+        assert "PQC_ENABLE_ADK_DEV_UI=false" in script
+        assert "PQC_ENABLE_ADK_API=false" in script
+        assert "PQC_ALLOW_UNVERIFIED_SIGNIN=true" not in script
 
 
 def test_tools_smoke_runner_never_invokes_the_llm():
@@ -613,19 +631,25 @@ def test_tools_smoke_runner_never_invokes_the_llm():
     assert result["kms_inventory_summary"]["data_source"] == "SIMULATED_DEMO_DATASET"
 
 
-def test_multi_tenant_google_auth_regional_sessions_and_isolated_connections(tmp_path):
+def test_multi_tenant_google_auth_regional_sessions_and_isolated_connections(tmp_path, google_verifier, monkeypatch):
     from fastapi.testclient import TestClient
+
+    from pqc_agent import auth_guard
 
     app_instance = _make_app(tmp_path)
     with TestClient(app_instance) as client:
-        # 1. Unauthorized external domain must be rejected
-        bad_auth = client.post("/api/auth/google", json={"email": "attacker@evil.example.com", "region": "NorthAm"})
+        # 1. Email-only sign-in is rejected (no verified credential); a verified external domain is forbidden
+        email_only = client.post("/api/auth/google", json={"email": "alice@google.com", "region": "NorthAm"})
+        assert email_only.status_code == 401
+        bad_auth = client.post(
+            "/api/auth/google", json={"google_access_token": "valid:attacker@evil.example.com", "region": "NorthAm"}
+        )
         assert bad_auth.status_code == 403
 
-        # 2. Sign in 4 Googlers across NorthAm, EMEA, India, and APAC
+        # 2. Sign in 4 Googlers across NorthAm, EMEA, India, and APAC (verified Google tokens)
         alice_login = client.post(
             "/api/auth/google",
-            json={"email": "alice@google.com", "name": "Alice NorthAm", "timezone": "America/New_York"},
+            json={"google_access_token": "valid:alice@google.com", "name": "Alice NorthAm", "timezone": "America/New_York"},
         )
         assert alice_login.status_code == 200
         alice_data = alice_login.json()
@@ -636,7 +660,7 @@ def test_multi_tenant_google_auth_regional_sessions_and_isolated_connections(tmp
 
         rahul_login = client.post(
             "/api/auth/google",
-            json={"email": "rahul@google.com", "name": "Rahul India", "timezone": "Asia/Kolkata"},
+            json={"google_access_token": "valid:rahul@google.com", "name": "Rahul India", "timezone": "Asia/Kolkata"},
         )
         assert rahul_login.status_code == 200
         rahul_data = rahul_login.json()
@@ -645,7 +669,7 @@ def test_multi_tenant_google_auth_regional_sessions_and_isolated_connections(tmp
 
         anna_login = client.post(
             "/api/auth/google",
-            json={"email": "anna@google.com", "name": "Anna EMEA", "timezone": "Europe/London"},
+            json={"google_access_token": "valid:anna@google.com", "name": "Anna EMEA", "timezone": "Europe/London"},
         )
         assert anna_login.status_code == 200
         assert anna_login.json()["user"]["region"] == "EMEA"
@@ -653,7 +677,7 @@ def test_multi_tenant_google_auth_regional_sessions_and_isolated_connections(tmp
 
         kenji_login = client.post(
             "/api/auth/google",
-            json={"email": "kenji@google.com", "name": "Kenji APAC", "timezone": "Asia/Tokyo"},
+            json={"google_access_token": "valid:kenji@google.com", "name": "Kenji APAC", "timezone": "Asia/Tokyo"},
         )
         assert kenji_login.status_code == 200
         assert kenji_login.json()["user"]["region"] == "APAC"
@@ -734,24 +758,44 @@ def test_multi_tenant_google_auth_regional_sessions_and_isolated_connections(tmp
         )
         assert cross_delete.status_code == 404
 
-        # 5. Cloud IAP Header auto-authentication & persistent restoration
-        iap_me = client.get(
+        # 5. Cloud IAP: the plain header is NEVER trusted; only a verified X-Goog-IAP-JWT-Assertion authenticates
+        client.cookies.clear()
+        forged_me = client.get(
             "/api/auth/me",
             headers={"X-Goog-Authenticated-User-Email": "accounts.google.com:alice@google.com"},
+        ).json()
+        assert forged_me["authenticated"] is False
+        assert forged_me["iap_active"] is False
+
+        def fake_verify_iap_jwt(token, audience=None):
+            if token == "signed-iap-jwt-for-alice":
+                return {"iss": auth_guard.IAP_ISSUER, "email": "alice@google.com", "sub": "accounts.google.com:1"}
+            return None
+
+        monkeypatch.setattr(auth_guard, "verify_iap_jwt", fake_verify_iap_jwt)
+        iap_me = client.get(
+            "/api/auth/me",
+            headers={
+                "X-Goog-IAP-JWT-Assertion": "signed-iap-jwt-for-alice",
+                "X-Goog-Authenticated-User-Email": "accounts.google.com:rahul@google.com",  # ignored
+            },
         ).json()
         assert iap_me["authenticated"] is True
         assert iap_me["iap_active"] is True
         assert iap_me["user"]["email"] == "alice@google.com"
         assert iap_me["session_count"] == 1
         assert iap_me["connection"]["organization_id"] == "111111111111"
+        bad_jwt_me = client.get("/api/auth/me", headers={"X-Goog-IAP-JWT-Assertion": "forged"}).json()
+        assert bad_jwt_me["authenticated"] is False
 
-        # 6. Tenants summary shows all 4 regions
-        tenants_summary = client.get("/api/auth/tenants").json()
+        # 6. Tenants summary (signed-in users only) shows all 4 regions
+        assert client.get("/api/auth/tenants").status_code == 401
+        tenants_summary = client.get("/api/auth/tenants", headers={"X-PQC-User-Token": alice_token}).json()
         for reg in ("NorthAm", "EMEA", "India", "APAC"):
             assert tenants_summary["by_region"].get(reg, 0) >= 1
 
 
-def test_oauth_3lo_tool_context_consent_card_and_credential_injection(tmp_path):
+def test_oauth_3lo_tool_context_consent_card_and_credential_injection(tmp_path, signin):
     from unittest.mock import MagicMock
 
     from fastapi.testclient import TestClient
@@ -766,11 +810,7 @@ def test_oauth_3lo_tool_context_consent_card_and_credential_injection(tmp_path):
     app_instance = _make_app(tmp_path)
     with TestClient(app_instance) as client:
         # 1. Sign in an EMEA Googler and switch their connection mode to 3-Legged OAuth (with empty token)
-        login_res = client.post(
-            "/api/auth/google",
-            json={"email": "emea.arch@google.com", "name": "EMEA Architect", "region": "EMEA"},
-        ).json()
-        token = login_res["token"]
+        token = signin(client, "emea.arch@google.com", name="EMEA Architect", region="EMEA")
 
         conn_res = client.post(
             "/api/connection",
@@ -783,8 +823,15 @@ def test_oauth_3lo_tool_context_consent_card_and_credential_injection(tmp_path):
         assert conn_res["oauth_consent_required"] is True
 
         # 2. Configure an OAuth Client ID and inspect `/api/auth/oauth/authorize?format=json`
+        client.cookies.clear()  # from here on the identity comes only from the explicit session token header
+        assert client.post(
+            "/api/auth/oauth/config",
+            headers={"X-PQC-User-Token": "forged.token"},
+            json={"client_id": "attacker-client.apps.googleusercontent.com"},
+        ).status_code == 401
         cfg_res = client.post(
             "/api/auth/oauth/config",
+            headers={"X-PQC-User-Token": token},
             json={"client_id": "777888999-test.apps.googleusercontent.com"},
         ).json()
         assert cfg_res["client_id"] == "777888999-test.apps.googleusercontent.com"

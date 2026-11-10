@@ -29,7 +29,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PQC_SIMULATION_MODE=FALSE \
     SESSION_DB_URL=sqlite:///data/pqc_sessions.db \
     PQC_ARTIFACT_BUCKET=gs://pqc-inventory-agent-cd06-pqc-agent-staging \
-    PQC_CALIBRATION_STORE_PATH=/data/calibration-history.jsonl
+    PQC_CALIBRATION_STORE_PATH=/data/calibration-history.jsonl \
+    PQC_ALLOW_UNVERIFIED_SIGNIN=false \
+    PQC_ENABLE_ADK_DEV_UI=false \
+    PQC_ENABLE_ADK_API=false
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

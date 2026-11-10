@@ -1,8 +1,10 @@
 """Gemini model catalog for the Workspace Portal.
 
-Only Gemini models that are VERIFIED to answer on Vertex AI in the configured project are offered to users.
+Only Gemini PRO models that are VERIFIED to answer on Vertex AI in the configured project are offered to users
+(lighter non-Pro tiers are intentionally excluded).
 Verification sends one tiny real request per candidate model (cached for `PQC_MODEL_VERIFICATION_TTL_SECONDS`).
-Candidates can be extended without code changes via `PQC_GEMINI_MODEL_CANDIDATES` (comma-separated model IDs).
+Candidates can be extended without code changes via `PQC_GEMINI_MODEL_CANDIDATES` (comma-separated model IDs); only
+Gemini Pro model IDs are accepted there (see `is_gemini_pro_model`).
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ import concurrent.futures
 import datetime
 import logging
 import os
+import re
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -20,17 +23,21 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL = os.getenv("PQC_AGENT_MODEL", "gemini-3.1-pro-preview-customtools")
 DEFAULT_THINKING_LEVEL = os.getenv("PQC_AGENT_THINKING_LEVEL", "MEDIUM")
 
-# Candidate Gemini models (real Vertex AI model IDs). Only verified ones are exposed in the UI.
+# Candidate Gemini PRO models (real Vertex AI model IDs). Only verified ones are exposed in the UI.
 GEMINI_MODEL_CANDIDATES: List[Dict[str, Any]] = [
     {"model": "gemini-3.1-pro-preview-customtools", "label": "Gemini 3.1 Pro (custom tools)", "thinking_levels": ["HIGH", "MEDIUM"]},
     {"model": "gemini-3.1-pro-preview", "label": "Gemini 3.1 Pro", "thinking_levels": ["HIGH", "MEDIUM"]},
     {"model": "gemini-3-pro-preview", "label": "Gemini 3 Pro", "thinking_levels": ["HIGH", "LOW"]},
-    {"model": "gemini-3-flash-preview", "label": "Gemini 3 Flash", "thinking_levels": ["MEDIUM", "LOW"]},
-    {"model": "gemini-3.1-flash-lite-preview", "label": "Gemini 3.1 Flash Lite", "thinking_levels": ["LOW"]},
     {"model": "gemini-2.5-pro", "label": "Gemini 2.5 Pro", "thinking_levels": [None]},
-    {"model": "gemini-2.5-flash", "label": "Gemini 2.5 Flash", "thinking_levels": [None]},
-    {"model": "gemini-2.5-flash-lite", "label": "Gemini 2.5 Flash Lite", "thinking_levels": [None]},
 ]
+
+
+_GEMINI_PRO_MODEL_RE = re.compile(r"^gemini-[0-9][0-9.]*-pro(?:-|$)")
+
+
+def is_gemini_pro_model(model: str) -> bool:
+    """True only for Gemini Pro model IDs (e.g. `gemini-2.5-pro`, `gemini-3.1-pro-preview-customtools`)."""
+    return bool(_GEMINI_PRO_MODEL_RE.match((model or "").strip().lower()))
 
 ProbeResult = Tuple[bool, Dict[str, Any]]
 ProbeFn = Callable[[str, Optional[str]], ProbeResult]
@@ -52,8 +59,10 @@ def _extra_candidates_from_env() -> List[Dict[str, Any]]:
     raw = os.getenv("PQC_GEMINI_MODEL_CANDIDATES", "")
     extra = []
     for model in [m.strip() for m in raw.split(",") if m.strip()]:
-        if model.startswith("gemini-"):
+        if is_gemini_pro_model(model):
             extra.append({"model": model, "label": _label_from_model_id(model), "thinking_levels": ["MEDIUM"]})
+        else:
+            logger.warning("Ignoring non-Pro model %r from PQC_GEMINI_MODEL_CANDIDATES (Gemini Pro models only).", model)
     return extra
 
 
@@ -99,7 +108,8 @@ class ModelRegistry:
         base = candidates if candidates is not None else GEMINI_MODEL_CANDIDATES + _extra_candidates_from_env()
         seen: Dict[str, Dict[str, Any]] = {}
         for cand in base:
-            if cand["model"].startswith("gemini-") or candidates is not None:
+            # Explicit `candidates` (tests / callers) are used as given; the default catalog is Gemini Pro only.
+            if candidates is not None or is_gemini_pro_model(cand["model"]):
                 seen.setdefault(cand["model"], dict(cand))
         self.candidates: List[Dict[str, Any]] = list(seen.values())
         self.probe: ProbeFn = probe or vertex_generate_probe
@@ -239,7 +249,7 @@ class ModelRegistry:
         ]
         default = self.default_entry()
         return {
-            "provider": "Vertex AI (Gemini only)",
+            "provider": "Vertex AI (Gemini Pro only)",
             "project": os.getenv("GOOGLE_CLOUD_PROJECT"),
             "location": os.getenv("GOOGLE_CLOUD_LOCATION"),
             "default_model": default["id"] if default else None,

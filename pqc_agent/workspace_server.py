@@ -6,22 +6,25 @@ Guarantees implemented here:
    including the specialist sub-agents (`served_by`).
 3. No silent fallbacks: if the model fails, the API returns an explicit error and no canned or templated text.
 4. Persistent history (ADK DatabaseSessionService + GCS artifacts), multimodal uploads, read-only gcloud bridge,
-   and ADK's `/dev-ui/` for trace inspection.
+   and ADK's `/dev-ui/` for trace inspection (local development only; disabled on Cloud Run).
+5. Authentication (see `pqc_agent/auth_guard.py`): sign-in requires a verified Google credential, the authenticated
+   identity (signed session token/cookie or verified Cloud IAP JWT) is the only source of `user_id`, ADK-native REST
+   routes are 404 on Cloud Run (and identity-bound when enabled), no wildcard CORS, no constant HMAC key.
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
 import contextvars
 import datetime
-import hashlib
 import hmac
+import html
 import json
 import logging
 import mimetypes
 import os
 import secrets
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -40,9 +43,7 @@ from google.adk.auth import (
     OAuth2Auth,
     OpenIdConnectWithConfig,
 )
-from google.adk.auth.credential_service.session_state_credential_service import (
-    SessionStateCredentialService,
-)
+from google.adk.auth.credential_service.in_memory_credential_service import InMemoryCredentialService
 from google.adk.cli.fast_api import get_fast_api_app
 from google.adk.cli.service_registry import get_service_registry
 from google.adk.plugins.base_plugin import BasePlugin
@@ -53,12 +54,14 @@ from google.adk.tools.tool_context import ToolContext
 from google.genai import types
 from pydantic import BaseModel
 
+from pqc_agent import auth_guard
 from pqc_agent.agent import create_pqc_agent
 from pqc_agent.model_registry import ModelRegistry
 from pqc_agent.portal_ui import PORTAL_HTML
 from pqc_agent.telemetry import LlmCallTelemetryPlugin, capture_llm_calls, summarize_llm_calls
 from tools.calibration_engine import register_uploaded_artifact_for_analysis
 from tools.gcloud_bridge import (
+    clear_user_access_token,
     execute_gcloud_command,
     get_gcp_connection_config,
     get_recent_gcloud_traces,
@@ -73,6 +76,10 @@ APP_NAME = "pqc_agent"
 DEFAULT_USER_ID = "sec-architect"
 SESSION_COOKIE_NAME = "pqc_session_token"
 SESSION_TOKEN_TTL_SECONDS = 30 * 24 * 3600  # 30 days
+SESSION_TOKEN_TYPE = "pqc_session"  # `typ` claim: OAuth state values can never be replayed as session tokens
+OAUTH_STATE_TYPE = "pqc_oauth_state"
+OAUTH_STATE_TTL_SECONDS = 600
+OAUTH_NONCE_COOKIE_NAME = "pqc_oauth_nonce"
 ALLOWED_AUTH_DOMAINS = tuple(
     d.strip().lower()
     for d in os.getenv(
@@ -249,6 +256,10 @@ class ResilientGcsArtifactService(GcsArtifactService):
 
 # Sidecar metadata store in SQLite/JSON for custom session titles, attachments, and tool traces
 def _get_data_dir() -> str:
+    override = os.getenv("PQC_DATA_DIR", "").strip()
+    if override:
+        os.makedirs(override, exist_ok=True)
+        return override
     if os.path.isdir("/data") and os.access("/data", os.W_OK):
         return "/data"
     os.makedirs("data", exist_ok=True)
@@ -315,34 +326,17 @@ _AUTH_SECRET_CACHE: Optional[bytes] = None
 
 
 def _get_auth_secret() -> bytes:
-    """Returns a persistent 256-bit HMAC secret stored on `/data` so signed cookies survive restarts."""
+    """Returns the HMAC key for session tokens and OAuth state: `PQC_AUTH_SECRET` > persisted random key on the data
+    dir > ephemeral random key (with a warning). There is no constant fallback key."""
     global _AUTH_SECRET_CACHE
     if _AUTH_SECRET_CACHE is not None:
         return _AUTH_SECRET_CACHE
-    env_secret = os.getenv("PQC_AUTH_SECRET", "").strip()
-    if env_secret:
-        _AUTH_SECRET_CACHE = env_secret.encode("utf-8")
-        return _AUTH_SECRET_CACHE
-    secret_path = os.path.join(_get_data_dir(), ".pqc_auth_secret")
     try:
-        if os.path.exists(secret_path):
-            with open(secret_path, "r", encoding="utf-8") as f:
-                raw = f.read().strip()
-                if len(raw) >= 32:
-                    _AUTH_SECRET_CACHE = raw.encode("utf-8")
-                    return _AUTH_SECRET_CACHE
-        generated = secrets.token_hex(32)
-        with open(secret_path, "w", encoding="utf-8") as f:
-            f.write(generated)
-        try:
-            os.chmod(secret_path, 0o600)
-        except OSError:
-            pass
-        _AUTH_SECRET_CACHE = generated.encode("utf-8")
-        return _AUTH_SECRET_CACHE
+        data_dir: Optional[str] = _get_data_dir()
     except OSError:
-        _AUTH_SECRET_CACHE = b"pqc-workspace-fallback-hmac-key-2026"
-        return _AUTH_SECRET_CACHE
+        data_dir = None
+    _AUTH_SECRET_CACHE = auth_guard.load_or_create_hmac_secret(data_dir)
+    return _AUTH_SECRET_CACHE
 
 
 def infer_region_from_timezone(timezone_str: Optional[str] = None, explicit_region: Optional[str] = None) -> str:
@@ -423,48 +417,62 @@ def sign_tenant_session_token(user_profile: Dict[str, Any]) -> str:
         "name": user_profile.get("name") or _format_display_name(user_profile["email"]),
         "region": user_profile.get("region") or "NorthAm",
         "auth_method": user_profile.get("auth_method") or "google_workspace_signin",
+        "typ": SESSION_TOKEN_TYPE,
         "iat": now_ts,
         "exp": now_ts + SESSION_TOKEN_TTL_SECONDS,
     }
-    raw_bytes = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    b64_payload = base64.urlsafe_b64encode(raw_bytes).decode("ascii").rstrip("=")
-    sig = hmac.new(_get_auth_secret(), b64_payload.encode("ascii"), hashlib.sha256).hexdigest()
-    return f"{b64_payload}.{sig}"
+    return auth_guard.sign_payload(payload, _get_auth_secret())
 
 
 def verify_tenant_session_token(token: Optional[str]) -> Optional[Dict[str, Any]]:
-    """Verifies an HMAC-SHA256 signed session token and returns its decoded payload if valid and unexpired."""
-    if not token or "." not in str(token):
+    """Verifies an HMAC-SHA256 signed session token (`typ` = session, unexpired, allowed corporate domain)."""
+    decoded = auth_guard.verify_signed_payload(token, _get_auth_secret(), expected_type=SESSION_TOKEN_TYPE)
+    if not decoded:
         return None
-    raw = str(token).strip()
-    if raw.lower().startswith("bearer "):
-        raw = raw[7:].strip()
-    parts = raw.split(".", 1)
-    if len(parts) != 2:
+    email = normalize_user_id(decoded.get("email") or decoded.get("uid"))
+    ok, _ = is_allowed_corporate_email(email)
+    if not ok:
         return None
-    b64_payload, provided_sig = parts
-    expected_sig = hmac.new(_get_auth_secret(), b64_payload.encode("ascii"), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(provided_sig, expected_sig):
-        return None
+    return decoded
+
+
+def sign_oauth_state(payload: Dict[str, Any]) -> str:
+    """Signs an OAuth `state` value (typ = oauth_state, 10 minute expiry) so callbacks cannot be forged."""
+    now_ts = int(time.time())
+    body = dict(payload)
+    body.update({"typ": OAUTH_STATE_TYPE, "iat": now_ts, "exp": now_ts + OAUTH_STATE_TTL_SECONDS})
+    return auth_guard.sign_payload(body, _get_auth_secret())
+
+
+def verify_oauth_state(state: Optional[str]) -> Optional[Dict[str, Any]]:
+    return auth_guard.verify_signed_payload(state, _get_auth_secret(), expected_type=OAUTH_STATE_TYPE)
+
+
+def _is_true_claim(value: Any) -> bool:
+    return value in (True, 1, "true", "True", "TRUE", "1")
+
+
+def _accepted_id_token_audiences() -> Tuple[str, ...]:
+    """OAuth client IDs accepted as ID-token audience: `PQC_GOOGLE_ID_TOKEN_AUDIENCES` + the configured OAuth client."""
+    audiences = [a.strip() for a in os.getenv("PQC_GOOGLE_ID_TOKEN_AUDIENCES", "").split(",") if a.strip()]
     try:
-        padding = "=" * (-len(b64_payload) % 4)
-        decoded = json.loads(base64.urlsafe_b64decode(b64_payload + padding).decode("utf-8"))
-        if int(decoded.get("exp", 0)) < int(time.time()):
-            return None
-        email = normalize_user_id(decoded.get("email") or decoded.get("uid"))
-        ok, _ = is_allowed_corporate_email(email)
-        if not ok:
-            return None
-        return decoded
+        client_id = (load_oauth_client_config().get("client_id") or "").strip()
     except Exception:
-        return None
+        client_id = ""
+    if client_id:
+        audiences.append(client_id)
+    return tuple(dict.fromkeys(audiences))
 
 
 def _verify_google_oauth_or_id_token(
     id_token_jwt: Optional[str] = None,
     google_access_token: Optional[str] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """Verifies a Google Identity Services ID token (JWT) or Google OAuth access token via Google's tokeninfo/userinfo APIs."""
+    """Verifies a Google ID token (JWT) or a Google OAuth access token with Google's tokeninfo endpoint.
+
+    Returns `({"email", "email_verified": True, ...}, None)` only for a VERIFIED email in `ALLOWED_AUTH_DOMAINS`;
+    ID tokens must come from accounts.google.com and, when OAuth client IDs are configured, carry one of them as `aud`.
+    """
     if id_token_jwt:
         tok = id_token_jwt.strip()
         try:
@@ -472,14 +480,21 @@ def _verify_google_oauth_or_id_token(
             req = urllib.request.Request(url, headers={"Accept": "application/json"})
             with urllib.request.urlopen(req, timeout=8) as resp:
                 info = json.loads(resp.read().decode("utf-8"))
-            email = normalize_user_id(info.get("email"))
-            if not email or info.get("email_verified") not in (True, "true", "True", "1"):
+            if info.get("iss") not in ("accounts.google.com", "https://accounts.google.com"):
+                return None, "Google ID token has an unexpected issuer."
+            audiences = _accepted_id_token_audiences()
+            if audiences and info.get("aud") not in audiences:
+                return None, "Google ID token was issued for a different OAuth client (audience mismatch)."
+            raw_email = str(info.get("email") or "").strip()
+            if not raw_email or not _is_true_claim(info.get("email_verified")):
                 return None, "Google ID token does not contain a verified email address."
+            email = normalize_user_id(raw_email)
             ok, msg = is_allowed_corporate_email(email)
             if not ok:
                 return None, msg
             return {
                 "email": email,
+                "email_verified": True,
                 "name": info.get("name") or _format_display_name(email),
                 "picture": info.get("picture") or "",
                 "hd": info.get("hd") or email.split("@")[-1],
@@ -497,18 +512,30 @@ def _verify_google_oauth_or_id_token(
             req = urllib.request.Request(url, headers={"Accept": "application/json"})
             with urllib.request.urlopen(req, timeout=8) as resp:
                 info = json.loads(resp.read().decode("utf-8"))
-            email = normalize_user_id(info.get("email"))
-            if not email:
-                return None, "Google access token did not return a user email scope."
+            raw_email = str(info.get("email") or "").strip()
+            if not raw_email:
+                return None, (
+                    "Google access token has no email claim: create it with the userinfo.email scope "
+                    "(e.g. `gcloud auth print-access-token`)."
+                )
+            if not _is_true_claim(info.get("email_verified")):
+                return None, "Google access token does not belong to a verified email address."
+            email = normalize_user_id(raw_email)
             ok, msg = is_allowed_corporate_email(email)
             if not ok:
                 return None, msg
+            try:
+                expires_in = int(info.get("expires_in") or 0) or None
+            except (TypeError, ValueError):
+                expires_in = None
             return {
                 "email": email,
+                "email_verified": True,
                 "name": _format_display_name(email),
                 "picture": "",
                 "hd": email.split("@")[-1],
                 "auth_method": "google_access_token",
+                "expires_in": expires_in,
             }, None
         except Exception as exc:
             return None, f"Google OAuth access token verification failed: {exc}"
@@ -554,68 +581,59 @@ def upsert_tenant_user_profile(
     return profile
 
 
-def resolve_authenticated_tenant_from_request(request: Request) -> Tuple[Optional[Dict[str, Any]], bool]:
-    """Inspects Cloud IAP headers, Bearer/X-PQC-User-Token headers, and cookies for an authenticated @google.com user.
+_IDENTITY_RESOLVER = auth_guard.IdentityResolver(
+    # Lambdas keep module-level lookups late-bound (monkeypatch friendly in tests).
+    verify_session_token=lambda token: verify_tenant_session_token(token),
+    is_allowed_email=lambda email: is_allowed_corporate_email(email)[0],
+    session_cookie_name=SESSION_COOKIE_NAME,
+    session_token_headers=("X-PQC-User-Token", "Authorization"),
+    normalize_user_id=normalize_user_id,
+)
 
-    Returns:
-        (user_profile_or_None, iap_active_bool)
+
+def resolve_request_identity(conn: Any) -> Optional[auth_guard.AuthenticatedIdentity]:
+    """Authenticated identity of a request/connection: verified Cloud IAP JWT or signed portal session token.
+
+    `X-PQC-User-Id`, `user_id` parameters and the plain `X-Goog-Authenticated-User-Email` header are never trusted.
     """
-    # 1. Check Cloud Identity-Aware Proxy (IAP) header first
-    iap_email_raw = (request.headers.get("X-Goog-Authenticated-User-Email") or "").strip()
-    if iap_email_raw:
-        clean_iap_email = normalize_user_id(iap_email_raw)
-        ok, _ = is_allowed_corporate_email(clean_iap_email)
-        if ok:
-            profile = upsert_tenant_user_profile(
-                email=clean_iap_email,
-                region=request.headers.get("X-PQC-User-Region"),
-                timezone_str=request.headers.get("X-PQC-User-Timezone"),
-                auth_method="cloud_iap",
-            )
-            return profile, True
+    return _IDENTITY_RESOLVER.resolve(conn)
 
-    # 2. Check signed session token in X-PQC-User-Token, Authorization Bearer, or Cookie
-    candidate_token = (
-        request.headers.get("X-PQC-User-Token")
-        or request.headers.get("Authorization")
-        or request.cookies.get(SESSION_COOKIE_NAME)
-    )
-    decoded = verify_tenant_session_token(candidate_token)
-    if decoded:
-        email = normalize_user_id(decoded.get("email") or decoded.get("uid"))
-        users_map = _load_tenant_users_map()
-        profile = users_map.get(email)
-        if not profile:
-            profile = upsert_tenant_user_profile(
-                email=email,
-                name=decoded.get("name"),
-                region=decoded.get("region"),
-                auth_method=decoded.get("auth_method", "google_workspace_signin"),
-            )
-        return profile, False
 
-    return None, False
+def resolve_authenticated_tenant_from_request(request: Request) -> Tuple[Optional[Dict[str, Any]], bool]:
+    """Returns `(tenant_profile_or_None, iap_active)` for the request's authenticated identity (if any)."""
+    identity = resolve_request_identity(request)
+    if identity is None:
+        return None, False
+    if identity.source == "iap":
+        profile = upsert_tenant_user_profile(
+            email=identity.email,
+            region=request.headers.get("X-PQC-User-Region"),
+            timezone_str=request.headers.get("X-PQC-User-Timezone"),
+            auth_method="cloud_iap",
+        )
+        return profile, True
+    profile = _load_tenant_users_map().get(identity.user_id)
+    if not profile:
+        claims = identity.claims or {}
+        profile = upsert_tenant_user_profile(
+            email=identity.email,
+            name=claims.get("name"),
+            region=claims.get("region"),
+            auth_method=claims.get("auth_method", "google_workspace_signin"),
+        )
+    return profile, False
 
 
 def activate_request_tenant_user(request: Request, explicit_user_id: Optional[str] = None) -> str:
-    """Resolves the active user_id for a request and binds it to the current execution context (`ContextVar`)."""
-    auth_profile, _ = resolve_authenticated_tenant_from_request(request)
-    header_uid = (request.headers.get("X-PQC-User-Id") or "").strip()
+    """Returns the authenticated user_id for a tenant-scoped request and binds it to the tenant `ContextVar`.
 
-    # If the request has an authenticated @google.com session and the caller didn't pass a custom non-default user_id
-    if auth_profile and (not explicit_user_id or explicit_user_id == DEFAULT_USER_ID):
-        resolved = auth_profile["user_id"]
-    elif explicit_user_id and explicit_user_id != DEFAULT_USER_ID:
-        resolved = normalize_user_id(explicit_user_id)
-    elif header_uid and header_uid != DEFAULT_USER_ID:
-        resolved = normalize_user_id(header_uid)
-    elif auth_profile:
-        resolved = auth_profile["user_id"]
-    else:
-        resolved = normalize_user_id(explicit_user_id or DEFAULT_USER_ID)
-
-    set_current_tenant_user(resolved)
-    return resolved
+    The authenticated identity is the ONLY source of the user id: HTTP 401 without one, HTTP 403 when an explicit
+    `user_id` parameter names somebody else. `X-PQC-User-Id` is ignored entirely.
+    """
+    identity = resolve_request_identity(request)
+    uid = auth_guard.bind_user_id(identity, explicit_user_id, normalize_user_id=normalize_user_id)
+    set_current_tenant_user(uid)
+    return uid
 
 
 # =============================================================================
@@ -767,7 +785,7 @@ class PqcOAuth3LOPlugin(BasePlugin):
     """ADK Plugin that integrates `ToolContext` 3-Legged OAuth (3LO) credentials with GCP discovery tools.
 
     Responsibilities:
-    1. Synchronizes delegated OAuth 2.0 tokens between ADK's `ToolContext` (`SessionStateCredentialService`)
+    1. Synchronizes delegated OAuth 2.0 tokens between ADK's `ToolContext` (in-memory credential service)
        and the isolated per-user `gcloud_bridge` connection state.
     2. When a user is in 3-Legged OAuth mode (`mode == 'access_token'`) and has not yet granted a token,
        calls `tool_context.request_credential(auth_config)` before the tool executes and emits an interactive
@@ -972,16 +990,18 @@ class GoogleAuthSignInPayload(BaseModel):
     id_token: Optional[str] = None
     google_access_token: Optional[str] = None
     use_token_for_gcp_connection: bool = False
+    oauth_state: Optional[str] = None  # set by the OAuth popup (implicit flow); verified + bound to this browser
 
 
 class ToolConsentPayload(BaseModel):
-    user_id: Optional[str] = None
+    user_id: Optional[str] = None  # optional; must equal the authenticated user when given
     session_id: Optional[str] = None
     access_token: str
     function_call_id: Optional[str] = None
     tool_name: Optional[str] = None
     target_scope: Optional[str] = None
     verify_with_google: bool = False
+    oauth_state: Optional[str] = None  # set by the OAuth popup (implicit flow); verified + bound to this browser
 
 
 class OAuthClientConfigPayload(BaseModel):
@@ -990,7 +1010,7 @@ class OAuthClientConfigPayload(BaseModel):
 
 
 class CreateSessionPayload(BaseModel):
-    user_id: str = DEFAULT_USER_ID
+    user_id: Optional[str] = None  # optional; must equal the authenticated user when given
     title: Optional[str] = None
     scope: Optional[str] = None
     session_id: Optional[str] = None
@@ -1009,6 +1029,182 @@ class ConnectionConfigPayload(BaseModel):
 class GcloudCommandPayload(BaseModel):
     command: str
     user_id: Optional[str] = None
+
+
+EMAIL_ONLY_SIGNIN_DISABLED_DETAIL = (
+    "Email-only sign-in is disabled: a verified Google credential is required. Run `gcloud auth print-access-token` "
+    "and paste the token in the sign-in dialog, or use 'Sign in with Google' when it is configured. "
+    "(Email-only sign-in exists only for local development with PQC_ALLOW_UNVERIFIED_SIGNIN=true.)"
+)
+_SENSITIVE_STATE_KEY_MARKERS = ("credential", "token", "secret")
+_USED_OAUTH_NONCES: Dict[str, float] = {}
+_USED_OAUTH_NONCES_LOCK = threading.Lock()
+
+
+def _adk_dev_ui_enabled() -> bool:
+    """ADK DevServer switch: True if PQC_ENABLE_ADK_DEV_UI in (true, 1, yes), False if in (false, 0, no), otherwise
+    `not os.getenv('K_SERVICE')` (enabled for local development, disabled on Cloud Run)."""
+    return auth_guard.adk_dev_ui_enabled()
+
+
+def _bind_tenant_context(identity: auth_guard.AuthenticatedIdentity) -> None:
+    """Binds the per-tenant `ContextVar` (gcloud bridge / tools) for ADK-native routes guarded by the middleware."""
+    set_current_tenant_user(identity.user_id)
+
+
+def _js_literal(value: Any) -> str:
+    """JSON-encodes `value` for safe embedding in an inline <script> block (no `</script>` break-out)."""
+    return json.dumps(value).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+
+
+def _redact_session_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Removes credential material (ADK auth credentials, OAuth tokens) from session state returned to clients."""
+    return {
+        key: value
+        for key, value in (state or {}).items()
+        if not any(marker in str(key).lower() for marker in _SENSITIVE_STATE_KEY_MARKERS)
+    }
+
+
+def _consume_oauth_nonce(nonce: str) -> bool:
+    """Single-use OAuth state nonces (replays of a completed callback are rejected)."""
+    now = time.time()
+    with _USED_OAUTH_NONCES_LOCK:
+        for key, expires_at in list(_USED_OAUTH_NONCES.items()):
+            if expires_at < now:
+                del _USED_OAUTH_NONCES[key]
+        if nonce in _USED_OAUTH_NONCES:
+            return False
+        _USED_OAUTH_NONCES[nonce] = now + OAUTH_STATE_TTL_SECONDS
+        return True
+
+
+def _validate_oauth_state_for_request(request: Request, state_value: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Verifies a signed OAuth `state`: HMAC + `typ` + expiry, nonce equal to this browser's nonce cookie, single use."""
+    decoded = verify_oauth_state(state_value)
+    if not decoded:
+        return None
+    cookie_nonce = request.cookies.get(OAUTH_NONCE_COOKIE_NAME) or ""
+    state_nonce = str(decoded.get("nonce") or "")
+    if not cookie_nonce or not state_nonce:
+        return None
+    if not hmac.compare_digest(cookie_nonce.encode("utf-8"), state_nonce.encode("utf-8")):
+        return None
+    if not _consume_oauth_nonce(state_nonce):
+        return None
+    return decoded
+
+
+def _exchange_oauth_code(code: str, redirect_uri: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Exchanges an OAuth authorization code server-side (the token is never embedded in an HTML page)."""
+    oauth_cfg = load_oauth_client_config()
+    try:
+        form_data = urllib.parse.urlencode(
+            {
+                "code": code,
+                "client_id": oauth_cfg.get("client_id", ""),
+                "client_secret": oauth_cfg.get("client_secret", ""),
+                "redirect_uri": redirect_uri,
+                "grant_type": "authorization_code",
+            }
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            oauth_cfg["token_endpoint"],
+            data=form_data,
+            headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            tok_data = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        return None, f"OAuth code exchange failed: {exc}"
+    if not tok_data.get("access_token"):
+        return None, "OAuth code exchange returned no access_token."
+    return tok_data, None
+
+
+def _bind_delegated_gcp_token(uid: str, access_token: str, expires_in: Optional[Any] = None) -> Dict[str, Any]:
+    """Binds a delegated OAuth access token to `uid`'s gcloud/GCP connection (process memory only)."""
+    try:
+        ttl = float(expires_in) if expires_in else None
+    except (TypeError, ValueError):
+        ttl = None
+    return set_gcp_connection_config(mode="access_token", access_token=access_token, user_id=uid, access_token_expires_in=ttl)
+
+
+def _oauth_popup_result_html(message_type: str, payload: Dict[str, Any], message: str, ok: bool) -> str:
+    """Small popup page that reports an OAuth result to the opener (same origin only) and closes itself."""
+    color = "#81c995" if ok else "#f87171"
+    close_js = "setTimeout(function () { window.close(); }, 400);" if ok else ""
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>PQC Workspace - Google authorization</title></head>
+<body style="background:#0b0f17;color:#e2e8f0;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;">
+<div id="msg" style="color:{color};max-width:480px;text-align:center;line-height:1.5;">{html.escape(message)}</div>
+<script>
+(function () {{
+  var payload = {_js_literal(payload)};
+  if (window.opener) {{
+    window.opener.postMessage({{ type: {_js_literal(message_type)}, payload: payload }}, window.location.origin);
+    {close_js}
+  }}
+}})();
+</script></body></html>"""
+
+
+# Implicit OAuth flow (no client secret configured): Google returns the token and `state` in the URL fragment, which
+# only the browser sees. This static page forwards both to the API (state verified server-side) and reports back.
+_OAUTH_IMPLICIT_CALLBACK_HTML = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>PQC Workspace - completing Google authorization</title></head>
+<body style="background:#0b0f17;color:#e2e8f0;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;">
+<div id="msg" style="max-width:480px;text-align:center;line-height:1.5;">Completing Google authorization...</div>
+<script>
+(async function () {
+  var msg = document.getElementById('msg');
+  var params = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+  try { history.replaceState(null, '', window.location.pathname); } catch (e) {}
+  var accessToken = params.get('access_token') || '';
+  var state = params.get('state') || '';
+  var error = params.get('error') || '';
+  var statePayload = {};
+  try {
+    var b64 = (state.split('.')[0] || '').replace(/-/g, '+').replace(/_/g, '/');
+    b64 += '='.repeat((4 - (b64.length % 4)) % 4);
+    statePayload = JSON.parse(atob(b64)) || {};
+  } catch (e) { statePayload = {}; }
+  var mode = statePayload.mode === 'signin' ? 'signin' : '3lo';
+  var type = mode === 'signin' ? 'PQC_SIGNIN_COMPLETE' : 'PQC_OAUTH_3LO_AUTHORIZED';
+  function finish(ok, payload, text) {
+    msg.textContent = text;
+    msg.style.color = ok ? '#81c995' : '#f87171';
+    if (window.opener) {
+      window.opener.postMessage({ type: type, payload: payload }, window.location.origin);
+      if (ok) { setTimeout(function () { window.close(); }, 400); }
+    }
+  }
+  if (error || !accessToken || !state) {
+    finish(false, { authenticated: false, error: error || 'missing access_token or state' }, 'Authorization did not complete: ' + (error || 'missing access_token or state'));
+    return;
+  }
+  var headers = { 'Content-Type': 'application/json' };
+  var sessionToken = localStorage.getItem('pqc_session_token');
+  if (sessionToken && mode !== 'signin') { headers['X-PQC-User-Token'] = sessionToken; }
+  var url = mode === 'signin' ? '/api/auth/google' : '/api/auth/tool-consent';
+  var body = mode === 'signin'
+    ? { google_access_token: accessToken, oauth_state: state, region: statePayload.region || undefined, timezone: statePayload.timezone || undefined, use_token_for_gcp_connection: false }
+    : { access_token: accessToken, oauth_state: state, session_id: statePayload.session_id || undefined, target_scope: statePayload.target_scope || undefined };
+  try {
+    var res = await fetch(url, { method: 'POST', credentials: 'same-origin', headers: headers, body: JSON.stringify(body) });
+    var data = {};
+    try { data = await res.json(); } catch (e) { data = {}; }
+    if (!res.ok) {
+      finish(false, Object.assign({ authenticated: false }, data), 'Authorization failed: ' + (data.detail || ('HTTP ' + res.status)));
+      return;
+    }
+    finish(true, data, mode === 'signin' ? 'Signed in. You can close this window.' : 'Authorized. You can close this window.');
+  } catch (e) {
+    finish(false, { authenticated: false, error: String(e) }, 'Authorization error: ' + e);
+  }
+})();
+</script></body></html>"""
 
 
 def _guess_gemini_mime_type(filename: str, declared_mime: Optional[str]) -> Tuple[str, bool]:
@@ -1191,13 +1387,19 @@ def create_workspace_app(
     model_registry: Optional[ModelRegistry] = None,
     verify_models_on_startup: Optional[bool] = None,
 ) -> FastAPI:
-    """Creates the FastAPI server with `/dev-ui/`, the portal at `GET /`, `/api/models`, `/api/sessions`, `/api/chat`."""
+    """Creates the FastAPI server: the portal at `GET /`, `/api/*` (identity-bound), and ADK's native routes.
+
+    ADK-native REST routes and the ADK DevServer (`/dev-ui`, `/dev/apps/*`) are disabled on Cloud Run unless
+    PQC_ENABLE_ADK_API / PQC_ENABLE_ADK_DEV_UI say otherwise; when enabled they require an authenticated identity.
+    """
     resolved_db_url = _normalize_sqlite_db_url(session_db_url or os.getenv("SESSION_DB_URL", DEFAULT_SESSION_DB_URL))
     resolved_bucket = (artifact_bucket or DEFAULT_STAGING_BUCKET).replace("gs://", "").strip("/")
 
     session_service = DatabaseSessionService(db_url=resolved_db_url)
     artifact_service = ResilientGcsArtifactService(bucket_name=resolved_bucket)
-    credential_service = SessionStateCredentialService()
+    # Delegated OAuth credentials stay in process memory: SessionStateCredentialService would store user tokens in
+    # clear text in the session DB on /data (a GCS bucket on Cloud Run) and echo them through session reads.
+    credential_service = InMemoryCredentialService()
     registry_obj = model_registry or ModelRegistry()
 
     registry = get_service_registry()
@@ -1206,14 +1408,40 @@ def create_workspace_app(
     registry.register_artifact_service("gs", lambda uri, **kw: artifact_service)
 
     project_root = str(Path(__file__).resolve().parent.parent)
+    dev_ui_on = _adk_dev_ui_enabled()
+    adk_api_on = auth_guard.adk_api_enabled()
+    cors_origins = auth_guard.allowed_cors_origins()  # None => same-origin portal only (no CORS headers)
     app = get_fast_api_app(
         agents_dir=project_root,
         session_service_uri=resolved_db_url,
         artifact_service_uri=f"gs://{resolved_bucket}",
-        web=True,
-        allow_origins=["*"],
+        web=dev_ui_on,
+        allow_origins=cors_origins,
     )
+    if not dev_ui_on:
+        # Defense in depth: no DevServer route (builder/save, deploy/*, eval, /dev-ui) may exist when disabled.
+        app.router.routes = [
+            r for r in app.router.routes if not str(getattr(r, "path", "")).startswith(("/dev/", "/dev-ui"))
+        ]
+    # Outermost middleware: every non-portal (ADK-native) route is 404 unless enabled, then identity-bound.
+    app.add_middleware(
+        auth_guard.AdkRouteGuardMiddleware,
+        resolver=resolve_request_identity,
+        api_enabled=adk_api_on,
+        dev_ui_static=dev_ui_on,
+        on_identity=_bind_tenant_context,
+        normalize_user_id=normalize_user_id,
+        allowed_origins=cors_origins,
+    )
+    if auth_guard.allow_unverified_signin():
+        logger.warning(
+            "PQC_ALLOW_UNVERIFIED_SIGNIN=true: email-only sign-in is ENABLED (development only)%s.",
+            " -- WARNING: this instance runs on Cloud Run" if auth_guard.running_on_cloud_run() else "",
+        )
 
+    app.state.adk_dev_ui_enabled = dev_ui_on
+    app.state.adk_api_enabled = adk_api_on
+    app.state.cors_allowed_origins = list(cors_origins or [])
     app.state.session_service = session_service
     app.state.artifact_service = artifact_service
     app.state.credential_service = credential_service
@@ -1257,16 +1485,122 @@ def create_workspace_app(
     async def serve_portal() -> HTMLResponse:
         return HTMLResponse(content=PORTAL_HTML)
 
+    def _is_https(request: Request) -> bool:
+        return (request.headers.get("x-forwarded-proto") or request.url.scheme).split(",")[0].strip() == "https"
+
+    def _set_session_cookie(resp: Any, request: Request, token: str) -> None:
+        resp.set_cookie(
+            key=SESSION_COOKIE_NAME,
+            value=token,
+            max_age=SESSION_TOKEN_TTL_SECONDS,
+            httponly=True,
+            samesite="lax",
+            secure=_is_https(request),
+            path="/",
+        )
+
+    def _set_oauth_nonce_cookie(resp: Any, request: Request, nonce: str) -> None:
+        # Binds the OAuth `state` to this browser (login-CSRF / token-injection protection).
+        resp.set_cookie(
+            key=OAUTH_NONCE_COOKIE_NAME,
+            value=nonce,
+            max_age=OAUTH_STATE_TTL_SECONDS,
+            httponly=True,
+            samesite="lax",
+            secure=_is_https(request),
+            path="/api/auth",
+        )
+
+    def _oauth_callback_uri(request: Request) -> str:
+        proto = (request.headers.get("x-forwarded-proto") or request.url.scheme).split(",")[0].strip()
+        host = request.headers.get("host") or request.url.netloc
+        return f"{proto}://{host}/api/auth/oauth/callback"
+
+    def _require_identity(request: Request, explicit_user_id: Optional[str] = None) -> auth_guard.AuthenticatedIdentity:
+        """401 without an authenticated identity, 403 if `explicit_user_id` names someone else; binds the tenant."""
+        identity = resolve_request_identity(request)
+        auth_guard.bind_user_id(identity, explicit_user_id, normalize_user_id=normalize_user_id)
+        assert identity is not None
+        set_current_tenant_user(identity.user_id)
+        return identity
+
+    def _auth_config_payload() -> Dict[str, Any]:
+        oauth_cfg = load_oauth_client_config()
+        client_id = oauth_cfg.get("client_id", "")
+        return {
+            "allow_unverified_signin": auth_guard.allow_unverified_signin(),
+            "google_oauth_client_configured": bool(client_id),
+            "google_oauth_client_id": client_id,
+            "oauth_signin_url": "/api/auth/oauth/signin" if client_id else None,
+            "access_token_command": "gcloud auth print-access-token",
+            "allowed_domains": list(ALLOWED_AUTH_DOMAINS),
+            "supported_regions": SUPPORTED_REGIONS,
+            "iap_jwt_verification": True,
+            "iap_audience_configured": bool(os.getenv(auth_guard.ENV_IAP_AUDIENCE, "").strip()),
+        }
+
+    async def _complete_signin(
+        *,
+        email: str,
+        name: Optional[str],
+        region: Optional[str],
+        timezone_str: Optional[str],
+        auth_method: str,
+        picture: Optional[str],
+        gcp_access_token: Optional[str] = None,
+        gcp_access_token_expires_in: Optional[Any] = None,
+    ) -> Tuple[Dict[str, Any], str]:
+        profile = upsert_tenant_user_profile(
+            email=email,
+            name=name,
+            region=region,
+            timezone_str=timezone_str,
+            auth_method=auth_method,
+            picture=picture,
+        )
+        uid = profile["user_id"]
+        set_current_tenant_user(uid)
+        if gcp_access_token:
+            _bind_delegated_gcp_token(uid, gcp_access_token, gcp_access_token_expires_in)
+        signed_token = sign_tenant_session_token(profile)
+        sess_resp = await session_service.list_sessions(app_name=APP_NAME, user_id=uid)
+        content = {
+            "authenticated": True,
+            "user": profile,
+            "user_id": uid,
+            "token": signed_token,
+            "session_count": len(sess_resp.sessions),
+            "connection": get_gcp_connection_config(mask_token=True, user_id=uid),
+            "supported_regions": SUPPORTED_REGIONS,
+        }
+        return content, signed_token
+
+    def _validated_google_identity(verified_info: Optional[Dict[str, Any]], err_msg: Optional[str]) -> Tuple[int, str]:
+        """(status, email_or_error): 200 + email for a verified allowed-domain identity, else 401/403 + reason."""
+        if not verified_info:
+            return 401, err_msg or "Google credential verification failed."
+        if verified_info.get("email_verified") is not True:
+            return 401, "The Google account email address is not verified."
+        ok, validated_or_err = is_allowed_corporate_email(str(verified_info.get("email") or ""))
+        if not ok:
+            return 403, validated_or_err
+        return 200, validated_or_err
+
     @app.get("/api/models")
-    async def list_available_models(refresh: bool = Query(default=False)) -> Dict[str, Any]:
-        """Lists ONLY Gemini models verified to answer on Vertex AI in this project."""
+    async def list_available_models(request: Request, refresh: bool = Query(default=False)) -> Dict[str, Any]:
+        """Lists ONLY Gemini Pro models verified to answer on Vertex AI in this project (public).
+
+        `refresh=true` re-probes every candidate with real (billed) Vertex AI calls, so it requires a signed-in user.
+        """
         if refresh:
+            activate_request_tenant_user(request)
             await asyncio.to_thread(registry_obj.verify_all, True)
         return registry_obj.catalog()
 
     @app.get("/api/health")
     async def api_health(request: Request) -> Dict[str, Any]:
-        uid = activate_request_tenant_user(request)
+        """Public status endpoint. Never activates a tenant from request parameters; connection only when signed in."""
+        identity = resolve_request_identity(request)
         catalog = registry_obj.catalog()
         oauth_cfg = load_oauth_client_config()
         return {
@@ -1275,6 +1609,8 @@ def create_workspace_app(
             "multi_tenant_enabled": True,
             "oauth_3lo_enabled": True,
             "google_oauth_client_configured": bool(oauth_cfg.get("client_id")),
+            "allow_unverified_signin": auth_guard.allow_unverified_signin(),
+            "authenticated": identity is not None,
             "supported_regions": [r["id"] for r in SUPPORTED_REGIONS],
             "allowed_auth_domains": list(ALLOWED_AUTH_DOMAINS),
             "session_service": type(session_service).__name__,
@@ -1282,36 +1618,45 @@ def create_workspace_app(
             "artifact_service": type(artifact_service).__name__,
             "artifact_bucket": f"gs://{resolved_bucket}",
             "credential_service": type(credential_service).__name__,
-            "connection": get_gcp_connection_config(mask_token=True, user_id=uid),
+            "connection": get_gcp_connection_config(mask_token=True, user_id=identity.user_id) if identity else None,
             "simulation_mode": os.getenv("PQC_SIMULATION_MODE", "FALSE"),
             "verified_models": [m["id"] for m in catalog["models"]],
             "model_verification": catalog["verification"],
-            "dev_ui_available": True,
-            "dev_ui_url": "/dev-ui/?app=pqc_agent",
+            "adk_api_enabled": adk_api_on,
+            "dev_ui_available": dev_ui_on,
+            "dev_ui_url": "/dev-ui/?app=pqc_agent" if dev_ui_on else None,
         }
 
     # =========================================================================
     # Multi-Tenant @google.com Authentication & Regional Profile (/api/auth/*)
     # =========================================================================
 
+    @app.get("/api/auth/config")
+    async def auth_config_endpoint() -> Dict[str, Any]:
+        """Public sign-in configuration for the portal sign-in dialog (which credential types are accepted)."""
+        return _auth_config_payload()
+
     @app.get("/api/auth/me")
     async def auth_me(request: Request) -> Dict[str, Any]:
         profile, iap_active = resolve_authenticated_tenant_from_request(request)
-        uid = profile["user_id"] if profile else DEFAULT_USER_ID
-        set_current_tenant_user(uid)
-        conn = get_gcp_connection_config(mask_token=True, user_id=uid)
-        oauth_cfg = load_oauth_client_config()
+        uid = profile["user_id"] if profile else None
+        conn: Optional[Dict[str, Any]] = None
         session_count = 0
-        if profile:
+        if uid:
+            set_current_tenant_user(uid)
+            conn = get_gcp_connection_config(mask_token=True, user_id=uid)
             try:
                 sess_resp = await session_service.list_sessions(app_name=APP_NAME, user_id=uid)
                 session_count = len(sess_resp.sessions)
             except Exception:
                 session_count = 0
+        cfg = _auth_config_payload()
         return {
             "authenticated": profile is not None,
             "iap_active": iap_active,
-            "google_oauth_client_id": oauth_cfg.get("client_id", ""),
+            "google_oauth_client_id": cfg["google_oauth_client_id"],
+            "google_oauth_client_configured": cfg["google_oauth_client_configured"],
+            "allow_unverified_signin": cfg["allow_unverified_signin"],
             "oauth_3lo_enabled": True,
             "oauth_scopes": list(GCP_OAUTH_SCOPES),
             "allowed_domains": list(ALLOWED_AUTH_DOMAINS),
@@ -1324,101 +1669,84 @@ def create_workspace_app(
 
     @app.post("/api/auth/google")
     async def auth_google_signin(request: Request, payload: GoogleAuthSignInPayload) -> JSONResponse:
-        """Authenticates a @google.com user (via ID token, OAuth token, or Google Workspace corporate sign-in),
-        persists their regional profile in `/data/pqc_tenant_users.json`, and sets a 30-day signed session cookie.
+        """Signs a user in from a VERIFIED Google credential and sets a signed 30-day session cookie.
+
+        Accepted credentials: a Google ID token (`credential` / `id_token`) or a Google OAuth access token
+        (`google_access_token`, e.g. `gcloud auth print-access-token`), both verified with Google. The email must be
+        verified and belong to ALLOWED_AUTH_DOMAINS (403 otherwise). Email-only sign-in returns 401 unless
+        PQC_ALLOW_UNVERIFIED_SIGNIN=true (local development only).
         """
-        verified_info: Optional[Dict[str, Any]] = None
-        id_jwt = payload.credential or payload.id_token
-        if id_jwt or payload.google_access_token:
-            verified_info, err_msg = await asyncio.to_thread(
-                _verify_google_oauth_or_id_token,
-                id_jwt,
-                payload.google_access_token,
-            )
-            if not verified_info:
-                raise HTTPException(status_code=401, detail=err_msg or "Google token verification failed.")
-            target_email = verified_info["email"]
+        if payload.oauth_state is not None:
+            st = _validate_oauth_state_for_request(request, payload.oauth_state)
+            if not st or st.get("mode") != "signin":
+                raise HTTPException(status_code=400, detail="Invalid or expired OAuth state. Start the sign-in again.")
+        id_jwt = (payload.credential or payload.id_token or "").strip() or None
+        access_tok = (payload.google_access_token or "").strip() or None
+        if access_tok and access_tok.lower().startswith("bearer "):
+            access_tok = access_tok[7:].strip() or None
+        expires_in: Optional[Any] = None
+        if id_jwt or access_tok:
+            verified_info, err_msg = await asyncio.to_thread(_verify_google_oauth_or_id_token, id_jwt, access_tok)
+            status_code, email_or_err = _validated_google_identity(verified_info, err_msg)
+            if status_code != 200:
+                raise HTTPException(status_code=status_code, detail=email_or_err)
+            assert verified_info is not None
+            target_email = email_or_err
             display_name = payload.name or verified_info.get("name")
             auth_method = verified_info.get("auth_method", "google_id_token")
             picture = verified_info.get("picture", "")
-        else:
-            raw_email = (payload.email or "").strip()
-            ok, validated_or_err = is_allowed_corporate_email(raw_email)
+            expires_in = verified_info.get("expires_in")
+        elif auth_guard.allow_unverified_signin():
+            ok, validated_or_err = is_allowed_corporate_email((payload.email or "").strip())
             if not ok:
                 raise HTTPException(status_code=403, detail=validated_or_err)
+            logger.warning("UNVERIFIED email-only sign-in for %s (PQC_ALLOW_UNVERIFIED_SIGNIN=true).", validated_or_err)
             target_email = validated_or_err
             display_name = payload.name
-            auth_method = "google_workspace_signin"
+            auth_method = "unverified_email_dev_only"
             picture = None
+        else:
+            raise HTTPException(status_code=401, detail=EMAIL_ONLY_SIGNIN_DISABLED_DETAIL)
 
-        profile = upsert_tenant_user_profile(
+        content, signed_token = await _complete_signin(
             email=target_email,
             name=display_name,
             region=payload.region,
             timezone_str=payload.timezone,
             auth_method=auth_method,
             picture=picture,
+            gcp_access_token=access_tok if (access_tok and payload.use_token_for_gcp_connection) else None,
+            gcp_access_token_expires_in=expires_in,
         )
-        uid = profile["user_id"]
-        set_current_tenant_user(uid)
-
-        # If the user signed in with a Google OAuth token and asked to use it for their GCP connection, bind it to their isolated state
-        if payload.google_access_token and payload.use_token_for_gcp_connection:
-            set_gcp_connection_config(
-                mode="access_token",
-                access_token=payload.google_access_token,
-                user_id=uid,
-            )
-
-        signed_token = sign_tenant_session_token(profile)
-        conn = get_gcp_connection_config(mask_token=True, user_id=uid)
-        sess_resp = await session_service.list_sessions(app_name=APP_NAME, user_id=uid)
-
-        resp = JSONResponse(
-            content={
-                "authenticated": True,
-                "user": profile,
-                "user_id": uid,
-                "token": signed_token,
-                "session_count": len(sess_resp.sessions),
-                "connection": conn,
-                "supported_regions": SUPPORTED_REGIONS,
-            }
-        )
-        is_https = (request.headers.get("x-forwarded-proto") or request.url.scheme) == "https"
-        resp.set_cookie(
-            key=SESSION_COOKIE_NAME,
-            value=signed_token,
-            max_age=SESSION_TOKEN_TTL_SECONDS,
-            httponly=True,
-            samesite="lax",
-            secure=is_https,
-            path="/",
-        )
+        resp = JSONResponse(content=content)
+        _set_session_cookie(resp, request, signed_token)
         return resp
 
     @app.post("/api/auth/logout")
-    async def auth_logout() -> JSONResponse:
+    async def auth_logout(request: Request) -> JSONResponse:
+        identity = resolve_request_identity(request)
+        if identity is not None:
+            clear_user_access_token(identity.user_id)
         resp = JSONResponse(content={"authenticated": False, "status": "logged_out"})
         resp.delete_cookie(key=SESSION_COOKIE_NAME, path="/")
         return resp
 
     @app.get("/api/auth/tenants")
-    async def list_registered_tenants() -> Dict[str, Any]:
+    async def list_registered_tenants(request: Request) -> Dict[str, Any]:
+        """Tenant directory: aggregate counts for signed-in users; individual profiles only for admins."""
+        identity = _require_identity(request)
         users_map = _load_tenant_users_map()
-        tenants = sorted(
-            users_map.values(),
-            key=lambda u: u.get("last_login_at", ""),
-            reverse=True,
-        )
+        tenants = sorted(users_map.values(), key=lambda u: u.get("last_login_at", ""), reverse=True)
         by_region: Dict[str, int] = {}
         for t in tenants:
             reg = t.get("region", "NorthAm")
             by_region[reg] = by_region.get(reg, 0) + 1
+        is_admin = auth_guard.is_admin_identity(identity)
         return {
             "total_tenants": len(tenants),
             "by_region": by_region,
-            "tenants": tenants,
+            "full_directory": is_admin,
+            "tenants": tenants if is_admin else [t for t in tenants if t.get("user_id") == identity.user_id],
         }
 
     # =========================================================================
@@ -1437,8 +1765,50 @@ def create_workspace_app(
         }
 
     @app.post("/api/auth/oauth/config")
-    async def update_oauth_config_endpoint(payload: OAuthClientConfigPayload) -> Dict[str, Any]:
+    async def update_oauth_config_endpoint(request: Request, payload: OAuthClientConfigPayload) -> Dict[str, Any]:
+        """Changes the GLOBAL OAuth client used by every tenant: signed-in administrators only (PQC_ADMIN_EMAILS;
+        without that list only local, non-Cloud Run instances treat signed-in users as administrators)."""
+        identity = _require_identity(request)
+        if not auth_guard.is_admin_identity(identity):
+            raise HTTPException(
+                status_code=403,
+                detail="Only portal administrators (PQC_ADMIN_EMAILS) can change the OAuth client configuration.",
+            )
         return save_oauth_client_config(client_id=payload.client_id, client_secret=payload.client_secret)
+
+    @app.get("/api/auth/oauth/signin")
+    async def oauth_signin_start_endpoint(
+        request: Request,
+        region: Optional[str] = Query(default=None),
+        timezone: Optional[str] = Query(default=None),
+    ) -> Any:
+        """Public: starts 'Sign in with Google' (OpenID Connect, popup) when an OAuth client is configured."""
+        oauth_cfg = load_oauth_client_config()
+        client_id = oauth_cfg.get("client_id", "")
+        if not client_id:
+            return HTMLResponse(
+                status_code=404,
+                content=_oauth_popup_result_html(
+                    "PQC_SIGNIN_COMPLETE",
+                    {"authenticated": False, "error": "GOOGLE_OAUTH_CLIENT_NOT_CONFIGURED"},
+                    "Google OAuth sign-in is not configured on this server. Close this window and paste the output "
+                    "of `gcloud auth print-access-token` in the sign-in dialog instead.",
+                    ok=False,
+                ),
+            )
+        nonce = secrets.token_urlsafe(16)
+        state = sign_oauth_state({"mode": "signin", "nonce": nonce, "region": region or "", "timezone": timezone or ""})
+        params = {
+            "client_id": client_id,
+            "redirect_uri": _oauth_callback_uri(request),
+            "response_type": "code" if oauth_cfg.get("client_secret") else "token",
+            "scope": "openid email profile",
+            "state": state,
+            "prompt": "select_account",
+        }
+        resp = RedirectResponse(url=f"{oauth_cfg['authorization_endpoint']}?{urllib.parse.urlencode(params)}", status_code=302)
+        _set_oauth_nonce_cookie(resp, request, nonce)
+        return resp
 
     @app.get("/api/auth/oauth/authorize")
     async def oauth_3lo_authorize_endpoint(
@@ -1449,26 +1819,23 @@ def create_workspace_app(
         redirect_uri: Optional[str] = Query(default=None),
         format: Optional[str] = Query(default=None),
     ) -> Any:
-        """Initiates the 3-Legged OAuth 2.0 (3LO) authorization flow for Google Cloud APIs.
-        - If `format=json`, returns the OAuth 2.0 authorization URL and metadata.
-        - If `GOOGLE_OAUTH_CLIENT_ID` is configured, redirects (`302`) directly to Google's official OAuth 2.0 consent screen.
-        - Otherwise renders an interactive Google Cloud OAuth 2.0 (3LO) Authorization popup window.
+        """Initiates the 3-Legged OAuth 2.0 (3LO) flow for Google Cloud APIs on behalf of the SIGNED-IN user.
+
+        - Requires an authenticated identity (401) and `user_id`, if given, must be that identity (403).
+        - The OAuth `state` is HMAC-signed, expires in 10 minutes, is single use and bound to this browser (nonce
+          cookie). `redirect_uri` is ignored: the callback is always this service's `/api/auth/oauth/callback`.
+        - `format=json` returns the authorization URL; `direct=1` redirects to Google; otherwise renders a popup.
         """
         uid = activate_request_tenant_user(request, explicit_user_id=user_id)
         oauth_cfg = load_oauth_client_config()
         client_id = oauth_cfg.get("client_id", "")
         has_secret = bool(oauth_cfg.get("client_secret"))
-        proto = request.headers.get("x-forwarded-proto") or request.url.scheme
-        host = request.headers.get("host") or request.url.netloc
-        cb_uri = redirect_uri or f"{proto}://{host}/api/auth/oauth/callback"
-
-        state_obj = {
-            "uid": uid,
-            "session_id": session_id or "",
-            "target_scope": scope or "organizations/31564119954",
-            "nonce": secrets.token_hex(8),
-        }
-        encoded_state = base64.urlsafe_b64encode(json.dumps(state_obj).encode("utf-8")).decode("ascii").rstrip("=")
+        cb_uri = _oauth_callback_uri(request)
+        target_scope = scope or "organizations/31564119954"
+        nonce = secrets.token_urlsafe(16)
+        encoded_state = sign_oauth_state(
+            {"mode": "3lo", "uid": uid, "session_id": session_id or "", "target_scope": target_scope, "nonce": nonce}
+        )
 
         google_auth_url = ""
         if client_id:
@@ -1482,17 +1849,17 @@ def create_workspace_app(
                 "state": encoded_state,
             }
             if has_secret:
-                params["access_type"] = "offline"
+                params["access_type"] = "online"
             if "@" in uid:
                 params["login_hint"] = uid
             google_auth_url = f"{oauth_cfg['authorization_endpoint']}?{urllib.parse.urlencode(params)}"
 
         if format == "json":
-            return JSONResponse(
+            json_resp = JSONResponse(
                 content={
                     "user_id": uid,
                     "session_id": session_id,
-                    "target_scope": scope,
+                    "target_scope": target_scope,
                     "client_id_configured": bool(client_id),
                     "client_id": client_id,
                     "redirect_uri": cb_uri,
@@ -1501,11 +1868,22 @@ def create_workspace_app(
                     "state": encoded_state,
                 }
             )
+            _set_oauth_nonce_cookie(json_resp, request, nonce)
+            return json_resp
 
         if google_auth_url and request.query_params.get("direct") == "1":
-            return RedirectResponse(url=google_auth_url, status_code=302)
+            redirect_resp = RedirectResponse(url=google_auth_url, status_code=302)
+            _set_oauth_nonce_cookie(redirect_resp, request, nonce)
+            return redirect_resp
 
-        # Render the interactive Google Cloud OAuth 2.0 (3LO) Consent Popup Window
+        google_button_html = ""
+        if google_auth_url:
+            google_button_html = (
+                f'<a href="{html.escape(google_auth_url, quote=True)}" style="text-decoration:none;">'
+                '<button type="button" class="btn btn-google">Continue to Google Consent Screen (accounts.google.com)'
+                "</button></a>"
+            )
+        # Every reflected value is HTML-escaped (markup) or JSON/script-escaped (inline JS): no reflected XSS.
         popup_html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1533,48 +1911,55 @@ def create_workspace_app(
 <body>
 <div class="card">
   <div class="hdr">
-    <svg width="26" height="26" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>
     <div>
       <span class="badge">3-Legged OAuth 2.0 • ADK ToolContext</span>
     </div>
   </div>
   <h2>Authorize PQC Inventory Agent</h2>
-  <p>Allow the agent to inspect <b>{scope}</b> on behalf of <b>{uid}</b> using read-only Google Cloud permissions:</p>
+  <p>Allow the agent to inspect <b>{html.escape(target_scope)}</b> on behalf of <b>{html.escape(uid)}</b> using read-only Google Cloud permissions:</p>
   <div class="scope-box">
     <div style="font-size:11px;color:#64748b;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.05em;">Requested OAuth 2.0 Scopes</div>
     <div class="scope-item">✓ openid email profile (@google.com identity)</div>
     <div class="scope-item">✓ https://www.googleapis.com/auth/cloud-platform.read-only</div>
   </div>
   <div id="errBox" class="err"></div>
-  {"<a href='" + google_auth_url + "' style='text-decoration:none;'><button type='button' class='btn btn-google'>Continue to Google Consent Screen (accounts.google.com)</button></a>" if google_auth_url else ""}
+  {google_button_html}
   <div style="font-size:12px;color:#cbd5e1;margin:10px 0 6px 0;font-weight:600;">Authorize with your Google Cloud OAuth Token:</div>
   <div class="cmd">gcloud auth print-access-token</div>
   <input id="tokInput" type="password" placeholder="Paste ya29... OAuth 2.0 access token" autofocus />
-  <button type="button" class="btn btn-google" onclick="submitConsent()">Allow & Inject into ADK ToolContext</button>
+  <button type="button" class="btn btn-google" onclick="submitConsent()">Allow &amp; Inject into ADK ToolContext</button>
   <details style="margin-top:10px;font-size:11.5px;color:#94a3b8;">
-    <summary style="cursor:pointer;color:#8ab4f8;">Configure Google OAuth 2.0 Web Client ID (Optional)</summary>
+    <summary style="cursor:pointer;color:#8ab4f8;">Configure Google OAuth 2.0 Web Client ID (administrators)</summary>
     <div style="margin-top:8px;">
-      <input id="cidInput" type="text" placeholder="123456-abc.apps.googleusercontent.com" value="{client_id}" />
-      <button type="button" class="btn btn-sec" onclick="saveClientId()">Save OAuth Client ID & Redirect to Google</button>
+      <input id="cidInput" type="text" placeholder="123456-abc.apps.googleusercontent.com" value="{html.escape(client_id, quote=True)}" />
+      <button type="button" class="btn btn-sec" onclick="saveClientId()">Save OAuth Client ID &amp; Redirect to Google</button>
     </div>
   </details>
 </div>
 <script>
+const PQC_SESSION_ID = {_js_literal(session_id or "")};
+const PQC_TARGET_SCOPE = {_js_literal(target_scope)};
+function pqcAuthHeaders() {{
+  const headers = {{ 'Content-Type': 'application/json' }};
+  const sessionToken = localStorage.getItem('pqc_session_token');
+  if (sessionToken) headers['X-PQC-User-Token'] = sessionToken;
+  return headers;
+}}
+function showError(message) {{
+  const err = document.getElementById('errBox');
+  err.textContent = message;
+  err.style.display = 'block';
+}}
 async function submitConsent() {{
   const tok = document.getElementById('tokInput').value.trim();
-  const err = document.getElementById('errBox');
-  err.style.display = 'none';
-  if (!tok) {{ err.textContent = 'Please paste a valid Google OAuth 2.0 access token.'; err.style.display = 'block'; return; }}
+  document.getElementById('errBox').style.display = 'none';
+  if (!tok) {{ showError('Please paste a valid Google OAuth 2.0 access token.'); return; }}
   try {{
     const res = await fetch('/api/auth/tool-consent', {{
       method: 'POST',
-      headers: {{ 'Content-Type': 'application/json' }},
-      body: JSON.stringify({{
-        user_id: {json.dumps(uid)},
-        session_id: {json.dumps(session_id or "")},
-        access_token: tok,
-        target_scope: {json.dumps(scope or "organizations/31564119954")}
-      }})
+      credentials: 'same-origin',
+      headers: pqcAuthHeaders(),
+      body: JSON.stringify({{ session_id: PQC_SESSION_ID, access_token: tok, target_scope: PQC_TARGET_SCOPE }})
     }});
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || 'Consent authorization failed.');
@@ -1585,24 +1970,32 @@ async function submitConsent() {{
       window.location.href = '/';
     }}
   }} catch (e) {{
-    err.textContent = e.message;
-    err.style.display = 'block';
+    showError(e.message);
   }}
 }}
 async function saveClientId() {{
   const cid = document.getElementById('cidInput').value.trim();
   if (!cid) return;
-  await fetch('/api/auth/oauth/config', {{
+  const res = await fetch('/api/auth/oauth/config', {{
     method: 'POST',
-    headers: {{ 'Content-Type': 'application/json' }},
+    credentials: 'same-origin',
+    headers: pqcAuthHeaders(),
     body: JSON.stringify({{ client_id: cid }})
   }});
+  if (!res.ok) {{
+    let detail = 'HTTP ' + res.status;
+    try {{ detail = (await res.json()).detail || detail; }} catch (e) {{}}
+    showError(detail);
+    return;
+  }}
   window.location.href = window.location.pathname + window.location.search + '&direct=1';
 }}
 </script>
 </body>
 </html>"""
-        return HTMLResponse(content=popup_html)
+        popup_resp = HTMLResponse(content=popup_html)
+        _set_oauth_nonce_cookie(popup_resp, request, nonce)
+        return popup_resp
 
     @app.get("/api/auth/oauth/callback", response_class=HTMLResponse)
     async def oauth_3lo_callback_endpoint(
@@ -1611,136 +2004,145 @@ async function saveClientId() {{
         state: Optional[str] = Query(default=None),
         error: Optional[str] = Query(default=None),
     ) -> HTMLResponse:
-        """Handles the Google OAuth 2.0 3LO redirect callback (both authorization code exchange and implicit token fragment)."""
-        decoded_state: Dict[str, Any] = {}
-        if state:
-            try:
-                pad = "=" * (-len(state) % 4)
-                decoded_state = json.loads(base64.urlsafe_b64decode(state + pad).decode("utf-8"))
-            except Exception:
-                decoded_state = {}
-        uid = normalize_user_id(decoded_state.get("uid") or DEFAULT_USER_ID)
-        sess_id = decoded_state.get("session_id") or ""
-        target_scope = decoded_state.get("target_scope") or "organizations/31564119954"
+        """Public OAuth redirect target for both 'Sign in with Google' and 3LO consent.
 
-        exchanged_token = ""
-        exchange_err = error or ""
-        if code and not exchange_err:
-            oauth_cfg = load_oauth_client_config()
-            proto = request.headers.get("x-forwarded-proto") or request.url.scheme
-            host = request.headers.get("host") or request.url.netloc
-            cb_uri = f"{proto}://{host}/api/auth/oauth/callback"
-            try:
-                form_data = urllib.parse.urlencode(
-                    {
-                        "code": code,
-                        "client_id": oauth_cfg.get("client_id", ""),
-                        "client_secret": oauth_cfg.get("client_secret", ""),
-                        "redirect_uri": cb_uri,
-                        "grant_type": "authorization_code",
-                    }
-                ).encode("utf-8")
-                req = urllib.request.Request(
-                    oauth_cfg["token_endpoint"],
-                    data=form_data,
-                    headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+        The signed `state` is mandatory (HMAC, `typ`, 10 min expiry, single use, nonce cookie of this browser). Codes
+        are exchanged server-side and tokens are never embedded in the returned page. Implicit-flow results (token in
+        the URL fragment) are forwarded by the browser to `/api/auth/google` or `/api/auth/tool-consent`, which verify
+        the same state.
+        """
+        hinted = verify_oauth_state(state) or {}
+        message_type = "PQC_SIGNIN_COMPLETE" if hinted.get("mode") == "signin" else "PQC_OAUTH_3LO_AUTHORIZED"
+        if error:
+            return HTMLResponse(
+                status_code=400,
+                content=_oauth_popup_result_html(
+                    message_type,
+                    {"authenticated": False, "status": "OAUTH_ERROR", "error": error},
+                    f"Authorization did not complete: {error}",
+                    ok=False,
+                ),
+            )
+        if not code:
+            return HTMLResponse(content=_OAUTH_IMPLICIT_CALLBACK_HTML)
+
+        st = _validate_oauth_state_for_request(request, state)
+        if not st:
+            return HTMLResponse(
+                status_code=400,
+                content=_oauth_popup_result_html(
+                    message_type,
+                    {"authenticated": False, "status": "INVALID_STATE"},
+                    "Invalid or expired OAuth state. Close this window and start again from the portal.",
+                    ok=False,
+                ),
+            )
+        tok_data, exchange_err = await asyncio.to_thread(_exchange_oauth_code, code, _oauth_callback_uri(request))
+        if not tok_data:
+            return HTMLResponse(
+                status_code=502,
+                content=_oauth_popup_result_html(
+                    message_type, {"authenticated": False, "status": "EXCHANGE_FAILED"}, exchange_err or "OAuth error.", ok=False
+                ),
+            )
+
+        if st.get("mode") == "signin":
+            id_tok = tok_data.get("id_token")
+            verified_info, err_msg = await asyncio.to_thread(
+                _verify_google_oauth_or_id_token, id_tok, None if id_tok else tok_data.get("access_token")
+            )
+            status_code, email_or_err = _validated_google_identity(verified_info, err_msg)
+            if status_code != 200 or verified_info is None:
+                return HTMLResponse(
+                    status_code=status_code,
+                    content=_oauth_popup_result_html(
+                        message_type, {"authenticated": False, "status": "REJECTED", "detail": email_or_err}, email_or_err, ok=False
+                    ),
                 )
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    tok_data = json.loads(resp.read().decode("utf-8"))
-                exchanged_token = tok_data.get("access_token", "")
-            except Exception as exc:
-                exchange_err = f"OAuth code exchange failed: {exc}"
+            content, signed_token = await _complete_signin(
+                email=email_or_err,
+                name=verified_info.get("name"),
+                region=st.get("region") or None,
+                timezone_str=st.get("timezone") or None,
+                auth_method=verified_info.get("auth_method", "google_id_token"),
+                picture=verified_info.get("picture", ""),
+            )
+            signin_resp = HTMLResponse(
+                content=_oauth_popup_result_html(message_type, content, "Signed in. You can close this window.", ok=True)
+            )
+            _set_session_cookie(signin_resp, request, signed_token)
+            signin_resp.delete_cookie(key=OAUTH_NONCE_COOKIE_NAME, path="/api/auth")
+            return signin_resp
 
-        callback_html = f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>Completing Google OAuth 2.0 Authorization...</title></head>
-<body style="background:#0b0f17;color:#e2e8f0;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;">
-<div id="msg">Completing Google Cloud OAuth 2.0 (3LO) authorization...</div>
-<script>
-(async function() {{
-  const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ''));
-  const accessToken = {json.dumps(exchanged_token)} || hashParams.get('access_token') || '';
-  const err = {json.dumps(exchange_err)} || hashParams.get('error') || '';
-  if (err || !accessToken) {{
-    document.getElementById('msg').textContent = 'Authorization did not complete: ' + (err || 'missing access_token');
-    return;
-  }}
-  const res = await fetch('/api/auth/tool-consent', {{
-    method: 'POST',
-    headers: {{ 'Content-Type': 'application/json' }},
-    body: JSON.stringify({{
-      user_id: {json.dumps(uid)},
-      session_id: {json.dumps(sess_id)},
-      access_token: accessToken,
-      target_scope: {json.dumps(target_scope)}
-    }})
-  }});
-  const data = await res.json();
-  if (window.opener) {{
-    window.opener.postMessage({{ type: 'PQC_OAUTH_3LO_AUTHORIZED', payload: data }}, window.location.origin);
-    window.close();
-  }} else {{
-    window.location.href = '/';
-  }}
-}})();
-</script></body></html>"""
-        return HTMLResponse(content=callback_html)
+        uid = normalize_user_id(st.get("uid"))
+        identity = resolve_request_identity(request)
+        if "@" not in uid or (identity is not None and identity.user_id != uid):
+            return HTMLResponse(
+                status_code=403,
+                content=_oauth_popup_result_html(
+                    message_type, {"authenticated": False, "status": "USER_MISMATCH"}, auth_guard.USER_MISMATCH_DETAIL, ok=False
+                ),
+            )
+        conn = _bind_delegated_gcp_token(uid, tok_data["access_token"], tok_data.get("expires_in"))
+        result_payload = {
+            "status": "AUTHORIZED",
+            "authenticated": True,
+            "user_id": uid,
+            "session_id": st.get("session_id") or None,
+            "target_scope": st.get("target_scope"),
+            "credential_key": GCP_OAUTH_CREDENTIAL_KEY,
+            "token_storage": "in_memory_only",
+            "connection": conn,
+        }
+        consent_resp = HTMLResponse(
+            content=_oauth_popup_result_html(message_type, result_payload, "Authorized. You can close this window.", ok=True)
+        )
+        consent_resp.delete_cookie(key=OAUTH_NONCE_COOKIE_NAME, path="/api/auth")
+        return consent_resp
 
     @app.post("/api/auth/tool-consent")
     async def grant_tool_oauth_consent_endpoint(
         request: Request,
         payload: ToolConsentPayload,
     ) -> Dict[str, Any]:
-        """Injects a user's 3-Legged OAuth 2.0 access token into:
-        1. The ADK session's `SessionStateCredentialService` (`ToolContext` credential store)
-        2. The isolated per-user `gcloud_bridge` connection configuration (`mode = 'access_token'`)
-        so the paused ADK tool can immediately resume execution on behalf of the user.
+        """Binds a delegated OAuth 2.0 access token to the SIGNED-IN user's gcloud/GCP connection so the paused ADK
+        tool can resume on their behalf. The token is kept in process memory only (never in session state or on disk).
         """
         uid = activate_request_tenant_user(request, explicit_user_id=payload.user_id)
+        if payload.oauth_state is not None:
+            st = _validate_oauth_state_for_request(request, payload.oauth_state)
+            if not st or st.get("mode") != "3lo" or normalize_user_id(st.get("uid")) != uid:
+                raise HTTPException(status_code=400, detail="Invalid or expired OAuth state. Start the authorization again.")
         raw_token = (payload.access_token or "").strip()
         if raw_token.lower().startswith("bearer "):
             raw_token = raw_token[7:].strip()
         if not raw_token:
             raise HTTPException(status_code=400, detail="A valid OAuth 2.0 access_token is required.")
 
-        verified_email = uid
+        verified_email: Optional[str] = None
+        expires_in: Optional[Any] = None
         if payload.verify_with_google:
             info, err_msg = await asyncio.to_thread(_verify_google_oauth_or_id_token, None, raw_token)
             if not info:
                 raise HTTPException(status_code=401, detail=err_msg or "Invalid Google OAuth access token.")
             verified_email = info["email"]
-            uid = set_current_tenant_user(verified_email)
+            expires_in = info.get("expires_in")
 
-        conn = set_gcp_connection_config(
-            mode="access_token",
-            access_token=raw_token,
-            user_id=uid,
-        )
-
-        # Also persist the credential inside the ADK session state so `tool_context.load_credential()` finds it
-        session_updated = False
+        conn = _bind_delegated_gcp_token(uid, raw_token, expires_in)
+        session_found = False
         if payload.session_id:
-            sess, resolved_uid = await _locate_session(payload.session_id, uid)
-            if sess is not None:
-                auth_cfg = build_gcp_oauth_auth_config(
-                    user_id=resolved_uid,
-                    session_id=sess.id,
-                    target_scope=payload.target_scope,
-                    access_token=raw_token,
-                )
-                cred_dict = auth_cfg.exchanged_auth_credential.model_dump(exclude_none=True) if auth_cfg.exchanged_auth_credential else {}
-                sess.state[f"auth_{GCP_OAUTH_CREDENTIAL_KEY}"] = cred_dict
-                sess.state[GCP_OAUTH_CREDENTIAL_KEY] = cred_dict
-                if isinstance(sess.state.get("pending_oauth_consent"), dict):
-                    sess.state["pending_oauth_consent"]["status"] = "AUTHORIZED"
-                session_updated = True
+            sess, _ = await _locate_session(payload.session_id, uid)
+            session_found = sess is not None
 
         return {
             "status": "AUTHORIZED",
             "authenticated": True,
             "user_id": uid,
-            "verified_email": verified_email,
+            "verified_email": verified_email or uid,
             "session_id": payload.session_id,
-            "session_credential_injected": session_updated,
+            "session_found": session_found,
+            "session_credential_injected": False,
+            "token_storage": "in_memory_only",
             "credential_key": GCP_OAUTH_CREDENTIAL_KEY,
             "tool_name": payload.tool_name,
             "target_scope": payload.target_scope,
@@ -1832,21 +2234,11 @@ async function saveClientId() {{
             "state": dict(session.state or {}),
         }
 
-    async def _locate_session(session_id: str, user_id: Optional[str] = None) -> Tuple[Optional[Any], str]:
-        candidate_user = normalize_user_id(user_id or DEFAULT_USER_ID)
+    async def _locate_session(session_id: str, user_id: str) -> Tuple[Optional[Any], str]:
+        """Strict tenant boundary: a session is only ever looked up under the authenticated user's own id."""
+        candidate_user = normalize_user_id(user_id)
         sess = await session_service.get_session(app_name=APP_NAME, user_id=candidate_user, session_id=session_id)
-        if sess is not None:
-            return sess, candidate_user
-        # Strict multi-tenant boundary: if candidate_user is an authenticated corporate email (@google.com),
-        # never fall back to scanning other users' sessions!
-        if "@" in candidate_user:
-            return None, candidate_user
-        all_resp = await session_service.list_sessions(app_name=APP_NAME, user_id=None)
-        for s in all_resp.sessions:
-            if s.id == session_id and "@" not in str(s.user_id):
-                found = await session_service.get_session(app_name=APP_NAME, user_id=s.user_id, session_id=session_id)
-                return found, s.user_id
-        return None, candidate_user
+        return sess, candidate_user
 
     @app.get("/api/sessions/{session_id}")
     async def get_persistent_session_detail(
@@ -1885,7 +2277,7 @@ async function saveClientId() {{
             "messages": messages,
             "tool_calls": tool_calls,
             "artifacts": artifacts,
-            "state": state_dict,
+            "state": _redact_session_state(state_dict),
         }
 
     @app.delete("/api/sessions/{session_id}")
@@ -1915,7 +2307,7 @@ async function saveClientId() {{
         message: Optional[str] = Form(default=None),
         prompt: Optional[str] = Form(default=None),
         session_id: Optional[str] = Form(default=None),
-        user_id: str = Form(default=DEFAULT_USER_ID),
+        user_id: Optional[str] = Form(default=None),  # optional; must equal the authenticated user when given
         scope: str = Form(default="organizations/31564119954"),
         project_id: Optional[str] = Form(default=None),
         location: str = Form(default="all"),
@@ -2200,8 +2592,7 @@ async function saveClientId() {{
         user_id: Optional[str] = Query(default=None),
     ) -> Dict[str, Any]:
         uid = activate_request_tenant_user(request, explicit_user_id=user_id)
-        filter_uid = uid if "@" in uid else user_id
-        return {"user_id": uid, "traces": get_recent_gcloud_traces(user_id=filter_uid)}
+        return {"user_id": uid, "traces": get_recent_gcloud_traces(user_id=uid)}
 
     return app
 

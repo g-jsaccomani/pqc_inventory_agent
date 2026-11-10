@@ -1487,20 +1487,36 @@ PORTAL_HTML = r"""<!DOCTYPE html>
         </div>
         <button onclick="closeAuthModal()" style="background:transparent;border:none;color:var(--text-secondary);font-size:16px;cursor:pointer;">✕</button>
       </div>
-      <form class="modal-body" onsubmit="submitGoogleWorkspaceSignIn(event)">
+      <form class="modal-body" onsubmit="submitGoogleWorkspaceSignIn(event)" autocomplete="off">
         <div class="auth-google-badge">
           <div>
-            <strong style="color:var(--text-primary);display:block;margin-bottom:2px;">Persistent Per-User Workspace (@google.com)</strong>
-            Sign in with your corporate <code>@google.com</code> identity. Your chat history, uploaded artifacts, and GCP connection settings are isolated and persisted across NorthAm, EMEA, India, APAC, and LATAM.
+            <strong style="color:var(--text-primary);display:block;margin-bottom:2px;">Verified Google sign-in (@google.com)</strong>
+            Your identity is verified with Google before a session is created. Chat history, uploaded artifacts, and GCP connection settings are isolated per user across NorthAm, EMEA, India, APAC, and LATAM.
           </div>
         </div>
 
         <div class="auth-error-banner" id="auth-error-banner"></div>
 
+        <button type="button" class="btn-modal-primary" id="auth-google-oauth-btn" onclick="startGoogleOAuthSignIn()" style="display:none;width:100%;justify-content:center;">
+          Sign in with Google
+        </button>
+
+        <div class="conn-field" id="auth-token-field">
+          <label for="auth-oauth-token-input">Google OAuth access token <span id="auth-token-required-badge" style="color:var(--gemini-link);">(required)</span></label>
+          <div style="font-size:12px;color:var(--text-secondary);line-height:1.5;margin-bottom:4px;">
+            Run <code>gcloud auth print-access-token</code> in a terminal where gcloud is signed in with your corporate account, then paste the output (<code>ya29...</code>). The token is verified with Google and never written to disk.
+          </div>
+          <input type="password" id="auth-oauth-token-input" placeholder="Paste the output of: gcloud auth print-access-token" autocomplete="off" />
+          <label style="display:flex;align-items:center;gap:6px;margin-top:4px;cursor:pointer;font-size:12px;color:var(--text-secondary);">
+            <input type="checkbox" id="auth-bind-gcp-token" style="width:auto;" checked />
+            <span>Also use this token for my isolated GCP / gcloud connection (kept in memory only)</span>
+          </label>
+        </div>
+
         <div class="conn-grid-2">
           <div class="conn-field">
-            <label for="auth-email-input">Google Corporate Email (@google.com)</label>
-            <input type="text" id="auth-email-input" placeholder="ldap@google.com" autocomplete="email" required />
+            <label for="auth-email-input">Corporate Email <span id="auth-email-hint" style="color:var(--text-muted);">(taken from the verified token)</span></label>
+            <input type="text" id="auth-email-input" placeholder="ldap@google.com" autocomplete="email" />
           </div>
           <div class="conn-field">
             <label for="auth-name-input">Display Name (Optional)</label>
@@ -1519,24 +1535,13 @@ PORTAL_HTML = r"""<!DOCTYPE html>
           </div>
         </div>
 
-        <details style="font-size:12px;color:var(--text-secondary);">
-          <summary style="cursor:pointer;color:var(--text-muted);user-select:none;">Optional: Verify with OAuth Token (`gcloud auth print-access-token`)</summary>
-          <div class="conn-field" style="margin-top:8px;">
-            <input type="password" id="auth-oauth-token-input" placeholder="Paste Google OAuth access token (optional)" />
-            <label style="display:flex;align-items:center;gap:6px;margin-top:4px;cursor:pointer;">
-              <input type="checkbox" id="auth-bind-gcp-token" style="width:auto;" checked />
-              <span>Also use this token for my isolated GCP / gcloud connection</span>
-            </label>
-          </div>
-        </details>
-
         <div style="display:flex;align-items:center;justify-content:space-between;margin-top:4px;">
           <button type="button" id="auth-signout-btn" onclick="signOutTenantUser()" style="display:none;background:transparent;border:1px solid var(--border-subtle);color:var(--text-secondary);padding:7px 12px;border-radius:999px;font-size:12px;cursor:pointer;">
             Switch Account / Sign Out
           </button>
           <div style="display:flex;gap:8px;margin-left:auto;">
             <button type="submit" class="btn-modal-primary" id="auth-submit-btn">
-              Continue with @google.com
+              Verify &amp; Sign In
             </button>
           </div>
         </div>
@@ -1660,15 +1665,109 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     let pendingFiles = [];
     let assistantResponsesStore = {};
 
+    let AUTH_CONFIG = { allow_unverified_signin: false, google_oauth_client_configured: false, oauth_signin_url: null };
+
+    // The server derives the user ONLY from the signed session token/cookie (or a verified IAP JWT):
+    // no client-asserted user id header is ever sent.
     function getAuthHeaders(extra = {}) {
       const headers = Object.assign({}, extra);
-      headers["X-PQC-User-Id"] = currentUserId;
       headers["X-PQC-User-Timezone"] = detectBrowserTimezone();
       headers["X-PQC-User-Region"] = selectedAuthRegion;
       if (currentAuthToken) {
         headers["X-PQC-User-Token"] = currentAuthToken;
       }
       return headers;
+    }
+
+    // Any HTTP 401 from the portal API opens the sign-in dialog instead of breaking the page.
+    const pqcNativeFetch = window.fetch.bind(window);
+    window.fetch = async function (input, init) {
+      const response = await pqcNativeFetch(input, init);
+      try {
+        const rawUrl = typeof input === "string" ? input : (input && input.url) || "";
+        const path = new URL(rawUrl, window.location.origin).pathname;
+        if (response.status === 401 && path.startsWith("/api/") && path !== "/api/auth/google") {
+          handleUnauthorizedResponse(response.clone());
+        }
+      } catch (e) {}
+      return response;
+    };
+
+    async function handleUnauthorizedResponse(res) {
+      let detail = "";
+      try {
+        detail = (await res.json()).detail || "";
+      } catch (e) {}
+      if (currentAuthToken) {
+        currentAuthToken = "";
+        localStorage.removeItem("pqc_session_token");
+      }
+      updateTenantProfileUI(null);
+      openAuthModal(detail || "Your session is missing or expired. Please sign in again.");
+    }
+
+    async function loadAuthConfig() {
+      try {
+        const res = await fetch("/api/auth/config", { credentials: "same-origin" });
+        if (res.ok) AUTH_CONFIG = Object.assign(AUTH_CONFIG, await res.json());
+      } catch (e) {
+        console.warn("Auth config warning:", e);
+      }
+      applyAuthConfigToModal();
+    }
+
+    function applyAuthConfigToModal() {
+      const oauthBtn = document.getElementById("auth-google-oauth-btn");
+      const tokenBadge = document.getElementById("auth-token-required-badge");
+      const emailHint = document.getElementById("auth-email-hint");
+      if (oauthBtn) oauthBtn.style.display = AUTH_CONFIG.google_oauth_client_configured ? "inline-flex" : "none";
+      if (AUTH_CONFIG.allow_unverified_signin) {
+        if (tokenBadge) tokenBadge.textContent = "(optional: local development mode)";
+        if (emailHint) emailHint.textContent = "(required without a token: development mode)";
+      } else {
+        if (tokenBadge) tokenBadge.textContent = AUTH_CONFIG.google_oauth_client_configured ? "(required unless you use Sign in with Google)" : "(required)";
+        if (emailHint) emailHint.textContent = "(taken from the verified token)";
+      }
+    }
+
+    function showAuthError(message) {
+      const errEl = document.getElementById("auth-error-banner");
+      if (errEl) {
+        errEl.textContent = message;
+        errEl.style.display = "block";
+      }
+    }
+
+    function startGoogleOAuthSignIn() {
+      const params = new URLSearchParams({ region: selectedAuthRegion || "", timezone: detectBrowserTimezone() || "" });
+      const w = 520, h = 640;
+      const left = Math.max(0, Math.round((window.screen.width - w) / 2));
+      const top = Math.max(0, Math.round((window.screen.height - h) / 2));
+      window.open(`/api/auth/oauth/signin?${params.toString()}`, "pqc_google_signin_popup", `width=${w},height=${h},left=${left},top=${top},resizable=yes,scrollbars=yes`);
+    }
+
+    async function applySignInResult(data) {
+      currentAuthToken = data.token || "";
+      if (currentAuthToken) {
+        localStorage.setItem("pqc_session_token", currentAuthToken);
+      }
+      const tokInput = document.getElementById("auth-oauth-token-input");
+      if (tokInput) tokInput.value = "";
+      updateTenantProfileUI(data.user);
+      if (data.connection) {
+        applyConnectionConfigToUI(data.connection);
+      }
+      closeAuthModal();
+      currentSessionId = localStorage.getItem(`pqc_active_session_id:${currentUserId}`) || null;
+      await fetchSessions();
+      if (!currentSessionId && allSessions.length > 0) {
+        currentSessionId = allSessions[0].session_id;
+      }
+      if (currentSessionId) {
+        await loadSessionHistory(currentSessionId);
+      } else {
+        goHome();
+      }
     }
 
     function computeInitials(nameOrEmail) {
@@ -1719,12 +1818,13 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       });
     }
 
-    function openAuthModal() {
+    function openAuthModal(message) {
       const errEl = document.getElementById("auth-error-banner");
       if (errEl) {
-        errEl.style.display = "none";
-        errEl.textContent = "";
+        errEl.style.display = message ? "block" : "none";
+        errEl.textContent = message || "";
       }
+      applyAuthConfigToModal();
       const emailInput = document.getElementById("auth-email-input");
       const nameInput = document.getElementById("auth-name-input");
       if (currentUserProfile && currentUserProfile.email) {
@@ -1735,7 +1835,8 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       }
       selectAuthRegion(selectedAuthRegion);
       document.getElementById("auth-modal").classList.add("open");
-      setTimeout(() => emailInput && emailInput.focus(), 60);
+      const tokenInput = document.getElementById("auth-oauth-token-input");
+      setTimeout(() => (AUTH_CONFIG.allow_unverified_signin ? emailInput : tokenInput) && (AUTH_CONFIG.allow_unverified_signin ? emailInput : tokenInput).focus(), 60);
     }
 
     function closeAuthModal() {
@@ -1757,6 +1858,10 @@ PORTAL_HTML = r"""<!DOCTYPE html>
             applyConnectionConfigToUI(data.connection);
           }
         } else {
+          if (currentAuthToken) {
+            currentAuthToken = "";
+            localStorage.removeItem("pqc_session_token");
+          }
           updateTenantProfileUI(null);
           openAuthModal();
         }
@@ -1781,47 +1886,43 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       const oauthToken = (document.getElementById("auth-oauth-token-input").value || "").trim();
       const bindGcp = Boolean(document.getElementById("auth-bind-gcp-token").checked);
 
+      if (!oauthToken && !AUTH_CONFIG.allow_unverified_signin) {
+        showAuthError(
+          "A verified Google credential is required. Run `gcloud auth print-access-token` and paste the token above" +
+            (AUTH_CONFIG.google_oauth_client_configured ? ", or use Sign in with Google." : ".")
+        );
+        return;
+      }
+      if (!oauthToken && !rawEmail) {
+        showAuthError("Development mode: enter your corporate email or paste an access token.");
+        return;
+      }
+
       try {
         const res = await fetch("/api/auth/google", {
           method: "POST",
           credentials: "same-origin",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            email: rawEmail,
+            email: rawEmail || undefined,
             name: displayName || undefined,
             region: selectedAuthRegion,
             timezone: detectBrowserTimezone(),
             google_access_token: oauthToken || undefined,
-            use_token_for_gcp_connection: bindGcp,
+            use_token_for_gcp_connection: Boolean(oauthToken) && bindGcp,
           }),
         });
-        const data = await res.json();
+        let data = {};
+        try {
+          data = await res.json();
+        } catch (parseErr) {
+          data = {};
+        }
         if (!res.ok || !data.authenticated) {
-          if (errEl) {
-            errEl.textContent = (data && data.detail) || "Authentication failed. Please use a valid @google.com email.";
-            errEl.style.display = "block";
-          }
+          showAuthError((data && data.detail) || `Sign-in failed (HTTP ${res.status}).`);
           return;
         }
-        currentAuthToken = data.token || "";
-        if (currentAuthToken) {
-          localStorage.setItem("pqc_session_token", currentAuthToken);
-        }
-        updateTenantProfileUI(data.user);
-        if (data.connection) {
-          applyConnectionConfigToUI(data.connection);
-        }
-        closeAuthModal();
-        currentSessionId = localStorage.getItem(`pqc_active_session_id:${currentUserId}`) || null;
-        await fetchSessions();
-        if (!currentSessionId && allSessions.length > 0) {
-          currentSessionId = allSessions[0].session_id;
-        }
-        if (currentSessionId) {
-          await loadSessionHistory(currentSessionId);
-        } else {
-          goHome();
-        }
+        await applySignInResult(data);
       } catch (err) {
         if (errEl) {
           errEl.textContent = `Sign-in error: ${err}`;
@@ -1842,13 +1943,18 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       localStorage.removeItem("pqc_user_id");
       updateTenantProfileUI(null);
       goHome();
-      await fetchSessions();
+      allSessions = [];
+      document.getElementById("session-count-badge").textContent = "0";
+      renderSessionList();
       openAuthModal();
     }
 
     async function loadModelCatalog(forceRefresh = false) {
       try {
-        const res = await fetch(`/api/models${forceRefresh ? "?refresh=true" : ""}`);
+        const res = await fetch(`/api/models${forceRefresh ? "?refresh=true" : ""}`, {
+          credentials: "same-origin",
+          headers: getAuthHeaders(),
+        });
         const data = await res.json();
         MODEL_OPTIONS = data.models || [];
         MODEL_CATALOG_META = {
@@ -1918,7 +2024,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       const unavailableCount = (MODEL_CATALOG_META.unavailable || []).length;
       const projectTxt = MODEL_CATALOG_META.project ? ` (${MODEL_CATALOG_META.project})` : "";
       note.textContent =
-        `Gemini only. Each model listed answered a live verification request on Vertex AI${projectTxt}.` +
+        `Gemini Pro only. Each model listed answered a live verification request on Vertex AI${projectTxt}.` +
         (unavailableCount ? ` ${unavailableCount} candidate model(s) unavailable in this project are hidden.` : "");
       menuEl.appendChild(note);
     }
@@ -1965,7 +2071,8 @@ PORTAL_HTML = r"""<!DOCTYPE html>
         .replace(/&/g, "&amp;")
         .replace(/</g, "&lt;")
         .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;");
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
     }
 
     function enhanceCodeBlocks(containerEl) {
@@ -2016,7 +2123,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
 
     async function loadConnectionConfig() {
       try {
-        const res = await fetch(`/api/connection?user_id=${encodeURIComponent(currentUserId)}`, {
+        const res = await fetch("/api/connection", {
           credentials: "same-origin",
           headers: getAuthHeaders(),
         });
@@ -2046,7 +2153,6 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       const selectedMode = document.getElementById("conn-mode-select").value;
       const rawTok = document.getElementById("conn-token-input").value.trim();
       const payload = {
-        user_id: currentUserId,
         mode: selectedMode,
         organization_id: document.getElementById("conn-org-input").value.trim(),
         project_id: document.getElementById("conn-proj-input").value.trim(),
@@ -2073,7 +2179,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       if (cardDomId) activeOAuthConsentCardId = cardDomId;
       if (resumePrompt) activeOAuthResumePrompt = resumePrompt;
       const orgId = (document.getElementById("conn-org-input").value || "31564119954").trim();
-      const targetUri = customAuthUri || `/api/auth/oauth/authorize?user_id=${encodeURIComponent(currentUserId)}&session_id=${encodeURIComponent(currentSessionId || "")}&scope=${encodeURIComponent("organizations/" + orgId.replace("organizations/", ""))}`;
+      const targetUri = customAuthUri || `/api/auth/oauth/authorize?session_id=${encodeURIComponent(currentSessionId || "")}&scope=${encodeURIComponent("organizations/" + orgId.replace("organizations/", ""))}`;
       const w = 520, h = 640;
       const left = Math.max(0, Math.round((window.screen.width - w) / 2));
       const top = Math.max(0, Math.round((window.screen.height - h) / 2));
@@ -2094,7 +2200,6 @@ PORTAL_HTML = r"""<!DOCTYPE html>
           credentials: "same-origin",
           headers: getAuthHeaders({ "Content-Type": "application/json" }),
           body: JSON.stringify({
-            user_id: currentUserId,
             session_id: currentSessionId,
             access_token: rawToken,
             tool_name: toolName,
@@ -2148,7 +2253,16 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     window.addEventListener("message", async (event) => {
       if (event.origin !== window.location.origin) return;
       if (event.data && event.data.type === "PQC_OAUTH_3LO_AUTHORIZED") {
-        await handleOAuth3LOAuthorized(event.data.payload, activeOAuthConsentCardId, activeOAuthResumePrompt);
+        if (event.data.payload && event.data.payload.status === "AUTHORIZED") {
+          await handleOAuth3LOAuthorized(event.data.payload, activeOAuthConsentCardId, activeOAuthResumePrompt);
+        }
+      } else if (event.data && event.data.type === "PQC_SIGNIN_COMPLETE") {
+        const payload = event.data.payload || {};
+        if (payload.authenticated && payload.token) {
+          await applySignInResult(payload);
+        } else {
+          openAuthModal(payload.detail || payload.error || "Google sign-in did not complete.");
+        }
       }
     });
 
@@ -2156,7 +2270,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       if (!consentCard) return "";
       const toolName = consentCard.tool_name || "collect_kms_inventory";
       const targetScope = consentCard.target_scope || "organizations/31564119954";
-      const authUri = consentCard.auth_uri || `/api/auth/oauth/authorize?user_id=${encodeURIComponent(currentUserId)}&session_id=${encodeURIComponent(currentSessionId || "")}&scope=${encodeURIComponent(targetScope)}`;
+      const authUri = consentCard.auth_uri || `/api/auth/oauth/authorize?session_id=${encodeURIComponent(currentSessionId || "")}&scope=${encodeURIComponent(targetScope)}`;
       const scopes = consentCard.scopes || ["openid", "email", "profile", "https://www.googleapis.com/auth/cloud-platform.read-only"];
       const resumePrompt = consentCard.original_prompt || `Please continue executing ${toolName} on ${targetScope}.`;
       const isAuthorized = consentCard.status === "AUTHORIZED";
@@ -2180,13 +2294,13 @@ PORTAL_HTML = r"""<!DOCTYPE html>
             <div><strong style="color:var(--text-primary);">OAuth 2.0 Scopes:</strong> ${escapeHtml(scopes.join(" "))}</div>
           </div>
           <div class="oauth-consent-actions">
-            <button type="button" class="btn-oauth-popup" onclick='openOAuth3LOPopup(${JSON.stringify(authUri)}, ${JSON.stringify(cardDomId)}, ${JSON.stringify(resumePrompt)})'>
+            <button type="button" class="btn-oauth-popup" onclick='openOAuth3LOPopup(${escapeHtml(JSON.stringify(authUri))}, ${escapeHtml(JSON.stringify(cardDomId))}, ${escapeHtml(JSON.stringify(resumePrompt))})'>
               <span>Authorize with Google Cloud (OAuth 2.0 Popup)</span>
             </button>
           </div>
           <div style="display:flex;gap:8px;align-items:center;margin-top:2px;">
             <input type="password" id="consent-tok-${escapeHtml(cardDomId)}" placeholder="Or paste ya29... token from: gcloud auth print-access-token" style="flex:1;padding:7px 10px;border-radius:8px;border:1px solid var(--border-subtle);background:var(--bg-canvas);color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:11.5px;" />
-            <button type="button" class="btn-minimal-action" onclick='submitInlineToolConsent(${JSON.stringify(cardDomId)}, ${JSON.stringify(toolName)}, ${JSON.stringify(targetScope)}, ${JSON.stringify(resumePrompt)})' style="padding:7px 12px;border:1px solid rgba(76,141,246,0.4);color:var(--gemini-link);">
+            <button type="button" class="btn-minimal-action" onclick='submitInlineToolConsent(${escapeHtml(JSON.stringify(cardDomId))}, ${escapeHtml(JSON.stringify(toolName))}, ${escapeHtml(JSON.stringify(targetScope))}, ${escapeHtml(JSON.stringify(resumePrompt))})' style="padding:7px 12px;border:1px solid rgba(76,141,246,0.4);color:var(--gemini-link);">
               Inject into ToolContext &amp; Resume
             </button>
           </div>
@@ -2197,7 +2311,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
 
     async function fetchSessions() {
       try {
-        const res = await fetch(`/api/sessions?user_id=${encodeURIComponent(currentUserId)}`, {
+        const res = await fetch("/api/sessions", {
           credentials: "same-origin",
           headers: getAuthHeaders(),
         });
@@ -2262,7 +2376,6 @@ PORTAL_HTML = r"""<!DOCTYPE html>
         credentials: "same-origin",
         headers: getAuthHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({
-          user_id: currentUserId,
           title: sessionTitle,
           scope: `organizations/${orgId.replace("organizations/", "")}`,
         }),
@@ -2283,7 +2396,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       localStorage.setItem(`pqc_active_session_id:${currentUserId}`, sessionId);
       localStorage.setItem("pqc_active_session_id", sessionId);
       renderSessionList();
-      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}?user_id=${encodeURIComponent(currentUserId)}`, {
+      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`, {
         credentials: "same-origin",
         headers: getAuthHeaders(),
       });
@@ -2317,7 +2430,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     }
 
     async function deleteSessionById(sessionId) {
-      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}?user_id=${encodeURIComponent(currentUserId)}`, {
+      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`, {
         method: "DELETE",
         credentials: "same-origin",
         headers: getAuthHeaders(),
@@ -2522,7 +2635,6 @@ PORTAL_HTML = r"""<!DOCTYPE html>
 
       const formData = new FormData();
       formData.append("message", messageText || "Read the attached file(s), explain what they contain and how they affect our PQC assessment.");
-      formData.append("user_id", currentUserId);
       formData.append("model_id", selectedModelId);
       if (currentSessionId) {
         formData.append("session_id", currentSessionId);
@@ -2560,6 +2672,13 @@ PORTAL_HTML = r"""<!DOCTYPE html>
           body: formData,
         });
         loadingRow.remove();
+        if (res.status === 401) {
+          appendAssistantMessageUI("", [], getModelDisplayLabel(selectedModelId), null, {
+            code: "AUTH_REQUIRED",
+            message: "Sign in to continue: the sign-in dialog is open. Your message was not sent to the model.",
+          });
+          return;
+        }
         let data = null;
         try {
           data = await res.json();
@@ -2632,7 +2751,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
           method: "POST",
           credentials: "same-origin",
           headers: getAuthHeaders({ "Content-Type": "application/json" }),
-          body: JSON.stringify({ command: cmd, user_id: currentUserId }),
+          body: JSON.stringify({ command: cmd }),
         });
         const data = await res.json();
         if (data.status === "SUCCESS") {
@@ -2664,8 +2783,10 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     window.addEventListener("DOMContentLoaded", async () => {
       const linkedSession = new URLSearchParams(window.location.search).get("session");
       renderModelDropdown();
+      await loadAuthConfig();
       await loadModelCatalog();
       await loadCurrentTenantUser();
+      if (!currentUserProfile) return;  // the sign-in dialog is open; tenant APIs require a verified session
       await loadConnectionConfig();
       await fetchSessions();
       if (linkedSession) {

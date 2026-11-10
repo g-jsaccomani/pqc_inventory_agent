@@ -5,6 +5,10 @@ Supports 3 connection modes switchable at runtime from the Gemini Enterprise Wor
 2. 'impersonation' ('Service Account Impersonation', e.g., 'pqc-reader@customer-project.iam.gserviceaccount.com')
 3. 'access_token' ('User gcloud Access Token' from `gcloud auth print-access-token`)
 
+Security: user OAuth access tokens are secrets. They are kept ONLY in process memory, keyed by tenant user with an
+expiry (`PQC_ACCESS_TOKEN_TTL_SECONDS`, default 3600 s = Google access-token lifetime), and are never written to the
+connection store on `/data` (a GCS bucket on Cloud Run). Only non-secret connection settings are persisted.
+
 Also provides the read-only diagnostic tool `execute_gcloud_command(command: str)` with strict
 verb allowlisting/denylisting and shell-injection prevention.
 """
@@ -168,7 +172,6 @@ def _default_connection_template() -> Dict[str, Any]:
         "project_id": os.getenv("GOOGLE_CLOUD_PROJECT", "pqc-inventory-agent-cd06"),
         "location": os.getenv("PQC_DEFAULT_LOCATION", "all"),
         "impersonated_service_account": os.getenv("PQC_IMPERSONATED_SERVICE_ACCOUNT", ""),
-        "access_token": os.getenv("PQC_USER_ACCESS_TOKEN", ""),
         "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }
 
@@ -177,10 +180,65 @@ _CONNECTION_STATE: Dict[str, Any] = _default_connection_template()
 _USER_CONNECTIONS: Dict[str, Dict[str, Any]] = {}
 _USER_CONNECTIONS_LOADED = False
 
+# Only these non-secret settings are ever persisted to the connection store on disk.
+_PERSISTED_CONNECTION_KEYS = (
+    "mode",
+    "organization_id",
+    "project_id",
+    "location",
+    "impersonated_service_account",
+    "updated_at",
+)
+_SECRET_CONNECTION_KEYS = ("access_token", "refresh_token", "id_token", "client_secret")
+
+# In-process OAuth access-token store: user_id -> (token, expires_at_epoch or None for operator-provided env tokens).
+_USER_ACCESS_TOKENS: Dict[str, Tuple[str, Optional[float]]] = {}
+if os.getenv("PQC_USER_ACCESS_TOKEN", "").strip():
+    # Operator-provided token: only for the non-tenant default user, never inherited by signed-in tenants.
+    _USER_ACCESS_TOKENS[DEFAULT_TENANT_USER_ID] = (os.getenv("PQC_USER_ACCESS_TOKEN", "").strip(), None)
+
+
+def _access_token_ttl_seconds() -> float:
+    try:
+        return max(60.0, float(os.getenv("PQC_ACCESS_TOKEN_TTL_SECONDS", "3600")))
+    except ValueError:
+        return 3600.0
+
+
+def _store_access_token(uid: str, token: str, expires_in: Optional[float] = None) -> None:
+    """Keeps `token` for `uid` in memory only (empty token clears it)."""
+    if not token:
+        _USER_ACCESS_TOKENS.pop(uid, None)
+        return
+    ttl = float(expires_in) if expires_in else _access_token_ttl_seconds()
+    _USER_ACCESS_TOKENS[uid] = (token, time.time() + ttl)
+
+
+def _get_access_token(uid: str) -> Tuple[str, Optional[float]]:
+    """Returns (token, expires_at) for `uid`, dropping expired tokens."""
+    entry = _USER_ACCESS_TOKENS.get(uid)
+    if not entry:
+        return "", None
+    token, expires_at = entry
+    if expires_at is not None and expires_at <= time.time():
+        _USER_ACCESS_TOKENS.pop(uid, None)
+        return "", None
+    return token, expires_at
+
+
+def clear_user_access_token(user_id: Optional[str] = None) -> None:
+    """Forgets the in-memory OAuth access token of a tenant user (e.g. on sign-out)."""
+    with _LOCK:
+        _USER_ACCESS_TOKENS.pop(normalize_user_id(user_id or get_current_tenant_user()), None)
+
 _GCLOUD_EXECUTION_LOG: List[Dict[str, Any]] = []
 
 
 def _get_user_connections_path() -> str:
+    override = os.getenv("PQC_DATA_DIR", "").strip()
+    if override:
+        os.makedirs(override, exist_ok=True)
+        return os.path.join(override, "pqc_user_connections.json")
     if os.path.isdir("/data") and os.access("/data", os.W_OK):
         return "/data/pqc_user_connections.json"
     os.makedirs("data", exist_ok=True)
@@ -195,28 +253,38 @@ def _ensure_user_connections_loaded() -> None:
     path = _get_user_connections_path()
     if not os.path.exists(path):
         return
+    legacy_secrets_found = False
     try:
         with open(path, "r", encoding="utf-8") as f:
             raw = json.load(f)
         if isinstance(raw, dict):
             for k, v in raw.items():
                 if isinstance(v, dict):
-                    _USER_CONNECTIONS[normalize_user_id(k)] = dict(v)
+                    if any(v.get(secret_key) for secret_key in _SECRET_CONNECTION_KEYS):
+                        legacy_secrets_found = True
+                    _USER_CONNECTIONS[normalize_user_id(k)] = {
+                        key: v[key] for key in _PERSISTED_CONNECTION_KEYS if key in v
+                    }
     except Exception:
         pass
+    if legacy_secrets_found:
+        # Purge plaintext tokens written by previous versions; they are not loaded back into memory.
+        logger.warning("Removed plaintext OAuth tokens from the legacy connection store %s.", path)
+        _persist_user_connections()
 
 
 def _persist_user_connections() -> None:
+    """Persists ONLY non-secret connection settings (never OAuth access tokens) with an atomic replace."""
     path = _get_user_connections_path()
     try:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        # Do not persist raw transient OAuth access tokens to disk for security; keep mode/org/project/SA
         serializable: Dict[str, Dict[str, Any]] = {}
         for uid, cfg in _USER_CONNECTIONS.items():
-            copy_cfg = dict(cfg)
-            serializable[uid] = copy_cfg
-        with open(path, "w", encoding="utf-8") as f:
+            serializable[uid] = {key: cfg[key] for key in _PERSISTED_CONNECTION_KEYS if key in cfg}
+        tmp_path = f"{path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(serializable, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
     except OSError:
         pass
 
@@ -247,8 +315,13 @@ def set_gcp_connection_config(
     impersonated_service_account: Optional[str] = None,
     access_token: Optional[str] = None,
     user_id: Optional[str] = None,
+    access_token_expires_in: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """Updates the active GCP / gcloud connection configuration for the current tenant user and returns its sanitized state."""
+    """Updates the active GCP / gcloud connection configuration for the current tenant user and returns its sanitized state.
+
+    `access_token` is kept in process memory only (see module docstring); `access_token_expires_in` (seconds)
+    overrides the default in-memory lifetime.
+    """
     with _LOCK:
         uid, target_state = _get_mutable_user_state(user_id)
         if mode is not None:
@@ -270,7 +343,9 @@ def set_gcp_connection_config(
             tok = str(access_token).strip()
             if tok.lower().startswith("bearer "):
                 tok = tok[7:].strip()
-            target_state["access_token"] = tok
+            _store_access_token(uid, tok, access_token_expires_in)
+        for secret_key in _SECRET_CONNECTION_KEYS:
+            target_state.pop(secret_key, None)
 
         target_state["updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
         _USER_CONNECTIONS[uid] = dict(target_state)
@@ -289,8 +364,8 @@ def get_gcp_connection_config(mask_token: bool = True, user_id: Optional[str] = 
             state = dict(_USER_CONNECTIONS[uid])
         else:
             state = _default_connection_template()
+        raw_token, token_expires_at = _get_access_token(uid)
     mode = normalize_connection_mode(state.get("mode"))
-    raw_token = state.get("access_token") or ""
     has_token = bool(raw_token)
     masked_token = ""
     if has_token:
@@ -311,6 +386,12 @@ def get_gcp_connection_config(mask_token: bool = True, user_id: Optional[str] = 
         "impersonated_service_account": state.get("impersonated_service_account", ""),
         "has_access_token": has_token,
         "access_token_preview": masked_token if mask_token else raw_token,
+        "access_token_storage": "in_memory_only",
+        "access_token_expires_at": (
+            datetime.datetime.fromtimestamp(token_expires_at, tz=datetime.timezone.utc).isoformat()
+            if (has_token and token_expires_at)
+            else None
+        ),
         "gcloud_binary_available": bool(_resolve_gcloud_binary()),
         "updated_at": state.get("updated_at"),
     }
