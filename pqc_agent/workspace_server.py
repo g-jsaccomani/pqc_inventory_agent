@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from google.adk.apps import App
 from google.adk.artifacts.gcs_artifact_service import GcsArtifactService
 from google.adk.auth import (
@@ -1734,6 +1734,40 @@ def create_workspace_app(
     @app.get("/", response_class=HTMLResponse, include_in_schema=False)
     async def serve_portal() -> HTMLResponse:
         return HTMLResponse(content=PORTAL_HTML)
+
+    assets_dir = Path(__file__).resolve().parent / "assets"
+
+    @app.get("/favicon.ico", include_in_schema=False)
+    async def serve_favicon() -> FileResponse:
+        return FileResponse(
+            path=str(assets_dir / "favicon.ico"),
+            media_type="image/x-icon",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+
+    @app.get("/static/pqc-favicon-64.png", include_in_schema=False)
+    async def serve_favicon_64() -> FileResponse:
+        return FileResponse(
+            path=str(assets_dir / "pqc_favicon_64.png"),
+            media_type="image/png",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+
+    @app.get("/static/pqc-logo-shield.png", include_in_schema=False)
+    async def serve_logo_shield() -> FileResponse:
+        return FileResponse(
+            path=str(assets_dir / "pqc_logo_shield.png"),
+            media_type="image/png",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+
+    @app.get("/static/pqc-logo-full.png", include_in_schema=False)
+    async def serve_logo_full() -> FileResponse:
+        return FileResponse(
+            path=str(assets_dir / "pqc_logo_full.png"),
+            media_type="image/png",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
 
     def _is_https(request: Request) -> bool:
         return (request.headers.get("x-forwarded-proto") or request.url.scheme).split(",")[0].strip() == "https"

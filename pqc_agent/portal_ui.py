@@ -6,6 +6,9 @@ PORTAL_HTML = r"""<!DOCTYPE html>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Agentic PQC Workspace Portal</title>
+  <link rel="icon" type="image/png" sizes="64x64" href="/static/pqc-favicon-64.png" />
+  <link rel="icon" type="image/x-icon" href="/favicon.ico" />
+  <link rel="apple-touch-icon" href="/static/pqc-logo-shield.png" />
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -84,9 +87,10 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     }
 
     .gemini-sparkle {
-      width: 22px;
-      height: 22px;
+      width: 26px;
+      height: 26px;
       flex-shrink: 0;
+      object-fit: contain;
     }
 
     /* Rounded Pill Button (#2a2a2a) */
@@ -1635,16 +1639,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
   <aside class="sidebar">
     <div class="sidebar-brand-row">
       <div class="brand-title" onclick="goHome()" title="Return to home screen">
-        <!-- Blue 4-point Gemini Star -->
-        <svg class="gemini-sparkle" viewBox="0 0 24 24" fill="none">
-          <path d="M12 2C12 7.52 16.48 12 22 12C16.48 12 12 16.48 12 22C12 16.48 7.52 12 2 12C7.52 12 12 7.52 12 2Z" fill="url(#geminiGrad)"/>
-          <defs>
-            <linearGradient id="geminiGrad" x1="2" y1="2" x2="22" y2="22" gradientUnits="userSpaceOnUse">
-              <stop stop-color="#4C8DF6"/>
-              <stop offset="1" stop-color="#1A73E8"/>
-            </linearGradient>
-          </defs>
-        </svg>
+        <img class="gemini-sparkle" src="/static/pqc-logo-shield.png" alt="Agentic PQC" />
         <span>Agentic PQC Workspace</span>
       </div>
     </div>
@@ -1728,7 +1723,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
         <button class="icon-btn" onclick="openGcloudModal()" title="Settings &amp; gcloud">
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <circle cx="12" cy="12" r="3"></circle>
-            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
           </svg>
         </button>
       </div>
@@ -1738,7 +1733,10 @@ PORTAL_HTML = r"""<!DOCTYPE html>
   <!-- Main Canvas (#131415 + Radial Deep Blue Glow) -->
   <main class="main-canvas">
     <header class="topbar">
-      <div class="topbar-title" onclick="goHome()" title="Return to home screen">Agentic PQC Workspace</div>
+      <div class="topbar-title" onclick="goHome()" title="Return to home screen" style="display:flex;align-items:center;gap:8px;">
+        <img src="/static/pqc-favicon-64.png" alt="" style="width:20px;height:20px;object-fit:contain;" />
+        <span>Agentic PQC Workspace</span>
+      </div>
       <div style="display:flex;align-items:center;gap:8px;">
         <button class="top-pill" id="header-conn-badge" onclick="openGcloudModal()" title="Isolated GCP Connection for your account">
           <span class="status-dot"></span>
@@ -1758,6 +1756,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     <div class="chat-scroll" id="chat-scroll">
       <!-- Centered Welcome Screen -->
       <div class="welcome-container" id="welcome-screen">
+        <img src="/static/pqc-logo-full.png" alt="Agentic PQC" style="height:118px;width:auto;object-fit:contain;margin-bottom:2px;filter:drop-shadow(0 8px 24px rgba(0,0,0,0.45));" />
         <h1 class="welcome-title">Agentic Post-Quantum Cryptography</h1>
 
         <div class="phase-chips-row">
@@ -3409,7 +3408,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
         <div class="msg-assistant-card">
           <div class="msg-assistant-bar">
             <div class="assistant-label">
-              <span style="color:var(--gemini-blue);">✦</span>
+              <img src="/static/pqc-favicon-64.png" alt="" style="width:18px;height:18px;object-fit:contain;" />
               <span>Agentic PQC Workspace</span>
               <span style="color:var(--text-muted);font-size:11.5px;font-weight:400;">• ${escapeHtml(activeBadge)}</span>
             </div>
