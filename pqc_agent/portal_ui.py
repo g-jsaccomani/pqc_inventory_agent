@@ -1917,12 +1917,13 @@ PORTAL_HTML = r"""<!DOCTYPE html>
 
         <div class="auth-error-banner" id="auth-error-banner"></div>
 
-        <div style="display:flex;flex-direction:column;gap:8px;">
-          <button type="button" class="btn-modal-primary" id="auth-auto-detect-btn" onclick="tryAutomaticGoogleSignIn(true)" style="width:100%;justify-content:center;background:#004a77;color:#c2e7ff;border:1px solid #4c8df6;">
-            ✦ Entrar Automaticamente com Conta Google Ativa (@google.com)
+        <div style="display:flex;flex-direction:column;gap:8px;align-items:stretch;">
+          <div id="gis-signin-btn-container" style="display:flex;justify-content:center;width:100%;"></div>
+          <button type="button" class="btn-modal-primary" id="auth-auto-detect-btn" onclick="startGoogleOAuthSignIn()" style="width:100%;justify-content:center;background:#004a77;color:#c2e7ff;border:1px solid #4c8df6;">
+            ✦ Entrar Automaticamente com Conta Google (@google.com)
           </button>
           <button type="button" class="btn-modal-primary" id="auth-google-oauth-btn" onclick="startGoogleOAuthSignIn()" style="display:none;width:100%;justify-content:center;">
-            Sign in with Google (accounts.google.com)
+            Escolher outra Conta Google (accounts.google.com)
           </button>
         </div>
 
@@ -2234,6 +2235,17 @@ PORTAL_HTML = r"""<!DOCTYPE html>
               auto_select: true,
               cancel_on_tap_outside: false,
             });
+            const btnContainer = document.getElementById("gis-signin-btn-container");
+            if (btnContainer) {
+              btnContainer.innerHTML = "";
+              window.google.accounts.id.renderButton(btnContainer, {
+                theme: "filled_blue",
+                size: "large",
+                shape: "pill",
+                text: "continue_with",
+                width: 360,
+              });
+            }
             if (!currentUserProfile) {
               window.google.accounts.id.prompt();
             }
@@ -2258,11 +2270,11 @@ PORTAL_HTML = r"""<!DOCTYPE html>
             timezone: detectBrowserTimezone(),
           }),
         });
-        if (res.ok) {
-          const data = await res.json();
-          if (data && data.authenticated) {
-            await applySignInResult(data);
-          }
+        const data = await res.json().catch(() => ({}));
+        if (res.ok && data && data.authenticated) {
+          await applySignInResult(data);
+        } else if (data && data.detail) {
+          showAuthError(data.detail);
         }
       } catch (e) {
         console.warn("One Tap sign-in error:", e);
@@ -2289,7 +2301,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
         if (tokenBadge) tokenBadge.textContent = "(optional: local development mode)";
         if (emailHint) emailHint.textContent = "(required without a token: development mode)";
       } else {
-        if (tokenBadge) tokenBadge.textContent = AUTH_CONFIG.google_oauth_client_configured ? "(required unless you use Sign in with Google)" : "(required)";
+        if (tokenBadge) tokenBadge.textContent = AUTH_CONFIG.google_oauth_client_configured ? "(opcional — use o botão Google acima para 1-clique)" : "(required)";
         if (emailHint) emailHint.textContent = "(taken from the verified token)";
       }
     }
@@ -2303,6 +2315,57 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     }
 
     function startGoogleOAuthSignIn() {
+      if (
+        AUTH_CONFIG.google_oauth_client_configured &&
+        AUTH_CONFIG.google_oauth_client_id &&
+        window.google &&
+        window.google.accounts &&
+        window.google.accounts.oauth2
+      ) {
+        try {
+          const tokenClient = window.google.accounts.oauth2.initTokenClient({
+            client_id: AUTH_CONFIG.google_oauth_client_id,
+            scope: "openid email profile",
+            prompt: "select_account",
+            callback: async (tokenResponse) => {
+              if (!tokenResponse || !tokenResponse.access_token) {
+                if (tokenResponse && tokenResponse.error) {
+                  showAuthError(`Google Sign-In error: ${tokenResponse.error}`);
+                }
+                return;
+              }
+              try {
+                const res = await fetch("/api/auth/google", {
+                  method: "POST",
+                  credentials: "same-origin",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    google_access_token: tokenResponse.access_token,
+                    region: selectedAuthRegion,
+                    timezone: detectBrowserTimezone(),
+                  }),
+                });
+                const data = await res.json().catch(() => ({}));
+                if (res.ok && data && data.authenticated) {
+                  await applySignInResult(data);
+                } else {
+                  openAuthModal((data && data.detail) || `Sign-in failed (HTTP ${res.status}).`);
+                }
+              } catch (err) {
+                openAuthModal(`Sign-in error: ${err}`);
+              }
+            },
+          });
+          tokenClient.requestAccessToken();
+          return;
+        } catch (e) {
+          console.warn("GIS initTokenClient fallback:", e);
+        }
+      }
+      if (!AUTH_CONFIG.google_oauth_client_configured) {
+        tryAutomaticGoogleSignIn(true);
+        return;
+      }
       const params = new URLSearchParams({ region: selectedAuthRegion || "", timezone: detectBrowserTimezone() || "" });
       const w = 520, h = 640;
       const left = Math.max(0, Math.round((window.screen.width - w) / 2));
