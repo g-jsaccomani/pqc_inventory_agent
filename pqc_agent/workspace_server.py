@@ -851,11 +851,15 @@ def resolve_authenticated_tenant_from_request(request: Request) -> Tuple[Optiona
     if identity is None:
         return None, False
     if identity.source == "iap":
+        existing = _load_tenant_users_map().get(identity.user_id, {})
+        claims = identity.claims or {}
         profile = upsert_tenant_user_profile(
             email=identity.email,
-            region=request.headers.get("X-PQC-User-Region"),
-            timezone_str=request.headers.get("X-PQC-User-Timezone"),
+            name=existing.get("name") or claims.get("name"),
+            region=existing.get("region") or request.headers.get("X-PQC-User-Region"),
+            timezone_str=existing.get("timezone") or request.headers.get("X-PQC-User-Timezone"),
             auth_method="cloud_iap",
+            picture=existing.get("picture") or claims.get("picture"),
         )
         return profile, True
     profile = _load_tenant_users_map().get(identity.user_id)
@@ -1888,8 +1892,10 @@ def create_workspace_app(
         uid = profile["user_id"] if profile else None
         conn: Optional[Dict[str, Any]] = None
         session_count = 0
-        if uid:
+        signed_token: Optional[str] = None
+        if uid and profile:
             set_current_tenant_user(uid)
+            signed_token = sign_tenant_session_token(profile)
             conn = get_gcp_connection_config(mask_token=True, user_id=uid)
             try:
                 sess_resp = await session_service.list_sessions(app_name=APP_NAME, user_id=uid)
@@ -1909,6 +1915,7 @@ def create_workspace_app(
             "supported_regions": SUPPORTED_REGIONS,
             "user": profile,
             "user_id": uid,
+            "token": signed_token,
             "session_count": session_count,
             "connection": conn,
         }
@@ -2030,9 +2037,21 @@ def create_workspace_app(
         except Exception:
             body = {}
         candidate_token = str((body or {}).get("token") or "").strip()
-        decoded = verify_tenant_session_token(candidate_token)
+        decoded = verify_tenant_session_token(candidate_token) if candidate_token else None
         if not decoded:
-            raise HTTPException(status_code=401, detail="Saved account session has expired. Please sign in again.")
+            identity = resolve_request_identity(request)
+            if identity and identity.source == "iap":
+                existing = _load_tenant_users_map().get(identity.user_id, {})
+                decoded = {
+                    "email": identity.email,
+                    "uid": identity.user_id,
+                    "name": existing.get("name"),
+                    "region": existing.get("region"),
+                    "auth_method": "cloud_iap",
+                    "picture": existing.get("picture"),
+                }
+            else:
+                raise HTTPException(status_code=401, detail="Saved account session has expired. Please sign in again.")
         email = normalize_user_id(decoded.get("email") or decoded.get("uid"))
         profile = upsert_tenant_user_profile(
             email=email,

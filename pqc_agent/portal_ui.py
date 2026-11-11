@@ -2522,32 +2522,34 @@ PORTAL_HTML = r"""<!DOCTYPE html>
         upsertSavedBrowserAccount(currentUserProfile, currentAuthToken, true);
         updateTenantProfileUI(currentUserProfile);
       }
-      if (currentAuthToken) {
-        try {
-          const res = await fetch("/api/auth/switch", {
-            method: "POST",
-            credentials: "same-origin",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              token: currentAuthToken,
-              region: selectedAuthRegion,
-              timezone: detectBrowserTimezone(),
-            }),
-          });
-          if (res.ok) {
-            const data = await res.json();
-            if (data && data.user) {
-              currentAuthToken = data.token || currentAuthToken;
-              localStorage.setItem("pqc_session_token", currentAuthToken);
-              updateTenantProfileUI(data.user);
-            }
+      try {
+        const res = await fetch("/api/auth/switch", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            token: currentAuthToken || undefined,
+            region: selectedAuthRegion,
+            timezone: detectBrowserTimezone(),
+          }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data && data.user) {
+            currentAuthToken = data.token || currentAuthToken;
+            if (currentAuthToken) localStorage.setItem("pqc_session_token", currentAuthToken);
+            updateTenantProfileUI(data.user);
           }
-        } catch (e) {}
-      }
+        }
+      } catch (e) {}
     }
 
     function addAnotherGoogleAccount() {
       closeGeminiAccountPopover();
+      if (currentUserProfile && currentUserProfile.auth_method === "cloud_iap") {
+        window.location.href = "/?gcp-iap-mode=CLEAR_LOGIN_COOKIE";
+        return;
+      }
       const emailInput = document.getElementById("auth-email-input");
       const nameInput = document.getElementById("auth-name-input");
       const tokInput = document.getElementById("auth-oauth-token-input");
@@ -2594,8 +2596,8 @@ PORTAL_HTML = r"""<!DOCTYPE html>
         if (popNameEl) popNameEl.textContent = fullName;
         if (popEmailEl) popEmailEl.textContent = profile.email;
         if (popDomainEl) popDomainEl.textContent = `Gerenciado por ${domain}`;
-        if (signoutBtn) signoutBtn.style.display = profile.auth_method === "cloud_iap" ? "none" : "inline-flex";
-        if (popSignoutRow) popSignoutRow.style.display = profile.auth_method === "cloud_iap" ? "none" : "flex";
+        if (signoutBtn) signoutBtn.style.display = "inline-flex";
+        if (popSignoutRow) popSignoutRow.style.display = "flex";
       } else {
         setAvatarElement("header-user-avatar-img", "user-avatar-initials", "", "G");
         setAvatarElement("sidebar-user-avatar-img", "sidebar-user-avatar-initials", "", "G");
@@ -2660,6 +2662,10 @@ PORTAL_HTML = r"""<!DOCTYPE html>
         if (!res.ok) return;
         const data = await res.json();
         if (data.authenticated && data.user) {
+          if (data.token) {
+            currentAuthToken = data.token;
+            localStorage.setItem("pqc_session_token", currentAuthToken);
+          }
           upsertSavedBrowserAccount(data.user, currentAuthToken, true);
           updateTenantProfileUI(data.user);
           currentSessionId = localStorage.getItem(`pqc_active_session_id:${currentUserId}`) || null;
@@ -2748,6 +2754,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     }
 
     async function signOutTenantUser() {
+      const wasIap = Boolean(currentUserProfile && currentUserProfile.auth_method === "cloud_iap");
       const signedOutEmail = currentUserProfile && currentUserProfile.email ? currentUserProfile.email : "";
       if (signedOutEmail) {
         markSavedBrowserAccountDisconnected(signedOutEmail);
@@ -2762,6 +2769,10 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       currentSessionId = null;
       localStorage.removeItem("pqc_session_token");
       localStorage.removeItem("pqc_user_id");
+      if (wasIap) {
+        window.location.href = "/?gcp-iap-mode=CLEAR_LOGIN_COOKIE";
+        return;
+      }
       updateTenantProfileUI(null);
       goHome();
       allSessions = [];

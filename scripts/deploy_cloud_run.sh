@@ -69,20 +69,21 @@ if [[ -n "${GOOGLE_OAUTH_CLIENT_ID:-}" ]]; then
 fi
 
 echo "=================================================================="
-echo "🚀 Deploying ${SERVICE_NAME} to Cloud Run (${LOCATION})"
+echo "🚀 Deploying ${SERVICE_NAME} to Cloud Run (${LOCATION}) with Cloud IAP"
 echo "   Project      : ${PROJECT_ID}"
 echo "   Account      : ${ARGOLIS_ACCOUNT}"
 echo "   GCS Volume   : gs://${BUCKET_NAME} -> /data (partitioned /data/tenants/<uid>/)"
 echo "   Session DB   : sqlite:///data/pqc_sessions.db (WAL + 30s busy_timeout, max-instances=1, concurrency=80)"
-echo "   Auth         : verified Google sign-in + Gemini Account Switcher; ADK dev UI + ADK REST API disabled"
+echo "   Auth (Edge)  : Cloud Run Direct IAP (--iap) restricted to @google.com & @jsaccomani.altostrat.com"
 echo "=================================================================="
 
-gcloud run deploy "${SERVICE_NAME}" \
+gcloud beta run deploy "${SERVICE_NAME}" \
   --source . \
   --account="${ARGOLIS_ACCOUNT}" \
   --project="${PROJECT_ID}" \
   --region="${LOCATION}" \
-  --allow-unauthenticated \
+  --no-allow-unauthenticated \
+  --iap \
   --execution-environment=gen2 \
   --max-instances="${MAX_INSTANCES:-1}" \
   --concurrency="${CONCURRENCY:-80}" \
@@ -93,4 +94,25 @@ gcloud run deploy "${SERVICE_NAME}" \
   --add-volume-mount="volume=pqc-data,mount-path=/data" \
   --set-env-vars="GOOGLE_GENAI_USE_VERTEXAI=TRUE,GOOGLE_CLOUD_PROJECT=${PROJECT_ID},GOOGLE_CLOUD_LOCATION=global,GCP_ORGANIZATION_ID=31564119954,GCP_ORGANIZATION_NAME=jsaccomani.altostrat.com,PQC_AGENT_MODEL=gemini-3.1-pro-preview-customtools,PQC_SIMULATION_MODE=FALSE,SESSION_DB_URL=sqlite:///data/pqc_sessions.db,PQC_ARTIFACT_BUCKET=gs://${BUCKET_NAME},PQC_CALIBRATION_STORE_PATH=/data/calibration-history.jsonl,PQC_ALLOW_UNVERIFIED_SIGNIN=false,PQC_ENABLE_ADK_DEV_UI=false,PQC_ENABLE_ADK_API=false${IAP_ENV}${OAUTH_CLIENT_ENV}" \
   ${EXTRA_DEPLOY_FLAGS[@]+"${EXTRA_DEPLOY_FLAGS[@]}"}
+
+echo "=================================================================="
+echo "🛡️  Enforcing Cloud IAP IAM Policy (@google.com & @jsaccomani.altostrat.com)"
+echo "=================================================================="
+gcloud run services remove-iam-policy-binding "${SERVICE_NAME}" \
+  --region="${LOCATION}" \
+  --project="${PROJECT_ID}" \
+  --member="allUsers" \
+  --role="roles/run.invoker" >/dev/null 2>&1 || true
+
+for MEMBER in "domain:google.com" "domain:jsaccomani.altostrat.com" "user:admin@jsaccomani.altostrat.com" "user:jsaccomani@google.com"; do
+  gcloud beta iap web add-iam-policy-binding \
+    --project="${PROJECT_ID}" \
+    --resource-type=cloud-run \
+    --region="${LOCATION}" \
+    --service="${SERVICE_NAME}" \
+    --member="${MEMBER}" \
+    --role="roles/iap.httpsResourceAccessor" >/dev/null
+done
+echo "✅ Cloud IAP active for domain:google.com and domain:jsaccomani.altostrat.com"
+
 
