@@ -653,10 +653,70 @@ def test_portal_ui_sign_in_dialog_follows_the_new_rules(tmp_path):
         assert "user_id=${encodeURIComponent(currentUserId)}" not in html
         for snippet in (
             "/api/auth/config",
+            "/api/auth/auto",
+            "/api/auth/switch",
             "gcloud auth print-access-token",
             "startGoogleOAuthSignIn",
             "handleUnauthorizedResponse",
             "response.status === 401",
             "PQC_SIGNIN_COMPLETE",
+            "Gerenciado por google.com",
+            "gemini-account-popover",
+            "Adicionar outra conta",
+            "Desconectado",
+            "Fazer login",
+            "Remover",
         ):
             assert snippet in html, snippet
+
+
+def test_auto_signin_account_switcher_and_partitioned_tenant_storage(tmp_path, monkeypatch, google_verifier):
+    from pqc_agent import workspace_server as ws
+
+    with TestClient(_app(tmp_path)) as client:
+        # 1. When no workstation token is present and no cookie is set, /api/auth/auto returns authenticated=False
+        r0 = client.post("/api/auth/auto")
+        assert r0.status_code == 200 and r0.json()["authenticated"] is False
+
+        # 2. When workstation auto-gcloud token is present, /api/auth/auto logs in automatically with profile & photo
+        monkeypatch.setattr(ws, "_try_workstation_auto_gcloud_token", lambda: f"valid:{ALICE}")
+        r_auto = client.post("/api/auth/auto", headers={"X-PQC-User-Region": "NorthAm"})
+        assert r_auto.status_code == 200
+        auto_data = r_auto.json()
+        assert auto_data["authenticated"] is True
+        assert auto_data["user_id"] == ALICE
+        alice_token = auto_data["token"]
+
+        # 3. Sign in Bob (EMEA) and verify both Alice and Bob have isolated partitioned directories on disk
+        r_bob = client.post(
+            "/api/auth/google",
+            json={"google_access_token": f"valid:{BOB}", "region": "EMEA"},
+        )
+        assert r_bob.status_code == 200
+        bob_token = r_bob.json()["token"]
+
+        # Create a session for Bob and update Bob's connection
+        bob_sess = client.post("/api/sessions", headers=_hdr(bob_token), json={"title": "EMEA Banking PQC"}).json()
+        client.post(
+            "/api/connection",
+            headers=_hdr(bob_token),
+            json={"mode": "impersonation", "organization_id": "222222222", "impersonated_service_account": "emea@p.iam.gserviceaccount.com"},
+        )
+
+        # Verify partitioned files exist under <tmp_path>/data/tenants/<uid>/
+        bob_dir = tmp_path / "data" / "tenants" / BOB
+        alice_dir = tmp_path / "data" / "tenants" / ALICE
+        assert (bob_dir / "profile.json").is_file()
+        assert (bob_dir / "connection.json").is_file()
+        assert (bob_dir / "sessions" / f"{bob_sess['session_id']}.json").is_file()
+        assert (alice_dir / "profile.json").is_file()
+
+        # 4. Switch back to Alice via /api/auth/switch (1-click Gemini Account Switcher)
+        r_switch = client.post("/api/auth/switch", json={"token": alice_token, "region": "LATAM"})
+        assert r_switch.status_code == 200
+        sw_data = r_switch.json()
+        assert sw_data["authenticated"] is True
+        assert sw_data["user_id"] == ALICE
+        assert sw_data["user"]["region"] == "LATAM"
+        assert sw_data["connection"]["organization_id"] == "31564119954"
+

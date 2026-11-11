@@ -1197,6 +1197,355 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       font-size: 12px;
     }
 
+    /* Gemini-Style Account Switcher Popover ("Gerenciado por google.com") */
+    .user-avatar-img {
+      width: 100%;
+      height: 100%;
+      border-radius: 50%;
+      object-fit: cover;
+      display: none;
+    }
+
+    .sidebar-user-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex: 1;
+      min-width: 0;
+      padding: 5px 6px;
+      border-radius: 999px;
+      cursor: pointer;
+      transition: background 0.14s ease;
+    }
+
+    .sidebar-user-row:hover {
+      background: var(--bg-pill);
+    }
+
+    .sidebar-user-avatar {
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, #4285F4, #1A73E8);
+      color: #fff;
+      font-size: 12px;
+      font-weight: 700;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      overflow: hidden;
+      position: relative;
+    }
+
+    .sidebar-user-text {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      line-height: 1.22;
+    }
+
+    .sidebar-user-name {
+      font-size: 13px;
+      font-weight: 500;
+      color: #e3e3e3;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .sidebar-user-sub {
+      font-size: 11px;
+      color: #9aa0a6;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .gemini-account-popover {
+      position: fixed;
+      z-index: 1200;
+      width: 376px;
+      max-width: calc(100vw - 24px);
+      background: #1e1f20;
+      border: 1px solid #333537;
+      border-radius: 28px;
+      padding: 14px 16px 16px;
+      box-shadow: 0 20px 55px rgba(0, 0, 0, 0.78);
+      color: #e3e3e3;
+      display: none;
+      flex-direction: column;
+      gap: 10px;
+      user-select: none;
+    }
+
+    .gemini-account-popover.open {
+      display: flex;
+    }
+
+    .gemini-popover-top {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+      padding: 2px 0 6px;
+      font-size: 12.5px;
+      font-weight: 500;
+      color: #e3e3e3;
+    }
+
+    .gemini-popover-close {
+      position: absolute;
+      right: 2px;
+      top: -1px;
+      background: transparent;
+      border: none;
+      color: #c4c7c5;
+      font-size: 18px;
+      width: 30px;
+      height: 30px;
+      border-radius: 50%;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .gemini-popover-close:hover {
+      background: #333537;
+      color: #ffffff;
+    }
+
+    .gemini-accounts-card {
+      background: #131314;
+      border-radius: 20px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .gemini-active-acct-row {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      padding: 16px 16px 14px;
+    }
+
+    .gemini-active-avatar-wrap {
+      position: relative;
+      width: 54px;
+      height: 54px;
+      flex-shrink: 0;
+    }
+
+    .gemini-active-avatar {
+      width: 54px;
+      height: 54px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, #4285F4, #1A73E8);
+      color: #ffffff;
+      font-size: 19px;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+    }
+
+    .gemini-avatar-edit-badge {
+      position: absolute;
+      right: -2px;
+      bottom: -2px;
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      background: #282a2c;
+      border: 2px solid #131314;
+      color: #e3e3e3;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 11px;
+      cursor: pointer;
+    }
+
+    .gemini-active-info {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .gemini-active-name {
+      font-size: 16.5px;
+      font-weight: 500;
+      color: #e3e3e3;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      margin-bottom: 1px;
+    }
+
+    .gemini-active-email {
+      font-size: 13px;
+      color: #c4c7c5;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .gemini-chevron-btn {
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      background: #282a2c;
+      border: none;
+      color: #e3e3e3;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+
+    .gemini-region-strip {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      padding: 0 16px 12px;
+      flex-wrap: wrap;
+    }
+
+    .gemini-region-pill {
+      padding: 3px 9px;
+      border-radius: 999px;
+      border: 1px solid #333537;
+      background: #1e1f20;
+      color: #c4c7c5;
+      font-size: 11px;
+      font-weight: 500;
+      cursor: pointer;
+    }
+
+    .gemini-region-pill.active {
+      background: #004a77;
+      border-color: #4c8df6;
+      color: #c2e7ff;
+      font-weight: 600;
+    }
+
+    .gemini-saved-acct-item {
+      border-top: 2px solid #1e1f20;
+      padding: 12px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .gemini-saved-acct-top {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .gemini-saved-avatar {
+      width: 34px;
+      height: 34px;
+      border-radius: 50%;
+      background: #333537;
+      color: #c4c7c5;
+      font-size: 13px;
+      font-weight: 600;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      overflow: hidden;
+    }
+
+    .gemini-disconnected-badge {
+      margin-left: auto;
+      background: #333537;
+      color: #e3e3e3;
+      font-size: 11px;
+      font-weight: 500;
+      padding: 2px 8px;
+      border-radius: 6px;
+      flex-shrink: 0;
+    }
+
+    .gemini-saved-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding-left: 4px;
+    }
+
+    .gemini-btn-login {
+      padding: 7px 18px;
+      border-radius: 999px;
+      border: none;
+      background: #004a77;
+      color: #c2e7ff;
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+    }
+
+    .gemini-btn-login:hover {
+      background: #005c94;
+    }
+
+    .gemini-btn-remove {
+      padding: 6px 16px;
+      border-radius: 999px;
+      border: 1px solid #8e918f;
+      background: transparent;
+      color: #a8c7fa;
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+    }
+
+    .gemini-btn-remove:hover {
+      background: rgba(168, 199, 250, 0.08);
+    }
+
+    .gemini-action-row {
+      border-top: 2px solid #1e1f20;
+      padding: 13px 16px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      background: transparent;
+      border-left: none;
+      border-right: none;
+      border-bottom: none;
+      width: 100%;
+      text-align: left;
+      color: #e3e3e3;
+      font-family: inherit;
+      font-size: 13.5px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background 0.12s ease;
+    }
+
+    .gemini-action-row:hover {
+      background: #1e1f20;
+    }
+
+    .gemini-action-icon {
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      background: #1e1f20;
+      color: #a8c7fa;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+
+
     /* ADK ToolContext 3-Legged OAuth (3LO) In-Chat Consent Card */
     .oauth-consent-card {
       margin-top: 12px;
@@ -1353,12 +1702,21 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     </div>
 
     <div class="sidebar-bottom-bar">
-      <span id="sidebar-tenant-label" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="Active @google.com Tenant">Google Cloud Consulting</span>
-      <div style="display:flex;gap:4px;">
-        <button class="icon-btn" onclick="openAuthModal()" title="Google Workspace (@google.com) Account &amp; Region">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
-            <circle cx="12" cy="7" r="4"></circle>
+      <div class="sidebar-user-row" id="sidebar-user-profile-row" onclick="toggleGeminiAccountPopover(event, 'sidebar')" title="Gerenciado por google.com">
+        <span class="sidebar-user-avatar">
+          <img id="sidebar-user-avatar-img" class="user-avatar-img" alt="" referrerpolicy="no-referrer" />
+          <span id="sidebar-user-avatar-initials">G</span>
+        </span>
+        <div class="sidebar-user-text">
+          <span class="sidebar-user-name" id="sidebar-tenant-label">Google Cloud Consulting</span>
+          <span class="sidebar-user-sub" id="sidebar-user-sub-label">Plus • NorthAm</span>
+        </div>
+      </div>
+      <div style="display:flex;gap:2px;flex-shrink:0;">
+        <button class="icon-btn" onclick="toggleGeminiAccountPopover(event, 'sidebar')" title="Notifications &amp; Account Status">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"></path>
+            <path d="M13.73 21a2 2 0 0 1-3.46 0"></path>
           </svg>
         </button>
         <a class="icon-btn" href="/dev-ui/?app=pqc_agent" target="_blank" rel="noopener" title="/dev-ui/">
@@ -1368,7 +1726,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
           </svg>
         </a>
         <button class="icon-btn" onclick="openGcloudModal()" title="Settings &amp; gcloud">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <circle cx="12" cy="12" r="3"></circle>
             <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
           </svg>
@@ -1386,8 +1744,11 @@ PORTAL_HTML = r"""<!DOCTYPE html>
           <span class="status-dot"></span>
           <span id="header-conn-text">Org 31564119954 • ADC</span>
         </button>
-        <button class="user-profile-pill" id="user-profile-pill" onclick="openAuthModal()" title="Multi-Tenant @google.com Session &amp; Region">
-          <span class="user-avatar-circle" id="user-avatar-initials">G</span>
+        <button class="user-profile-pill" id="user-profile-pill" onclick="toggleGeminiAccountPopover(event, 'header')" title="Gerenciado por google.com">
+          <span class="user-avatar-circle" style="overflow:hidden;position:relative;">
+            <img id="header-user-avatar-img" class="user-avatar-img" alt="" referrerpolicy="no-referrer" />
+            <span id="user-avatar-initials">G</span>
+          </span>
           <span id="user-email-label">Sign in (@google.com)</span>
           <span class="region-tag-pill" id="user-region-badge">NorthAm</span>
         </button>
@@ -1477,39 +1838,104 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     </div>
   </main>
 
+  <!-- Gemini Account Switcher Popover ("Gerenciado por google.com") -->
+  <div class="gemini-account-popover" id="gemini-account-popover" onclick="event.stopPropagation()">
+    <div class="gemini-popover-top">
+      <span id="gemini-managed-domain-label">Gerenciado por google.com</span>
+      <button type="button" class="gemini-popover-close" onclick="closeGeminiAccountPopover()" title="Fechar">✕</button>
+    </div>
+
+    <div class="gemini-accounts-card">
+      <div class="gemini-active-acct-row">
+        <div class="gemini-active-avatar-wrap">
+          <div class="gemini-active-avatar">
+            <img id="popover-user-avatar-img" class="user-avatar-img" alt="" referrerpolicy="no-referrer" />
+            <span id="popover-user-avatar-initials">G</span>
+          </div>
+          <span class="gemini-avatar-edit-badge" onclick="openAuthModal()" title="Configurar conta e região">✎</span>
+        </div>
+        <div class="gemini-active-info">
+          <div class="gemini-active-name" id="popover-user-name">Google Cloud Consulting</div>
+          <div class="gemini-active-email" id="popover-user-email">Sign in (@google.com)</div>
+        </div>
+        <button type="button" class="gemini-chevron-btn" id="popover-chevron-btn" onclick="togglePopoverAccountList()" title="Mostrar/ocultar contas">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+            <polyline points="18 15 12 9 6 15"></polyline>
+          </svg>
+        </button>
+      </div>
+
+      <div class="gemini-region-strip" id="popover-region-strip">
+        <button type="button" class="gemini-region-pill" data-region="NorthAm" onclick="switchPopoverRegion('NorthAm')">NorthAm</button>
+        <button type="button" class="gemini-region-pill" data-region="EMEA" onclick="switchPopoverRegion('EMEA')">EMEA</button>
+        <button type="button" class="gemini-region-pill" data-region="India" onclick="switchPopoverRegion('India')">India</button>
+        <button type="button" class="gemini-region-pill" data-region="APAC" onclick="switchPopoverRegion('APAC')">APAC</button>
+        <button type="button" class="gemini-region-pill" data-region="LATAM" onclick="switchPopoverRegion('LATAM')">LATAM</button>
+      </div>
+
+      <div id="gemini-saved-accounts-list"></div>
+
+      <button type="button" class="gemini-action-row" onclick="addAnotherGoogleAccount()">
+        <span class="gemini-action-icon">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+            <line x1="12" y1="5" x2="12" y2="19"></line>
+            <line x1="5" y1="12" x2="19" y2="12"></line>
+          </svg>
+        </span>
+        <span>Adicionar outra conta</span>
+      </button>
+
+      <button type="button" class="gemini-action-row" id="popover-signout-row" onclick="signOutTenantUser()">
+        <span class="gemini-action-icon" style="color:#e3e3e3;">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path>
+            <polyline points="16 17 21 12 16 7"></polyline>
+            <line x1="21" y1="12" x2="9" y2="12"></line>
+          </svg>
+        </span>
+        <span>Sair</span>
+      </button>
+    </div>
+  </div>
+
   <!-- Google Workspace (@google.com) Multi-Tenant Sign-In & Region Modal -->
   <div class="modal-backdrop" id="auth-modal">
     <div class="modal-panel" style="width: 500px;">
       <div class="modal-header">
         <div style="display:flex;align-items:center;gap:8px;">
           <span class="user-avatar-circle">G</span>
-          <span>Google Workspace Multi-Tenant Session</span>
+          <span>Gerenciado por google.com — Conta Corporativa</span>
         </div>
         <button onclick="closeAuthModal()" style="background:transparent;border:none;color:var(--text-secondary);font-size:16px;cursor:pointer;">✕</button>
       </div>
       <form class="modal-body" onsubmit="submitGoogleWorkspaceSignIn(event)" autocomplete="off">
         <div class="auth-google-badge">
           <div>
-            <strong style="color:var(--text-primary);display:block;margin-bottom:2px;">Verified Google sign-in (@google.com)</strong>
-            Your identity is verified with Google before a session is created. Chat history, uploaded artifacts, and GCP connection settings are isolated per user across NorthAm, EMEA, India, APAC, and LATAM.
+            <strong style="color:var(--text-primary);display:block;margin-bottom:2px;">Login Automático Google Workspace (@google.com)</strong>
+            Sua foto, nome e sessões são isolados por usuário (NorthAm, EMEA, India, APAC e LATAM) e validados criptograficamente com o Google.
           </div>
         </div>
 
         <div class="auth-error-banner" id="auth-error-banner"></div>
 
-        <button type="button" class="btn-modal-primary" id="auth-google-oauth-btn" onclick="startGoogleOAuthSignIn()" style="display:none;width:100%;justify-content:center;">
-          Sign in with Google
-        </button>
+        <div style="display:flex;flex-direction:column;gap:8px;">
+          <button type="button" class="btn-modal-primary" id="auth-auto-detect-btn" onclick="tryAutomaticGoogleSignIn(true)" style="width:100%;justify-content:center;background:#004a77;color:#c2e7ff;border:1px solid #4c8df6;">
+            ✦ Entrar Automaticamente com Conta Google Ativa (@google.com)
+          </button>
+          <button type="button" class="btn-modal-primary" id="auth-google-oauth-btn" onclick="startGoogleOAuthSignIn()" style="display:none;width:100%;justify-content:center;">
+            Sign in with Google (accounts.google.com)
+          </button>
+        </div>
 
         <div class="conn-field" id="auth-token-field">
-          <label for="auth-oauth-token-input">Google OAuth access token <span id="auth-token-required-badge" style="color:var(--gemini-link);">(required)</span></label>
+          <label for="auth-oauth-token-input">Token OAuth Google Cloud <span id="auth-token-required-badge" style="color:var(--gemini-link);">(required)</span></label>
           <div style="font-size:12px;color:var(--text-secondary);line-height:1.5;margin-bottom:4px;">
-            Run <code>gcloud auth print-access-token</code> in a terminal where gcloud is signed in with your corporate account, then paste the output (<code>ya29...</code>). The token is verified with Google and never written to disk.
+            Se estiver em outro navegador sem OAuth popup, rode <code>gcloud auth print-access-token</code> no terminal logado com seu <code>@google.com</code> e cole abaixo. O sistema buscará automaticamente seu nome e sua foto real do Google.
           </div>
           <input type="password" id="auth-oauth-token-input" placeholder="Paste the output of: gcloud auth print-access-token" autocomplete="off" />
           <label style="display:flex;align-items:center;gap:6px;margin-top:4px;cursor:pointer;font-size:12px;color:var(--text-secondary);">
             <input type="checkbox" id="auth-bind-gcp-token" style="width:auto;" checked />
-            <span>Also use this token for my isolated GCP / gcloud connection (kept in memory only)</span>
+            <span>Usar também na minha conexão isolada GCP / gcloud (mantido apenas em memória)</span>
           </label>
         </div>
 
@@ -1520,7 +1946,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
           </div>
           <div class="conn-field">
             <label for="auth-name-input">Display Name (Optional)</label>
-            <input type="text" id="auth-name-input" placeholder="e.g. Jane Doe" autocomplete="name" />
+            <input type="text" id="auth-name-input" placeholder="e.g. Joabson Saccomani" autocomplete="name" />
           </div>
         </div>
 
@@ -1706,6 +2132,144 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       openAuthModal(detail || "Your session is missing or expired. Please sign in again.");
     }
 
+    let popoverAccountsExpanded = true;
+    let gisInitialized = false;
+
+    function loadSavedBrowserAccounts() {
+      try {
+        const raw = localStorage.getItem("pqc_saved_accounts");
+        const parsed = raw ? JSON.parse(raw) : [];
+        return Array.isArray(parsed) ? parsed : [];
+      } catch (e) {
+        return [];
+      }
+    }
+
+    function saveBrowserAccountsList(list) {
+      try {
+        localStorage.setItem("pqc_saved_accounts", JSON.stringify(list));
+      } catch (e) {}
+    }
+
+    function upsertSavedBrowserAccount(profile, token, connected = true) {
+      if (!profile || !profile.email) return;
+      const email = String(profile.email).toLowerCase();
+      const list = loadSavedBrowserAccounts();
+      const existingIdx = list.findIndex((a) => String(a.email || "").toLowerCase() === email);
+      const entry = {
+        email: email,
+        name: profile.name || email.split("@")[0],
+        picture: profile.picture || (existingIdx >= 0 ? list[existingIdx].picture : "") || "",
+        region: profile.region || selectedAuthRegion || "NorthAm",
+        domain: profile.domain || email.split("@")[1] || "google.com",
+        token: connected ? (token || (existingIdx >= 0 ? list[existingIdx].token : "") || "") : "",
+        connected: Boolean(connected),
+        updated_at: new Date().toISOString(),
+      };
+      if (existingIdx >= 0) {
+        list[existingIdx] = entry;
+      } else {
+        list.unshift(entry);
+      }
+      saveBrowserAccountsList(list);
+    }
+
+    function markSavedBrowserAccountDisconnected(email) {
+      if (!email) return;
+      const clean = String(email).toLowerCase();
+      const list = loadSavedBrowserAccounts();
+      list.forEach((acct) => {
+        if (String(acct.email || "").toLowerCase() === clean) {
+          acct.connected = false;
+          acct.token = "";
+        }
+      });
+      saveBrowserAccountsList(list);
+    }
+
+    function removeSavedBrowserAccount(email) {
+      const clean = String(email || "").toLowerCase();
+      const filtered = loadSavedBrowserAccounts().filter((a) => String(a.email || "").toLowerCase() !== clean);
+      saveBrowserAccountsList(filtered);
+      renderGeminiSavedAccountsList();
+    }
+
+    function setAvatarElement(imgId, initialsId, pictureUrl, nameOrEmail) {
+      const imgEl = document.getElementById(imgId);
+      const initEl = document.getElementById(initialsId);
+      const initials = computeInitials(nameOrEmail);
+      if (initEl) initEl.textContent = initials;
+      if (!imgEl) return;
+      if (pictureUrl && String(pictureUrl).startsWith("https://")) {
+        imgEl.onload = () => {
+          imgEl.style.display = "block";
+          if (initEl) initEl.style.display = "none";
+        };
+        imgEl.onerror = () => {
+          imgEl.style.display = "none";
+          if (initEl) initEl.style.display = "inline";
+        };
+        imgEl.src = pictureUrl;
+      } else {
+        imgEl.removeAttribute("src");
+        imgEl.style.display = "none";
+        if (initEl) initEl.style.display = "inline";
+      }
+    }
+
+    function initGoogleIdentityServicesOneTap() {
+      if (gisInitialized || !AUTH_CONFIG.google_oauth_client_configured || !AUTH_CONFIG.google_oauth_client_id) {
+        return;
+      }
+      gisInitialized = true;
+      const script = document.createElement("script");
+      script.src = "https://accounts.google.com/gsi/client";
+      script.async = true;
+      script.defer = true;
+      script.onload = () => {
+        try {
+          if (window.google && window.google.accounts && window.google.accounts.id) {
+            window.google.accounts.id.initialize({
+              client_id: AUTH_CONFIG.google_oauth_client_id,
+              callback: handleGoogleOneTapCredentialResponse,
+              auto_select: true,
+              cancel_on_tap_outside: false,
+            });
+            if (!currentUserProfile) {
+              window.google.accounts.id.prompt();
+            }
+          }
+        } catch (e) {
+          console.warn("GIS One Tap init warning:", e);
+        }
+      };
+      document.head.appendChild(script);
+    }
+
+    async function handleGoogleOneTapCredentialResponse(response) {
+      if (!response || !response.credential) return;
+      try {
+        const res = await fetch("/api/auth/google", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            credential: response.credential,
+            region: selectedAuthRegion,
+            timezone: detectBrowserTimezone(),
+          }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data && data.authenticated) {
+            await applySignInResult(data);
+          }
+        }
+      } catch (e) {
+        console.warn("One Tap sign-in error:", e);
+      }
+    }
+
     async function loadAuthConfig() {
       try {
         const res = await fetch("/api/auth/config", { credentials: "same-origin" });
@@ -1714,6 +2278,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
         console.warn("Auth config warning:", e);
       }
       applyAuthConfigToModal();
+      initGoogleIdentityServicesOneTap();
     }
 
     function applyAuthConfigToModal() {
@@ -1746,10 +2311,66 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       window.open(`/api/auth/oauth/signin?${params.toString()}`, "pqc_google_signin_popup", `width=${w},height=${h},left=${left},top=${top},resizable=yes,scrollbars=yes`);
     }
 
+    async function tryAutomaticGoogleSignIn(manualClick = false) {
+      try {
+        const res = await fetch("/api/auth/auto", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: getAuthHeaders({ "Content-Type": "application/json" }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data && data.authenticated && data.user) {
+            await applySignInResult(data);
+            return true;
+          }
+        }
+      } catch (e) {}
+
+      // Try any connected account saved in the browser's Gemini Account Switcher
+      const saved = loadSavedBrowserAccounts();
+      const connectedAcct = saved.find((a) => a.connected && a.token);
+      if (connectedAcct && connectedAcct.token) {
+        try {
+          const sRes = await fetch("/api/auth/switch", {
+            method: "POST",
+            credentials: "same-origin",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              token: connectedAcct.token,
+              region: connectedAcct.region || selectedAuthRegion,
+              timezone: detectBrowserTimezone(),
+            }),
+          });
+          if (sRes.ok) {
+            const sData = await sRes.json();
+            if (sData && sData.authenticated && sData.user) {
+              await applySignInResult(sData);
+              return true;
+            }
+          }
+        } catch (e) {}
+      }
+
+      if (manualClick) {
+        if (AUTH_CONFIG.google_oauth_client_configured) {
+          startGoogleOAuthSignIn();
+        } else {
+          showAuthError(
+            "Nenhuma sessão ativa encontrada automaticamente neste navegador. Cole o token do comando `gcloud auth print-access-token` abaixo para autenticar sua conta @google.com (ficará salva por 30 dias no seletor de contas)."
+          );
+        }
+      }
+      return false;
+    }
+
     async function applySignInResult(data) {
       currentAuthToken = data.token || "";
       if (currentAuthToken) {
         localStorage.setItem("pqc_session_token", currentAuthToken);
+      }
+      if (data.user && data.user.email) {
+        upsertSavedBrowserAccount(data.user, currentAuthToken, true);
       }
       const tokInput = document.getElementById("auth-oauth-token-input");
       if (tokInput) tokInput.value = "";
@@ -1758,6 +2379,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
         applyConnectionConfigToUI(data.connection);
       }
       closeAuthModal();
+      closeGeminiAccountPopover();
       currentSessionId = localStorage.getItem(`pqc_active_session_id:${currentUserId}`) || null;
       await fetchSessions();
       if (!currentSessionId && allSessions.length > 0) {
@@ -1779,35 +2401,216 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       return raw.slice(0, 2).toUpperCase() || "G";
     }
 
+    function toggleGeminiAccountPopover(event, anchor = "header") {
+      if (event) event.stopPropagation();
+      const pop = document.getElementById("gemini-account-popover");
+      if (!pop) return;
+      if (!currentUserProfile || !currentUserProfile.email) {
+        openAuthModal();
+        return;
+      }
+      const isOpen = pop.classList.contains("open");
+      if (isOpen) {
+        closeGeminiAccountPopover();
+        return;
+      }
+      renderGeminiSavedAccountsList();
+      if (anchor === "sidebar") {
+        pop.style.left = "14px";
+        pop.style.bottom = "58px";
+        pop.style.top = "auto";
+        pop.style.right = "auto";
+      } else {
+        pop.style.right = "18px";
+        pop.style.top = "54px";
+        pop.style.left = "auto";
+        pop.style.bottom = "auto";
+      }
+      pop.classList.add("open");
+    }
+
+    function closeGeminiAccountPopover() {
+      const pop = document.getElementById("gemini-account-popover");
+      if (pop) pop.classList.remove("open");
+    }
+
+    function togglePopoverAccountList() {
+      popoverAccountsExpanded = !popoverAccountsExpanded;
+      const listEl = document.getElementById("gemini-saved-accounts-list");
+      const btn = document.getElementById("popover-chevron-btn");
+      if (listEl) listEl.style.display = popoverAccountsExpanded ? "block" : "none";
+      if (btn) {
+        btn.innerHTML = popoverAccountsExpanded
+          ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><polyline points="18 15 12 9 6 15"></polyline></svg>'
+          : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><polyline points="6 9 12 15 18 9"></polyline></svg>';
+      }
+    }
+
+    function renderGeminiSavedAccountsList() {
+      const container = document.getElementById("gemini-saved-accounts-list");
+      if (!container) return;
+      container.innerHTML = "";
+      const activeEmail = currentUserProfile && currentUserProfile.email ? String(currentUserProfile.email).toLowerCase() : "";
+      const others = loadSavedBrowserAccounts().filter((a) => String(a.email || "").toLowerCase() !== activeEmail);
+      others.forEach((acct) => {
+        const item = document.createElement("div");
+        item.className = "gemini-saved-acct-item";
+        const isConnected = Boolean(acct.connected && acct.token);
+        const safeEmail = escapeHtml(acct.email || "");
+        const safeName = escapeHtml(acct.name || acct.email || "");
+        const avatarInner =
+          acct.picture && String(acct.picture).startsWith("https://")
+            ? `<img src="${escapeHtml(acct.picture)}" style="width:100%;height:100%;border-radius:50%;object-fit:cover;" referrerpolicy="no-referrer" />`
+            : `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>`;
+        item.innerHTML = `
+          <div class="gemini-saved-acct-top">
+            <span class="gemini-saved-avatar">${avatarInner}</span>
+            <div style="min-width:0;flex:1;">
+              ${acct.name && acct.name !== acct.email ? `<div style="font-size:13px;font-weight:500;color:#e3e3e3;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${safeName}</div>` : ""}
+              <div style="font-size:12.5px;color:#c4c7c5;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${safeEmail}</div>
+            </div>
+            ${isConnected ? `<span class="region-tag-pill">${escapeHtml(acct.region || "NorthAm")}</span>` : `<span class="gemini-disconnected-badge">Desconectado</span>`}
+          </div>
+          <div class="gemini-saved-actions">
+            <button type="button" class="gemini-btn-login" onclick="switchOrLoginSavedAccount('${safeEmail}')">${isConnected ? "Alternar conta" : "Fazer login"}</button>
+            <button type="button" class="gemini-btn-remove" onclick="removeSavedBrowserAccount('${safeEmail}')">Remover</button>
+          </div>
+        `;
+        container.appendChild(item);
+      });
+    }
+
+    async function switchOrLoginSavedAccount(email) {
+      const clean = String(email || "").toLowerCase();
+      const found = loadSavedBrowserAccounts().find((a) => String(a.email || "").toLowerCase() === clean);
+      if (found && found.connected && found.token) {
+        try {
+          const res = await fetch("/api/auth/switch", {
+            method: "POST",
+            credentials: "same-origin",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              token: found.token,
+              region: found.region || selectedAuthRegion,
+              timezone: detectBrowserTimezone(),
+            }),
+          });
+          if (res.ok) {
+            const data = await res.json();
+            if (data && data.authenticated) {
+              await applySignInResult(data);
+              return;
+            }
+          }
+        } catch (e) {}
+      }
+      closeGeminiAccountPopover();
+      const emailInput = document.getElementById("auth-email-input");
+      if (emailInput) emailInput.value = clean;
+      if (AUTH_CONFIG.google_oauth_client_configured) {
+        startGoogleOAuthSignIn();
+      } else {
+        openAuthModal(`Faça login novamente para reconectar ${clean}.`);
+      }
+    }
+
+    async function switchPopoverRegion(regionId) {
+      selectAuthRegion(regionId);
+      localStorage.setItem("pqc_user_region", selectedAuthRegion);
+      if (currentUserProfile) {
+        currentUserProfile.region = selectedAuthRegion;
+        upsertSavedBrowserAccount(currentUserProfile, currentAuthToken, true);
+        updateTenantProfileUI(currentUserProfile);
+      }
+      if (currentAuthToken) {
+        try {
+          const res = await fetch("/api/auth/switch", {
+            method: "POST",
+            credentials: "same-origin",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              token: currentAuthToken,
+              region: selectedAuthRegion,
+              timezone: detectBrowserTimezone(),
+            }),
+          });
+          if (res.ok) {
+            const data = await res.json();
+            if (data && data.user) {
+              currentAuthToken = data.token || currentAuthToken;
+              localStorage.setItem("pqc_session_token", currentAuthToken);
+              updateTenantProfileUI(data.user);
+            }
+          }
+        } catch (e) {}
+      }
+    }
+
+    function addAnotherGoogleAccount() {
+      closeGeminiAccountPopover();
+      const emailInput = document.getElementById("auth-email-input");
+      const nameInput = document.getElementById("auth-name-input");
+      const tokInput = document.getElementById("auth-oauth-token-input");
+      if (emailInput) emailInput.value = "";
+      if (nameInput) nameInput.value = "";
+      if (tokInput) tokInput.value = "";
+      if (AUTH_CONFIG.google_oauth_client_configured) {
+        startGoogleOAuthSignIn();
+      } else {
+        openAuthModal();
+      }
+    }
+
     function updateTenantProfileUI(profile) {
       currentUserProfile = profile || null;
-      const initialsEl = document.getElementById("user-avatar-initials");
       const emailEl = document.getElementById("user-email-label");
       const regEl = document.getElementById("user-region-badge");
       const sidebarTenantEl = document.getElementById("sidebar-tenant-label");
+      const sidebarSubEl = document.getElementById("sidebar-user-sub-label");
       const connModalUserEl = document.getElementById("conn-modal-user-label");
       const signoutBtn = document.getElementById("auth-signout-btn");
+      const popNameEl = document.getElementById("popover-user-name");
+      const popEmailEl = document.getElementById("popover-user-email");
+      const popDomainEl = document.getElementById("gemini-managed-domain-label");
+      const popSignoutRow = document.getElementById("popover-signout-row");
 
       if (profile && profile.email) {
         currentUserId = profile.user_id || profile.email;
         selectedAuthRegion = profile.region || selectedAuthRegion;
+        const fullName = profile.name || profile.email.split("@")[0];
+        const domain = profile.domain || profile.email.split("@")[1] || "google.com";
         localStorage.setItem("pqc_user_id", currentUserId);
         localStorage.setItem("pqc_user_region", selectedAuthRegion);
-        if (initialsEl) initialsEl.textContent = computeInitials(profile.name || profile.email);
-        if (emailEl) emailEl.textContent = profile.email;
+
+        setAvatarElement("header-user-avatar-img", "user-avatar-initials", profile.picture, fullName || profile.email);
+        setAvatarElement("sidebar-user-avatar-img", "sidebar-user-avatar-initials", profile.picture, fullName || profile.email);
+        setAvatarElement("popover-user-avatar-img", "popover-user-avatar-initials", profile.picture, fullName || profile.email);
+
+        if (emailEl) emailEl.textContent = fullName;
         if (regEl) regEl.textContent = selectedAuthRegion;
-        if (sidebarTenantEl) sidebarTenantEl.textContent = `${profile.email} (${selectedAuthRegion})`;
+        if (sidebarTenantEl) sidebarTenantEl.textContent = fullName;
+        if (sidebarSubEl) sidebarSubEl.textContent = `Plus • ${selectedAuthRegion}`;
         if (connModalUserEl) connModalUserEl.textContent = `${profile.email} • ${selectedAuthRegion}`;
+        if (popNameEl) popNameEl.textContent = fullName;
+        if (popEmailEl) popEmailEl.textContent = profile.email;
+        if (popDomainEl) popDomainEl.textContent = `Gerenciado por ${domain}`;
         if (signoutBtn) signoutBtn.style.display = profile.auth_method === "cloud_iap" ? "none" : "inline-flex";
+        if (popSignoutRow) popSignoutRow.style.display = profile.auth_method === "cloud_iap" ? "none" : "flex";
       } else {
-        if (initialsEl) initialsEl.textContent = "G";
+        setAvatarElement("header-user-avatar-img", "user-avatar-initials", "", "G");
+        setAvatarElement("sidebar-user-avatar-img", "sidebar-user-avatar-initials", "", "G");
+        setAvatarElement("popover-user-avatar-img", "popover-user-avatar-initials", "", "G");
         if (emailEl) emailEl.textContent = "Sign in (@google.com)";
         if (regEl) regEl.textContent = selectedAuthRegion;
         if (sidebarTenantEl) sidebarTenantEl.textContent = "Google Cloud Consulting";
+        if (sidebarSubEl) sidebarSubEl.textContent = `Plus • ${selectedAuthRegion}`;
         if (connModalUserEl) connModalUserEl.textContent = currentUserId;
+        if (popNameEl) popNameEl.textContent = "Google Cloud Consulting";
+        if (popEmailEl) popEmailEl.textContent = "Sign in (@google.com)";
         if (signoutBtn) signoutBtn.style.display = "none";
       }
       selectAuthRegion(selectedAuthRegion);
+      renderGeminiSavedAccountsList();
     }
 
     function selectAuthRegion(regionId) {
@@ -1816,9 +2619,14 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       btns.forEach((b) => {
         b.classList.toggle("selected", b.getAttribute("data-region") === selectedAuthRegion);
       });
+      const popBtns = document.querySelectorAll("#popover-region-strip .gemini-region-pill");
+      popBtns.forEach((b) => {
+        b.classList.toggle("active", b.getAttribute("data-region") === selectedAuthRegion);
+      });
     }
 
     function openAuthModal(message) {
+      closeGeminiAccountPopover();
       const errEl = document.getElementById("auth-error-banner");
       if (errEl) {
         errEl.style.display = message ? "block" : "none";
@@ -1852,19 +2660,25 @@ PORTAL_HTML = r"""<!DOCTYPE html>
         if (!res.ok) return;
         const data = await res.json();
         if (data.authenticated && data.user) {
+          upsertSavedBrowserAccount(data.user, currentAuthToken, true);
           updateTenantProfileUI(data.user);
           currentSessionId = localStorage.getItem(`pqc_active_session_id:${currentUserId}`) || null;
           if (data.connection) {
             applyConnectionConfigToUI(data.connection);
           }
-        } else {
-          if (currentAuthToken) {
-            currentAuthToken = "";
-            localStorage.removeItem("pqc_session_token");
-          }
-          updateTenantProfileUI(null);
-          openAuthModal();
+          return;
         }
+        // Not signed in yet via cookie/header -> attempt automatic zero-typing Google sign-in!
+        const autoOk = await tryAutomaticGoogleSignIn(false);
+        if (autoOk) {
+          return;
+        }
+        if (currentAuthToken) {
+          currentAuthToken = "";
+          localStorage.removeItem("pqc_session_token");
+        }
+        updateTenantProfileUI(null);
+        openAuthModal();
       } catch (e) {
         console.warn("Tenant auth check warning:", e);
       }
@@ -1887,6 +2701,8 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       const bindGcp = Boolean(document.getElementById("auth-bind-gcp-token").checked);
 
       if (!oauthToken && !AUTH_CONFIG.allow_unverified_signin) {
+        const autoWorked = await tryAutomaticGoogleSignIn(false);
+        if (autoWorked) return;
         showAuthError(
           "A verified Google credential is required. Run `gcloud auth print-access-token` and paste the token above" +
             (AUTH_CONFIG.google_oauth_client_configured ? ", or use Sign in with Google." : ".")
@@ -1932,6 +2748,11 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     }
 
     async function signOutTenantUser() {
+      const signedOutEmail = currentUserProfile && currentUserProfile.email ? currentUserProfile.email : "";
+      if (signedOutEmail) {
+        markSavedBrowserAccountDisconnected(signedOutEmail);
+      }
+      closeGeminiAccountPopover();
       try {
         await fetch("/api/auth/logout", { method: "POST", credentials: "same-origin" });
       } catch (e) {}
@@ -2055,6 +2876,18 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       if (wrapper && !wrapper.contains(ev.target)) {
         if (menuEl) menuEl.classList.remove("open");
         if (btnEl) btnEl.classList.remove("active");
+      }
+      const pop = document.getElementById("gemini-account-popover");
+      const pill = document.getElementById("user-profile-pill");
+      const sbRow = document.getElementById("sidebar-user-profile-row");
+      if (
+        pop &&
+        pop.classList.contains("open") &&
+        !pop.contains(ev.target) &&
+        (!pill || !pill.contains(ev.target)) &&
+        (!sbRow || !sbRow.contains(ev.target))
+      ) {
+        pop.classList.remove("open");
       }
     });
 

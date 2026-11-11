@@ -234,15 +234,50 @@ def clear_user_access_token(user_id: Optional[str] = None) -> None:
 _GCLOUD_EXECUTION_LOG: List[Dict[str, Any]] = []
 
 
-def _get_user_connections_path() -> str:
+def _get_bridge_data_dir() -> str:
     override = os.getenv("PQC_DATA_DIR", "").strip()
     if override:
         os.makedirs(override, exist_ok=True)
-        return os.path.join(override, "pqc_user_connections.json")
+        return override
     if os.path.isdir("/data") and os.access("/data", os.W_OK):
-        return "/data/pqc_user_connections.json"
+        return "/data"
     os.makedirs("data", exist_ok=True)
-    return os.path.join("data", "pqc_user_connections.json")
+    return "data"
+
+
+def _safe_tenant_dir_id(uid: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9._@-]", "_", normalize_user_id(uid)).strip("._")
+    return cleaned or DEFAULT_TENANT_USER_ID
+
+
+def _get_tenant_connection_file(uid: str) -> str:
+    return os.path.join(_get_bridge_data_dir(), "tenants", _safe_tenant_dir_id(uid), "connection.json")
+
+
+def _atomic_write_json_file(path: str, payload: Any) -> None:
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_pqc_", suffix=".json", dir=parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _get_user_connections_path() -> str:
+    return os.path.join(_get_bridge_data_dir(), "pqc_user_connections.json")
 
 
 def _ensure_user_connections_loaded() -> None:
@@ -251,42 +286,64 @@ def _ensure_user_connections_loaded() -> None:
         return
     _USER_CONNECTIONS_LOADED = True
     path = _get_user_connections_path()
-    if not os.path.exists(path):
-        return
     legacy_secrets_found = False
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        if isinstance(raw, dict):
-            for k, v in raw.items():
-                if isinstance(v, dict):
-                    if any(v.get(secret_key) for secret_key in _SECRET_CONNECTION_KEYS):
-                        legacy_secrets_found = True
-                    _USER_CONNECTIONS[normalize_user_id(k)] = {
-                        key: v[key] for key in _PERSISTED_CONNECTION_KEYS if key in v
-                    }
-    except Exception:
-        pass
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                for k, v in raw.items():
+                    if isinstance(v, dict):
+                        if any(v.get(secret_key) for secret_key in _SECRET_CONNECTION_KEYS):
+                            legacy_secrets_found = True
+                        _USER_CONNECTIONS[normalize_user_id(k)] = {
+                            key: v[key] for key in _PERSISTED_CONNECTION_KEYS if key in v
+                        }
+        except Exception:
+            pass
+    # Also load partitioned per-tenant connection files (/data/tenants/<uid>/connection.json)
+    tenants_root = os.path.join(_get_bridge_data_dir(), "tenants")
+    if os.path.isdir(tenants_root):
+        try:
+            for entry in os.scandir(tenants_root):
+                if not entry.is_dir():
+                    continue
+                conn_file = os.path.join(entry.path, "connection.json")
+                if os.path.isfile(conn_file):
+                    try:
+                        with open(conn_file, "r", encoding="utf-8") as cf:
+                            cdata = json.load(cf)
+                        if isinstance(cdata, dict):
+                            uid = normalize_user_id(cdata.get("user_id") or entry.name)
+                            _USER_CONNECTIONS[uid] = {
+                                key: cdata[key] for key in _PERSISTED_CONNECTION_KEYS if key in cdata
+                            }
+                    except Exception:
+                        pass
+        except OSError:
+            pass
     if legacy_secrets_found:
         # Purge plaintext tokens written by previous versions; they are not loaded back into memory.
         logger.warning("Removed plaintext OAuth tokens from the legacy connection store %s.", path)
         _persist_user_connections()
 
 
-def _persist_user_connections() -> None:
-    """Persists ONLY non-secret connection settings (never OAuth access tokens) with an atomic replace."""
+def _persist_user_connections(changed_uid: Optional[str] = None) -> None:
+    """Persists ONLY non-secret connection settings per tenant (`/data/tenants/<uid>/connection.json`) and index."""
     path = _get_user_connections_path()
     try:
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         serializable: Dict[str, Dict[str, Any]] = {}
         for uid, cfg in _USER_CONNECTIONS.items():
-            serializable[uid] = {key: cfg[key] for key in _PERSISTED_CONNECTION_KEYS if key in cfg}
-        tmp_path = f"{path}.tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(serializable, f, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, path)
+            clean_cfg = {key: cfg[key] for key in _PERSISTED_CONNECTION_KEYS if key in cfg}
+            serializable[uid] = clean_cfg
+            if changed_uid is None or uid == changed_uid:
+                tenant_payload = dict(clean_cfg)
+                tenant_payload["user_id"] = uid
+                _atomic_write_json_file(_get_tenant_connection_file(uid), tenant_payload)
+        _atomic_write_json_file(path, serializable)
     except OSError:
         pass
+
 
 
 def normalize_connection_mode(raw_mode: Optional[str]) -> str:
@@ -349,7 +406,7 @@ def set_gcp_connection_config(
 
         target_state["updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
         _USER_CONNECTIONS[uid] = dict(target_state)
-        _persist_user_connections()
+        _persist_user_connections(changed_uid=uid)
         return get_gcp_connection_config(mask_token=True, user_id=uid)
 
 

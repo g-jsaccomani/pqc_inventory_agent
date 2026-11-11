@@ -144,6 +144,25 @@ def _patched_db_session_init(self: DatabaseSessionService, db_url: str | None = 
     if db_url is not None:
         db_url = _normalize_sqlite_db_url(db_url)
     _ORIG_DB_SESSION_INIT(self, db_url=db_url, *args, **kwargs)
+    # Harden SQLite concurrency with 30s busy_timeout and WAL journal mode so concurrent requests never fail with
+    # 'database is locked' or partial writes.
+    if db_url and db_url.startswith("sqlite") and hasattr(self, "db_engine"):
+        try:
+            import sqlalchemy.event
+
+            @sqlalchemy.event.listens_for(self.db_engine.sync_engine, "connect")
+            def _set_sqlite_pragmas(dbapi_conn: Any, _conn_record: Any) -> None:
+                try:
+                    cur = dbapi_conn.cursor()
+                    cur.execute("PRAGMA busy_timeout=30000;")
+                    if ":memory:" not in (db_url or ""):
+                        cur.execute("PRAGMA journal_mode=WAL;")
+                    cur.execute("PRAGMA synchronous=NORMAL;")
+                    cur.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
 
 DatabaseSessionService.__init__ = _patched_db_session_init  # type: ignore[method-assign]
@@ -254,7 +273,38 @@ class ResilientGcsArtifactService(GcsArtifactService):
         return sorted(set(local_keys))
 
 
-# Sidecar metadata store in SQLite/JSON for custom session titles, attachments, and tool traces
+# =============================================================================
+# Partitioned Per-Tenant / Per-Session Atomic Storage + Optional Cloud Firestore
+# =============================================================================
+import re as _re
+import subprocess as _subprocess
+import tempfile as _tempfile
+
+_STORAGE_LOCK = threading.RLock()
+_FIRESTORE_CLIENT: Any = None
+_FIRESTORE_CHECKED = False
+
+
+def _get_firestore_client() -> Any:
+    """Returns a Cloud Firestore client when `PQC_ENABLE_FIRESTORE=true` and `google-cloud-firestore` is installed."""
+    global _FIRESTORE_CLIENT, _FIRESTORE_CHECKED
+    if auth_guard.env_flag("PQC_ENABLE_FIRESTORE") is not True:
+        return None
+    if _FIRESTORE_CHECKED:
+        return _FIRESTORE_CLIENT
+    _FIRESTORE_CHECKED = True
+    try:
+        from google.cloud import firestore  # type: ignore[import-untyped]
+
+        db_id = os.getenv("PQC_FIRESTORE_DATABASE", "(default)").strip() or "(default)"
+        proj_id = os.getenv("GOOGLE_CLOUD_PROJECT", "pqc-inventory-agent-cd06").strip()
+        _FIRESTORE_CLIENT = firestore.Client(project=proj_id, database=db_id)
+    except Exception as exc:
+        logger.warning("Cloud Firestore client unavailable (falling back to partitioned /data/tenants): %s", exc)
+        _FIRESTORE_CLIENT = None
+    return _FIRESTORE_CLIENT
+
+
 def _get_data_dir() -> str:
     override = os.getenv("PQC_DATA_DIR", "").strip()
     if override:
@@ -266,29 +316,139 @@ def _get_data_dir() -> str:
     return "data"
 
 
+def _safe_fs_segment(value: str, fallback: str = "default") -> str:
+    cleaned = _re.sub(r"[^a-zA-Z0-9._@-]", "_", str(value or "").strip()).strip("._")
+    return cleaned or fallback
+
+
+def _get_tenant_partition_dir(uid: str) -> str:
+    return os.path.join(_get_data_dir(), "tenants", _safe_fs_segment(normalize_user_id(uid), DEFAULT_USER_ID))
+
+
+def _atomic_write_json(path: str, payload: Any) -> None:
+    """Writes JSON atomically via a unique temporary file + fsync + `os.replace` so concurrent readers never see partial data."""
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp_path = _tempfile.mkstemp(prefix=".tmp_pqc_", suffix=".json", dir=parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 def _get_metadata_store_path() -> str:
     return os.path.join(_get_data_dir(), "pqc_session_metadata.json")
 
 
 def _load_session_metadata_map() -> Dict[str, Dict[str, Any]]:
-    path = _get_metadata_store_path()
-    if not os.path.exists(path):
-        return {}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+    with _STORAGE_LOCK:
+        merged: Dict[str, Dict[str, Any]] = {}
+        path = _get_metadata_store_path()
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                if isinstance(raw, dict):
+                    merged.update(raw)
+            except Exception:
+                pass
+        # Load partitioned per-tenant / per-session metadata files (/data/tenants/<uid>/sessions/<session_id>.json)
+        tenants_dir = os.path.join(_get_data_dir(), "tenants")
+        if os.path.isdir(tenants_dir):
+            try:
+                for tenant_entry in os.scandir(tenants_dir):
+                    if not tenant_entry.is_dir():
+                        continue
+                    sess_dir = os.path.join(tenant_entry.path, "sessions")
+                    if not os.path.isdir(sess_dir):
+                        continue
+                    for sess_file in os.scandir(sess_dir):
+                        if not sess_file.is_file() or not sess_file.name.endswith(".json"):
+                            continue
+                        try:
+                            with open(sess_file.path, "r", encoding="utf-8") as sf:
+                                sdata = json.load(sf)
+                            if isinstance(sdata, dict):
+                                sid = str(sdata.get("session_id") or sess_file.name[:-5])
+                                merged[sid] = sdata
+                        except Exception:
+                            pass
+            except OSError:
+                pass
+        return merged
 
 
-def _save_session_metadata_map(meta_map: Dict[str, Dict[str, Any]]) -> None:
-    path = _get_metadata_store_path()
-    try:
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(meta_map, f, ensure_ascii=False, indent=2)
-    except OSError:
-        pass
+def _save_session_metadata_map(meta_map: Dict[str, Dict[str, Any]], changed_session_id: Optional[str] = None) -> None:
+    with _STORAGE_LOCK:
+        try:
+            for sid, sdata in meta_map.items():
+                if not isinstance(sdata, dict):
+                    continue
+                if changed_session_id is not None and sid != changed_session_id:
+                    continue
+                uid = normalize_user_id(sdata.get("user_id") or DEFAULT_USER_ID)
+                sdata_copy = dict(sdata)
+                sdata_copy["session_id"] = sid
+                sdata_copy["user_id"] = uid
+                sess_path = os.path.join(
+                    _get_tenant_partition_dir(uid),
+                    "sessions",
+                    f"{_safe_fs_segment(sid, 'session')}.json",
+                )
+                _atomic_write_json(sess_path, sdata_copy)
+                fs_client = _get_firestore_client()
+                if fs_client is not None:
+                    try:
+                        (
+                            fs_client.collection("pqc_tenants")
+                            .document(uid)
+                            .collection("sessions")
+                            .document(sid)
+                            .set(sdata_copy, merge=True)
+                        )
+                    except Exception:
+                        pass
+            _atomic_write_json(_get_metadata_store_path(), meta_map)
+        except OSError:
+            pass
+
+
+def _delete_partitioned_session_metadata(uid: str, session_id: str) -> None:
+    with _STORAGE_LOCK:
+        sess_path = os.path.join(
+            _get_tenant_partition_dir(uid),
+            "sessions",
+            f"{_safe_fs_segment(session_id, 'session')}.json",
+        )
+        try:
+            if os.path.exists(sess_path):
+                os.unlink(sess_path)
+        except OSError:
+            pass
+        fs_client = _get_firestore_client()
+        if fs_client is not None:
+            try:
+                (
+                    fs_client.collection("pqc_tenants")
+                    .document(normalize_user_id(uid))
+                    .collection("sessions")
+                    .document(session_id)
+                    .delete()
+                )
+            except Exception:
+                pass
 
 
 # =============================================================================
@@ -301,25 +461,59 @@ def _get_tenant_users_path() -> str:
 
 
 def _load_tenant_users_map() -> Dict[str, Dict[str, Any]]:
-    path = _get_tenant_users_path()
-    if not os.path.exists(path):
-        return {}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+    with _STORAGE_LOCK:
+        users_map: Dict[str, Dict[str, Any]] = {}
+        path = _get_tenant_users_path()
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    users_map.update(data)
+            except Exception:
+                pass
+        # Also load partitioned per-tenant profile files (/data/tenants/<uid>/profile.json)
+        tenants_dir = os.path.join(_get_data_dir(), "tenants")
+        if os.path.isdir(tenants_dir):
+            try:
+                for entry in os.scandir(tenants_dir):
+                    if not entry.is_dir():
+                        continue
+                    prof_file = os.path.join(entry.path, "profile.json")
+                    if os.path.isfile(prof_file):
+                        try:
+                            with open(prof_file, "r", encoding="utf-8") as pf:
+                                pdata = json.load(pf)
+                            if isinstance(pdata, dict) and pdata.get("email"):
+                                uid = normalize_user_id(pdata["email"])
+                                users_map[uid] = pdata
+                        except Exception:
+                            pass
+            except OSError:
+                pass
+        return users_map
 
 
-def _save_tenant_users_map(users_map: Dict[str, Dict[str, Any]]) -> None:
-    path = _get_tenant_users_path()
-    try:
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(users_map, f, ensure_ascii=False, indent=2)
-    except OSError:
-        pass
+def _save_tenant_users_map(users_map: Dict[str, Dict[str, Any]], changed_uid: Optional[str] = None) -> None:
+    with _STORAGE_LOCK:
+        try:
+            for uid, profile in users_map.items():
+                if not isinstance(profile, dict):
+                    continue
+                if changed_uid is not None and uid != changed_uid:
+                    continue
+                prof_path = os.path.join(_get_tenant_partition_dir(uid), "profile.json")
+                _atomic_write_json(prof_path, profile)
+                fs_client = _get_firestore_client()
+                if fs_client is not None:
+                    try:
+                        fs_client.collection("pqc_tenants").document(uid).set(profile, merge=True)
+                    except Exception:
+                        pass
+            _atomic_write_json(_get_tenant_users_path(), users_map)
+        except OSError:
+            pass
+
 
 
 _AUTH_SECRET_CACHE: Optional[bytes] = None
@@ -415,6 +609,7 @@ def sign_tenant_session_token(user_profile: Dict[str, Any]) -> str:
         "uid": normalize_user_id(user_profile["email"]),
         "email": normalize_user_id(user_profile["email"]),
         "name": user_profile.get("name") or _format_display_name(user_profile["email"]),
+        "picture": user_profile.get("picture") or "",
         "region": user_profile.get("region") or "NorthAm",
         "auth_method": user_profile.get("auth_method") or "google_workspace_signin",
         "typ": SESSION_TOKEN_TYPE,
@@ -528,12 +723,35 @@ def _verify_google_oauth_or_id_token(
                 expires_in = int(info.get("expires_in") or 0) or None
             except (TypeError, ValueError):
                 expires_in = None
+
+            # Enrich with real Google profile photo (`picture`) and full display name (`name`) from userinfo
+            user_full_name = str(info.get("name") or "").strip() or _format_display_name(email)
+            user_picture = str(info.get("picture") or "").strip()
+            user_hd = str(info.get("hd") or "").strip() or email.split("@")[-1]
+            if not user_picture or user_full_name == _format_display_name(email):
+                try:
+                    u_req = urllib.request.Request(
+                        "https://www.googleapis.com/oauth2/v3/userinfo",
+                        headers={"Authorization": f"Bearer {tok}", "Accept": "application/json"},
+                    )
+                    with urllib.request.urlopen(u_req, timeout=3) as u_resp:
+                        u_info = json.loads(u_resp.read().decode("utf-8"))
+                    if isinstance(u_info, dict) and normalize_user_id(u_info.get("email") or "") == email:
+                        if u_info.get("name"):
+                            user_full_name = str(u_info["name"]).strip()
+                        if u_info.get("picture"):
+                            user_picture = str(u_info["picture"]).strip()
+                        if u_info.get("hd"):
+                            user_hd = str(u_info["hd"]).strip()
+                except Exception:
+                    pass
+
             return {
                 "email": email,
                 "email_verified": True,
-                "name": _format_display_name(email),
-                "picture": "",
-                "hd": email.split("@")[-1],
+                "name": user_full_name,
+                "picture": user_picture,
+                "hd": user_hd,
                 "auth_method": "google_access_token",
                 "expires_in": expires_in,
             }, None
@@ -541,6 +759,33 @@ def _verify_google_oauth_or_id_token(
             return None, f"Google OAuth access token verification failed: {exc}"
 
     return None, "No token provided."
+
+
+def _try_workstation_auto_gcloud_token() -> Optional[str]:
+    """On a corporate workstation (not Cloud Run), checks if `gcloud auth print-access-token` yields a valid token."""
+    if auth_guard.running_on_cloud_run():
+        return None
+    if auth_guard.env_flag("PQC_AUTO_WORKSTATION_GCLOUD_AUTH") is False:
+        return None
+    if "PYTEST_CURRENT_TEST" in os.environ and os.getenv("PQC_ENABLE_AUTO_GCLOUD_IN_TESTS") != "1":
+        return None
+    try:
+        env = os.environ.copy()
+        venv_py = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".venv", "bin", "python"))
+        if os.path.isfile(venv_py) and not env.get("CLOUDSDK_PYTHON"):
+            env["CLOUDSDK_PYTHON"] = venv_py
+        out = _subprocess.check_output(
+            ["gcloud", "auth", "print-access-token", "--quiet"],
+            env=env,
+            stderr=_subprocess.DEVNULL,
+            text=True,
+            timeout=4,
+        )
+        lines = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
+        tok = lines[-1] if lines else ""
+        return tok if tok.startswith("ya29.") else None
+    except Exception:
+        return None
 
 
 def upsert_tenant_user_profile(
@@ -551,7 +796,7 @@ def upsert_tenant_user_profile(
     auth_method: str = "google_workspace_signin",
     picture: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Creates or updates a persistent @google.com tenant user profile in `/data/pqc_tenant_users.json`."""
+    """Creates or updates a persistent @google.com tenant user profile in `/data/tenants/<uid>/profile.json`."""
     clean_email = normalize_user_id(email)
     users_map = _load_tenant_users_map()
     existing = users_map.get(clean_email, {})
@@ -563,6 +808,7 @@ def upsert_tenant_user_profile(
     )
     resolved_name = _format_display_name(clean_email, name or existing.get("name"))
     domain = clean_email.split("@", 1)[-1] if "@" in clean_email else "google.com"
+    resolved_picture = picture if (picture is not None and str(picture).strip()) else existing.get("picture", "")
 
     profile = {
         "user_id": clean_email,
@@ -572,12 +818,12 @@ def upsert_tenant_user_profile(
         "region": resolved_region,
         "timezone": timezone_str or existing.get("timezone") or "UTC",
         "auth_method": auth_method or existing.get("auth_method") or "google_workspace_signin",
-        "picture": picture if picture is not None else existing.get("picture", ""),
+        "picture": resolved_picture,
         "created_at": existing.get("created_at") or now_iso,
         "last_login_at": now_iso,
     }
     users_map[clean_email] = profile
-    _save_tenant_users_map(users_map)
+    _save_tenant_users_map(users_map, changed_uid=clean_email)
     return profile
 
 
@@ -1731,6 +1977,89 @@ def create_workspace_app(
         resp.delete_cookie(key=SESSION_COOKIE_NAME, path="/")
         return resp
 
+    @app.post("/api/auth/auto")
+    async def auth_auto_signin(request: Request) -> JSONResponse:
+        """Automatic zero-typing sign-in: restores an existing verified session/IAP identity or, on a corporate
+        workstation, automatically verifies the active `gcloud` corporate identity with Google (`tokeninfo` + `userinfo`).
+        """
+        profile, iap_active = resolve_authenticated_tenant_from_request(request)
+        if profile is not None:
+            uid = profile["user_id"]
+            set_current_tenant_user(uid)
+            signed_token = sign_tenant_session_token(profile)
+            sess_resp = await session_service.list_sessions(app_name=APP_NAME, user_id=uid)
+            resp = JSONResponse(
+                content={
+                    "authenticated": True,
+                    "iap_active": iap_active,
+                    "user": profile,
+                    "user_id": uid,
+                    "token": signed_token,
+                    "session_count": len(sess_resp.sessions),
+                    "connection": get_gcp_connection_config(mask_token=True, user_id=uid),
+                    "supported_regions": SUPPORTED_REGIONS,
+                }
+            )
+            _set_session_cookie(resp, request, signed_token)
+            return resp
+
+        auto_tok = await asyncio.to_thread(_try_workstation_auto_gcloud_token)
+        if auto_tok:
+            verified_info, err_msg = await asyncio.to_thread(_verify_google_oauth_or_id_token, None, auto_tok)
+            status_code, email_or_err = _validated_google_identity(verified_info, err_msg)
+            if status_code == 200 and verified_info is not None:
+                content, signed_token = await _complete_signin(
+                    email=email_or_err,
+                    name=verified_info.get("name"),
+                    region=request.headers.get("X-PQC-User-Region"),
+                    timezone_str=request.headers.get("X-PQC-User-Timezone"),
+                    auth_method="google_auto_session",
+                    picture=verified_info.get("picture", ""),
+                )
+                resp = JSONResponse(content=content)
+                _set_session_cookie(resp, request, signed_token)
+                return resp
+
+        return JSONResponse(status_code=200, content={"authenticated": False})
+
+    @app.post("/api/auth/switch")
+    async def auth_switch_account(request: Request) -> JSONResponse:
+        """Switches the active browser session between verified Google accounts stored in the Gemini Account Switcher."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        candidate_token = str((body or {}).get("token") or "").strip()
+        decoded = verify_tenant_session_token(candidate_token)
+        if not decoded:
+            raise HTTPException(status_code=401, detail="Saved account session has expired. Please sign in again.")
+        email = normalize_user_id(decoded.get("email") or decoded.get("uid"))
+        profile = upsert_tenant_user_profile(
+            email=email,
+            name=decoded.get("name"),
+            region=(body or {}).get("region") or decoded.get("region"),
+            timezone_str=(body or {}).get("timezone") or request.headers.get("X-PQC-User-Timezone"),
+            auth_method=decoded.get("auth_method") or "google_workspace_signin",
+            picture=decoded.get("picture"),
+        )
+        uid = profile["user_id"]
+        set_current_tenant_user(uid)
+        fresh_token = sign_tenant_session_token(profile)
+        sess_resp = await session_service.list_sessions(app_name=APP_NAME, user_id=uid)
+        content = {
+            "authenticated": True,
+            "user": profile,
+            "user_id": uid,
+            "token": fresh_token,
+            "session_count": len(sess_resp.sessions),
+            "connection": get_gcp_connection_config(mask_token=True, user_id=uid),
+            "supported_regions": SUPPORTED_REGIONS,
+        }
+        resp = JSONResponse(content=content)
+        _set_session_cookie(resp, request, fresh_token)
+        return resp
+
+
     @app.get("/api/auth/tenants")
     async def list_registered_tenants(request: Request) -> Dict[str, Any]:
         """Tenant directory: aggregate counts for signed-in users; individual profiles only for admins."""
@@ -2220,7 +2549,7 @@ async function saveClientId() {{
             "attachments_by_turn": [],
             "turn_telemetry": {},
         }
-        _save_session_metadata_map(meta_map)
+        _save_session_metadata_map(meta_map, changed_session_id=session.id)
         return {
             "session_id": session.id,
             "id": session.id,
@@ -2291,10 +2620,11 @@ async function saveClientId() {{
         if sess is None:
             raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
         await session_service.delete_session(app_name=APP_NAME, user_id=resolved_user, session_id=session_id)
+        _delete_partitioned_session_metadata(resolved_user, session_id)
         meta_map = _load_session_metadata_map()
         if session_id in meta_map:
             del meta_map[session_id]
-            _save_session_metadata_map(meta_map)
+            _save_session_metadata_map(meta_map, changed_session_id="__deleted__")
         return {"deleted": True, "status": "deleted", "session_id": session_id, "user_id": resolved_user}
 
     # =========================================================================
@@ -2526,7 +2856,7 @@ async function saveClientId() {{
                 "error": error,
                 "oauth_consent_required": active_consent_card,
             }
-        _save_session_metadata_map(meta_map)
+        _save_session_metadata_map(meta_map, changed_session_id=session_id)
 
         payload = {
             "session_id": session_id,

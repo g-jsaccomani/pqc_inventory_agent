@@ -63,13 +63,18 @@ if [[ -n "${PQC_IAP_AUDIENCE:-}" ]]; then
   IAP_ENV=",PQC_IAP_AUDIENCE=${PQC_IAP_AUDIENCE}"
 fi
 
+OAUTH_CLIENT_ENV=""
+if [[ -n "${GOOGLE_OAUTH_CLIENT_ID:-}" ]]; then
+  OAUTH_CLIENT_ENV=",GOOGLE_OAUTH_CLIENT_ID=${GOOGLE_OAUTH_CLIENT_ID}"
+fi
+
 echo "=================================================================="
 echo "🚀 Deploying ${SERVICE_NAME} to Cloud Run (${LOCATION})"
 echo "   Project      : ${PROJECT_ID}"
 echo "   Account      : ${ARGOLIS_ACCOUNT}"
-echo "   GCS Volume   : gs://${BUCKET_NAME} -> /data"
-echo "   Session DB   : sqlite:///data/pqc_sessions.db"
-echo "   Auth         : verified Google sign-in only; ADK dev UI + ADK REST API disabled"
+echo "   GCS Volume   : gs://${BUCKET_NAME} -> /data (partitioned /data/tenants/<uid>/)"
+echo "   Session DB   : sqlite:///data/pqc_sessions.db (WAL + 30s busy_timeout, max-instances=1, concurrency=80)"
+echo "   Auth         : verified Google sign-in + Gemini Account Switcher; ADK dev UI + ADK REST API disabled"
 echo "=================================================================="
 
 gcloud run deploy "${SERVICE_NAME}" \
@@ -79,11 +84,13 @@ gcloud run deploy "${SERVICE_NAME}" \
   --region="${LOCATION}" \
   --allow-unauthenticated \
   --execution-environment=gen2 \
+  --max-instances="${MAX_INSTANCES:-1}" \
+  --concurrency="${CONCURRENCY:-80}" \
   --memory=2Gi \
   --cpu=2 \
   --timeout=600 \
   --add-volume="name=pqc-data,type=cloud-storage,bucket=${BUCKET_NAME}" \
   --add-volume-mount="volume=pqc-data,mount-path=/data" \
-  --set-env-vars="GOOGLE_GENAI_USE_VERTEXAI=TRUE,GOOGLE_CLOUD_PROJECT=${PROJECT_ID},GOOGLE_CLOUD_LOCATION=global,GCP_ORGANIZATION_ID=31564119954,GCP_ORGANIZATION_NAME=jsaccomani.altostrat.com,PQC_AGENT_MODEL=gemini-3.1-pro-preview-customtools,PQC_SIMULATION_MODE=FALSE,SESSION_DB_URL=sqlite:///data/pqc_sessions.db,PQC_ARTIFACT_BUCKET=gs://${BUCKET_NAME},PQC_CALIBRATION_STORE_PATH=/data/calibration-history.jsonl,PQC_ALLOW_UNVERIFIED_SIGNIN=false,PQC_ENABLE_ADK_DEV_UI=false,PQC_ENABLE_ADK_API=false${IAP_ENV}" \
+  --set-env-vars="GOOGLE_GENAI_USE_VERTEXAI=TRUE,GOOGLE_CLOUD_PROJECT=${PROJECT_ID},GOOGLE_CLOUD_LOCATION=global,GCP_ORGANIZATION_ID=31564119954,GCP_ORGANIZATION_NAME=jsaccomani.altostrat.com,PQC_AGENT_MODEL=gemini-3.1-pro-preview-customtools,PQC_SIMULATION_MODE=FALSE,SESSION_DB_URL=sqlite:///data/pqc_sessions.db,PQC_ARTIFACT_BUCKET=gs://${BUCKET_NAME},PQC_CALIBRATION_STORE_PATH=/data/calibration-history.jsonl,PQC_ALLOW_UNVERIFIED_SIGNIN=false,PQC_ENABLE_ADK_DEV_UI=false,PQC_ENABLE_ADK_API=false${IAP_ENV}${OAUTH_CLIENT_ENV}" \
   ${EXTRA_DEPLOY_FLAGS[@]+"${EXTRA_DEPLOY_FLAGS[@]}"}
 
