@@ -54,8 +54,17 @@ fi
 # - No wildcard CORS (PQC_ALLOWED_ORIGINS unset => same-origin portal only).
 # Optional: PQC_AUTH_SECRET_SECRET=<Secret Manager secret name> injects the session HMAC key (recommended), and
 # PQC_IAP_AUDIENCE=<IAP audience> when the service sits behind Cloud IAP (only verified IAP JWTs are trusted).
+PQC_AUTH_SECRET_SECRET="${PQC_AUTH_SECRET_SECRET:-pqc-session-secret}"
 EXTRA_DEPLOY_FLAGS=()
 if [[ -n "${PQC_AUTH_SECRET_SECRET:-}" ]]; then
+  gcloud services enable secretmanager.googleapis.com --account="${ARGOLIS_ACCOUNT}" --project="${PROJECT_ID}" --quiet >/dev/null 2>&1 || true
+  if ! gcloud secrets describe "${PQC_AUTH_SECRET_SECRET}" --account="${ARGOLIS_ACCOUNT}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+    python3 -c "import secrets; print(secrets.token_urlsafe(48), end='')" | \
+      gcloud secrets create "${PQC_AUTH_SECRET_SECRET}" --account="${ARGOLIS_ACCOUNT}" --project="${PROJECT_ID}" --replication-policy="automatic" --data-file=-
+  fi
+  PROJECT_NUMBER=$(gcloud projects describe "${PROJECT_ID}" --account="${ARGOLIS_ACCOUNT}" --format="value(projectNumber)")
+  gcloud secrets add-iam-policy-binding "${PQC_AUTH_SECRET_SECRET}" --account="${ARGOLIS_ACCOUNT}" --project="${PROJECT_ID}" \
+    --member="serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" --role="roles/secretmanager.secretAccessor" --format="none" || true
   EXTRA_DEPLOY_FLAGS+=("--set-secrets=PQC_AUTH_SECRET=${PQC_AUTH_SECRET_SECRET}:latest")
 fi
 IAP_ENV=""
