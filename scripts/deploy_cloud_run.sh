@@ -36,7 +36,7 @@ echo "=================================================================="
 
 TOKEN_EMAIL=""
 if TOK=$(CLOUDSDK_CORE_DISABLE_PROMPTS=1 gcloud auth print-access-token "${ARGOLIS_ACCOUNT}" 2>/dev/null); then
-  TOKEN_EMAIL=$(curl -s "https://oauth2.googleapis.com/tokeninfo?access_token=${TOK}" | grep -o '"email": *"[^"]*"' | head -n1 | cut -d'"' -f4 || true)
+  TOKEN_EMAIL=$(curl -s --cacert /etc/ssl/cert.pem --max-time 10 "https://oauth2.googleapis.com/tokeninfo?access_token=${TOK}" | grep -o '"email": *"[^"]*"' | head -n1 | cut -d'"' -f4 || true)
 fi
 
 if [[ "${TOKEN_EMAIL}" != "${ARGOLIS_ACCOUNT}" ]]; then
