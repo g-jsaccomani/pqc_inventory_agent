@@ -8,7 +8,7 @@ set -euo pipefail
 
 PROJECT_ID="${1:-pqc-inventory-agent-cd06}"
 LOCATION="${2:-us-central1}"
-SERVICE_NAME="${3:-pqc-inventory-agent}"
+SERVICE_NAME="${3:-agentic-pqc}"
 BUCKET_NAME="${PROJECT_ID}-pqc-agent-staging"
 ARGOLIS_ACCOUNT="${ARGOLIS_ACCOUNT:-admin@jsaccomani.altostrat.com}"
 

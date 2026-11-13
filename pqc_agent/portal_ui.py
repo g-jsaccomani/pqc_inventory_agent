@@ -2217,11 +2217,21 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       }
     }
 
+    function isDirectGisAuthorizedOrigin() {
+      const h = (window.location.hostname || "").toLowerCase();
+      return h.startsWith("pqc-inventory-agent") || h === "localhost" || h === "127.0.0.1";
+    }
+
     function initGoogleIdentityServicesOneTap() {
       if (gisInitialized || !AUTH_CONFIG.google_oauth_client_configured || !AUTH_CONFIG.google_oauth_client_id) {
         return;
       }
       gisInitialized = true;
+      if (!isDirectGisAuthorizedOrigin()) {
+        const btnContainer = document.getElementById("gis-signin-btn-container");
+        if (btnContainer) btnContainer.innerHTML = "";
+        return;
+      }
       const script = document.createElement("script");
       script.src = "https://accounts.google.com/gsi/client";
       script.async = true;
@@ -2315,6 +2325,14 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     }
 
     function startGoogleOAuthSignIn() {
+      if (!isDirectGisAuthorizedOrigin() && AUTH_CONFIG.google_oauth_client_configured) {
+        const w = 480, h = 560;
+        const left = Math.max(0, Math.round((window.screen.width - w) / 2));
+        const top = Math.max(0, Math.round((window.screen.height - h) / 2));
+        const bridgeUrl = `https://pqc-inventory-agent-110254026096.us-central1.run.app/api/auth/bridge?origin=${encodeURIComponent(window.location.origin)}`;
+        window.open(bridgeUrl, "pqc_google_signin_bridge", `width=${w},height=${h},left=${left},top=${top},resizable=yes,scrollbars=yes`);
+        return;
+      }
       if (
         AUTH_CONFIG.google_oauth_client_configured &&
         AUTH_CONFIG.google_oauth_client_id &&
@@ -3157,6 +3175,38 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     }
 
     window.addEventListener("message", async (event) => {
+      const trustedBridgeOrigins = [
+        window.location.origin,
+        "https://pqc-inventory-agent-110254026096.us-central1.run.app",
+        "https://pqc-inventory-agent-s55r6zceia-uc.a.run.app",
+        "https://cspr-copilot-301423082258.us-central1.run.app",
+        "https://cspr-copilot-gqvpblre3a-uc.a.run.app"
+      ];
+      if (!trustedBridgeOrigins.includes(event.origin)) return;
+      if (event.data && event.data.type === "AGENTIC_GOOGLE_AUTH") {
+        try {
+          const res = await fetch("/api/auth/google", {
+            method: "POST",
+            credentials: "same-origin",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              credential: event.data.credential || undefined,
+              google_access_token: event.data.access_token || undefined,
+              region: selectedAuthRegion,
+              timezone: detectBrowserTimezone(),
+            }),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (res.ok && data && data.authenticated) {
+            await applySignInResult(data);
+          } else {
+            openAuthModal((data && data.detail) || `Sign-in failed (HTTP ${res.status}).`);
+          }
+        } catch (err) {
+          openAuthModal(`Sign-in error: ${err}`);
+        }
+        return;
+      }
       if (event.origin !== window.location.origin) return;
       if (event.data && event.data.type === "PQC_OAUTH_3LO_AUTHORIZED") {
         if (event.data.payload && event.data.payload.status === "AUTHORIZED") {

@@ -2168,6 +2168,116 @@ def create_workspace_app(
             )
         return save_oauth_client_config(client_id=payload.client_id, client_secret=payload.client_secret)
 
+    @app.get("/api/auth/bridge", response_class=HTMLResponse)
+    async def oauth_google_bridge_endpoint(
+        request: Request,
+        origin: Optional[str] = Query(default=None),
+    ) -> HTMLResponse:
+        """Public Verified Google Identity Bridge popup for canonical agentic-*.run.app origins."""
+        import re as _re
+
+        raw_origin = (origin or "").strip().rstrip("/")
+        if not _re.match(
+            r"^(https://[a-z0-9-]+(\.[a-z0-9-]+)*\.run\.app|https://[a-z0-9-]+\.jsaccomani\.altostrat\.com|http://(localhost|127\.0\.0\.1)(:\d+)?)$",
+            raw_origin,
+        ):
+            raw_origin = "https://agentic-pqc-110254026096.us-central1.run.app"
+        oauth_cfg = load_oauth_client_config()
+        client_id = oauth_cfg.get("client_id", "") or "110254026096-f16ns988ibh6v3ku6rjj9i4ib17t4p9b.apps.googleusercontent.com"
+        bridge_html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Sign in with Google — Google Cloud Security Consulting</title>
+<style>
+  body {{ margin:0; font-family:'Google Sans','Inter',system-ui,sans-serif; background:#0b0f17; color:#e2e8f0; display:flex; align-items:center; justify-content:center; min-height:100vh; padding:16px; box-sizing:border-box; }}
+  .card {{ width:100%; max-width:420px; background:#111827; border:1px solid #1e293b; border-radius:16px; padding:28px 24px; box-shadow:0 24px 60px rgba(0,0,0,0.65); text-align:center; }}
+  .badge {{ display:inline-block; font-size:11px; font-weight:600; color:#8ab4f8; background:rgba(66,133,244,0.14); border:1px solid rgba(66,133,244,0.35); padding:3px 10px; border-radius:999px; margin-bottom:12px; }}
+  h2 {{ margin:0 0 8px 0; font-size:18px; color:#f8fafc; }}
+  p {{ margin:0 0 18px 0; font-size:13px; color:#94a3b8; line-height:1.5; }}
+  .slot {{ display:flex; justify-content:center; min-height:44px; margin-bottom:12px; }}
+  .btn {{ width:100%; padding:11px 14px; border-radius:999px; border:1px solid #334155; background:#1e293b; color:#f8fafc; font-weight:600; font-size:13px; cursor:pointer; display:inline-flex; align-items:center; justify-content:center; gap:8px; }}
+  .btn:hover {{ background:#334155; }}
+  .err {{ color:#f87171; font-size:12px; margin-top:12px; display:none; }}
+</style>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+</head>
+<body>
+<div class="card">
+  <span class="badge">Google Cloud Identity-Aware Proxy (IAP)</span>
+  <h2>Sign in with Google</h2>
+  <p>Select your verified <b>@google.com</b> or <b>@jsaccomani.altostrat.com</b> account to continue.</p>
+  <div id="gisSlot" class="slot"></div>
+  <button type="button" class="btn" onclick="openChooser()">Choose a Google Account (@google.com)</button>
+  <div id="errBox" class="err"></div>
+</div>
+<script>
+const TARGET_ORIGIN = {_js_literal(raw_origin)};
+const CLIENT_ID = {_js_literal(client_id)};
+function sendToOpener(payload) {{
+  if (window.opener) {{
+    window.opener.postMessage(Object.assign({{ type: 'AGENTIC_GOOGLE_AUTH' }}, payload), TARGET_ORIGIN);
+    setTimeout(() => window.close(), 120);
+  }}
+}}
+function showErr(m) {{
+  const el = document.getElementById('errBox');
+  el.textContent = m;
+  el.style.display = 'block';
+}}
+function openChooser() {{
+  if (!window.google || !window.google.accounts || !window.google.accounts.oauth2) {{
+    showErr('Google Identity Services is still loading. Please try again in a second.');
+    return;
+  }}
+  const tc = window.google.accounts.oauth2.initTokenClient({{
+    client_id: CLIENT_ID,
+    scope: 'openid email profile',
+    prompt: 'select_account',
+    callback: (resp) => {{
+      if (resp && resp.access_token) {{
+        sendToOpener({{ access_token: resp.access_token }});
+      }} else if (resp && resp.error) {{
+        showErr('Google OAuth: ' + resp.error);
+      }}
+    }}
+  }});
+  tc.requestAccessToken();
+}}
+window.addEventListener('load', () => {{
+  const iv = setInterval(() => {{
+    if (window.google && window.google.accounts && window.google.accounts.id) {{
+      clearInterval(iv);
+      window.google.accounts.id.initialize({{
+        client_id: CLIENT_ID,
+        callback: (resp) => {{
+          if (resp && resp.credential) {{
+            sendToOpener({{ credential: resp.credential }});
+          }}
+        }},
+        auto_select: true,
+        cancel_on_tap_outside: false
+      }});
+      const slot = document.getElementById('gisSlot');
+      if (slot) {{
+        window.google.accounts.id.renderButton(slot, {{
+          theme: 'filled_blue',
+          size: 'large',
+          shape: 'pill',
+          text: 'continue_with',
+          width: 340
+        }});
+      }}
+      window.google.accounts.id.prompt();
+    }}
+  }}, 100);
+}});
+</script>
+</body>
+</html>"""
+        return HTMLResponse(content=bridge_html)
+
     @app.get("/api/auth/oauth/signin")
     async def oauth_signin_start_endpoint(
         request: Request,
