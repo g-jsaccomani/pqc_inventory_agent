@@ -77,8 +77,12 @@ gcloud run deploy pqc-inventory-agent \
   --region="${LOCATION}" \
   --allow-unauthenticated \
   --execution-environment=gen2 \
-  --memory=2Gi \
-  --cpu=2 \
+  --min-instances=1 \
+  --max-instances=10 \
+  --memory=16Gi \
+  --cpu=8 \
+  --no-cpu-throttling \
+  --cpu-boost \
   --timeout=600 \
   --add-volume="name=pqc-data,type=cloud-storage,bucket=${BUCKET_NAME}" \
   --add-volume-mount="volume=pqc-data,mount-path=/data" \

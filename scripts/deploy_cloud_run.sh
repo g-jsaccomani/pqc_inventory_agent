@@ -99,10 +99,13 @@ gcloud beta run deploy "${SERVICE_NAME}" \
   --region="${LOCATION}" \
   "${IAP_FLAGS[@]}" \
   --execution-environment=gen2 \
-  --max-instances="${MAX_INSTANCES:-1}" \
+  --min-instances="${MIN_INSTANCES:-1}" \
+  --max-instances="${MAX_INSTANCES:-10}" \
   --concurrency="${CONCURRENCY:-80}" \
-  --memory=2Gi \
-  --cpu=2 \
+  --memory="${MEMORY:-16Gi}" \
+  --cpu="${CPU:-8}" \
+  --no-cpu-throttling \
+  --cpu-boost \
   --timeout=600 \
   --add-volume="name=pqc-data,type=cloud-storage,bucket=${BUCKET_NAME}" \
   --add-volume-mount="volume=pqc-data,mount-path=/data" \
