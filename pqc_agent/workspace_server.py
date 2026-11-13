@@ -1239,6 +1239,7 @@ class GoogleAuthSignInPayload(BaseModel):
     credential: Optional[str] = None  # Google Identity Services JWT id_token
     id_token: Optional[str] = None
     google_access_token: Optional[str] = None
+    access_token: Optional[str] = None
     use_token_for_gcp_connection: bool = False
     oauth_state: Optional[str] = None  # set by the OAuth popup (implicit flow); verified + bound to this browser
 
@@ -1978,7 +1979,7 @@ def create_workspace_app(
             if not st or st.get("mode") != "signin":
                 raise HTTPException(status_code=400, detail="Invalid or expired OAuth state. Start the sign-in again.")
         id_jwt = (payload.credential or payload.id_token or "").strip() or None
-        access_tok = (payload.google_access_token or "").strip() or None
+        access_tok = (payload.google_access_token or payload.access_token or "").strip() or None
         if access_tok and access_tok.lower().startswith("bearer "):
             access_tok = access_tok[7:].strip() or None
         expires_in: Optional[Any] = None
@@ -2172,11 +2173,12 @@ def create_workspace_app(
     async def oauth_google_bridge_endpoint(
         request: Request,
         origin: Optional[str] = Query(default=None),
+        target_origin: Optional[str] = Query(default=None),
     ) -> HTMLResponse:
         """Public Verified Google Identity Bridge popup for canonical agentic-*.run.app origins."""
         import re as _re
 
-        raw_origin = (origin or "").strip().rstrip("/")
+        raw_origin = (origin or target_origin or "").strip().rstrip("/")
         if not _re.match(
             r"^(https://[a-z0-9-]+(\.[a-z0-9-]+)*\.run\.app|https://[a-z0-9-]+\.jsaccomani\.altostrat\.com|http://(localhost|127\.0\.0\.1)(:\d+)?)$",
             raw_origin,
@@ -2209,16 +2211,18 @@ def create_workspace_app(
   <h2>Sign in with Google</h2>
   <p>Select your verified <b>@google.com</b> or <b>@jsaccomani.altostrat.com</b> account to continue.</p>
   <div id="gisSlot" class="slot"></div>
-  <button type="button" class="btn" onclick="openChooser()">Choose a Google Account (@google.com)</button>
+  <button type="button" class="btn" onclick="openChooser()">Authorize Google OAuth Token (@google.com)</button>
   <div id="errBox" class="err"></div>
 </div>
 <script>
 const TARGET_ORIGIN = {_js_literal(raw_origin)};
 const CLIENT_ID = {_js_literal(client_id)};
 function sendToOpener(payload) {{
+  const msg = Object.assign({{ type: 'AGENTIC_GOOGLE_AUTH' }}, payload);
   if (window.opener) {{
-    window.opener.postMessage(Object.assign({{ type: 'AGENTIC_GOOGLE_AUTH' }}, payload), TARGET_ORIGIN);
-    setTimeout(() => window.close(), 120);
+    try {{ window.opener.postMessage(msg, TARGET_ORIGIN); }} catch (e) {{}}
+    try {{ window.opener.postMessage(msg, '*'); }} catch (e) {{}}
+    setTimeout(() => window.close(), 150);
   }}
 }}
 function showErr(m) {{
@@ -2233,7 +2237,7 @@ function openChooser() {{
   }}
   const tc = window.google.accounts.oauth2.initTokenClient({{
     client_id: CLIENT_ID,
-    scope: 'openid email profile',
+    scope: 'openid email profile https://www.googleapis.com/auth/cloud-platform.read-only',
     prompt: 'select_account',
     callback: (resp) => {{
       if (resp && resp.access_token) {{
