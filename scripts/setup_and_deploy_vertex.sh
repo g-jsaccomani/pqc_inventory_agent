@@ -71,7 +71,7 @@ if [[ -n "${PQC_IAP_AUDIENCE:-}" ]]; then
   IAP_ENV=",PQC_IAP_AUDIENCE=${PQC_IAP_AUDIENCE}"
 fi
 
-gcloud run deploy pqc-inventory-agent \
+gcloud run deploy agentic-pqc \
   --source . \
   --project="${PROJECT_ID}" \
   --region="${LOCATION}" \

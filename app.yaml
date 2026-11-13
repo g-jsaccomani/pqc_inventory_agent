@@ -14,7 +14,7 @@ runtime:
   framework: google-adk
   target_platform: vertex_ai_agent_engine
   reasoning_engine_resource: "projects/110254026096/locations/us-central1/reasoningEngines/519268830350934016"
-  cloud_run_url: "https://pqc-inventory-agent-110254026096.us-central1.run.app/"
+  cloud_run_url: "https://agentic-pqc-110254026096.us-central1.run.app/"
   cloud_run_dev_ui_url: ""  # ADK dev UI is disabled on Cloud Run (PQC_ENABLE_ADK_DEV_UI=false); use it locally
   python_version: "3.12"
   entrypoint: "main:app"
