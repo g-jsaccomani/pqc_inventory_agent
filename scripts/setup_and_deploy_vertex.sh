@@ -66,19 +66,18 @@ EXTRA_DEPLOY_FLAGS=()
 if [[ -n "${PQC_AUTH_SECRET_SECRET:-}" ]]; then
   EXTRA_DEPLOY_FLAGS+=("--set-secrets=PQC_AUTH_SECRET=${PQC_AUTH_SECRET_SECRET}:latest")
 fi
-IAP_ENV=""
-if [[ -n "${PQC_IAP_AUDIENCE:-}" ]]; then
-  IAP_ENV=",PQC_IAP_AUDIENCE=${PQC_IAP_AUDIENCE}"
-fi
+PQC_IAP_AUDIENCE="${PQC_IAP_AUDIENCE:-/projects/${PROJECT_NUMBER}/locations/${LOCATION}/services/agentic-pqc}"
+IAP_ENV=",PQC_IAP_AUDIENCE=${PQC_IAP_AUDIENCE}"
 
-gcloud run deploy agentic-pqc \
+gcloud beta run deploy agentic-pqc \
   --source . \
   --project="${PROJECT_ID}" \
   --region="${LOCATION}" \
-  --allow-unauthenticated \
+  --no-allow-unauthenticated \
+  --iap \
   --execution-environment=gen2 \
   --min-instances=1 \
-  --max-instances=10 \
+  --max-instances=1 \
   --memory=16Gi \
   --cpu=8 \
   --no-cpu-throttling \
