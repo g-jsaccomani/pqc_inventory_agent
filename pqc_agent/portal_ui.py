@@ -2219,7 +2219,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
 
     function isDirectGisAuthorizedOrigin() {
       const h = (window.location.hostname || "").toLowerCase();
-      return h.startsWith("pqc-inventory-agent") || h === "localhost" || h === "127.0.0.1";
+      return h.startsWith("agentic-pqc") || h === "localhost" || h === "127.0.0.1";
     }
 
     function initGoogleIdentityServicesOneTap() {
@@ -2329,7 +2329,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
         const w = 480, h = 560;
         const left = Math.max(0, Math.round((window.screen.width - w) / 2));
         const top = Math.max(0, Math.round((window.screen.height - h) / 2));
-        const bridgeUrl = `https://pqc-inventory-agent-110254026096.us-central1.run.app/api/auth/bridge?origin=${encodeURIComponent(window.location.origin)}`;
+        const bridgeUrl = `https://agentic-pqc-110254026096.us-central1.run.app/api/auth/bridge?origin=${encodeURIComponent(window.location.origin)}`;
         window.open(bridgeUrl, "pqc_google_signin_bridge", `width=${w},height=${h},left=${left},top=${top},resizable=yes,scrollbars=yes`);
         return;
       }
@@ -3177,8 +3177,8 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     window.addEventListener("message", async (event) => {
       const trustedBridgeOrigins = [
         window.location.origin,
-        "https://pqc-inventory-agent-110254026096.us-central1.run.app",
-        "https://pqc-inventory-agent-s55r6zceia-uc.a.run.app",
+        "https://agentic-pqc-110254026096.us-central1.run.app",
+        "https://agentic-pqc-dt7a7ayxsa-uc.a.run.app",
         "https://cspr-copilot-301423082258.us-central1.run.app",
         "https://cspr-copilot-gqvpblre3a-uc.a.run.app"
       ];

@@ -73,7 +73,7 @@ When a customer signs the 6-week engagement (224 consulting hours in the Agentic
 
 ## 6. Copy-Paste Prompts for Live Demos
 
-If you are showing the Agentic PQC web interface or Gemini chat live to a customer, simply copy and paste any of these 3 plain-language prompts:
+If you are showing the Agentic PQC web interface (authenticated via Cloud IAP Google Sign-In with isolated per-user sessions across NorthAm, EMEA, India, APAC, and LATAM) or Gemini chat live to a customer, simply copy and paste any of these 3 plain-language prompts:
 
 - **Prompt 1 — Full Executive & Technical Assessment:** `Run a complete Post-Quantum Cryptography (PQC) readiness assessment across our Google Cloud organization. Show me our readiness scorecard, which encryption keys are at risk first and why (with evidence), which applications depend on them, and a step-by-step upgrade plan.`
 - **Prompt 2 — Calibrate for a Specific Industry (e.g., Banking):** `Calibrate our assessment for a Retail & Investment Bank where financial records must remain confidential for 10 years and regulatory deadlines require migration within 24 months. Recalculate our risk and top priorities.`
@@ -87,13 +87,13 @@ If you are showing the Agentic PQC web interface or Gemini chat live to a custom
 - **Full transparency per answer.** Each answer shows "Answered by" with the real Vertex AI model version, the number of LLM calls, token usage and which agents took part.
 - **No silent fallbacks.** If the model fails, the portal shows the error; no pre-written text is substituted. Demo data is only used when explicitly requested and is always labeled as demo data.
 
-## 8. Portal Security & Sign-In
+## 8. Portal Security, Multi-Tenant Isolation & Sign-In
 
-The portal holds read access to the organization, so every API request is authenticated and bound to the signed-in user (implementation: `pqc_agent/auth_guard.py`).
+The portal holds read access to the organization, so every API request is authenticated, cryptographically verified, and strictly isolated per signed-in `@google.com` user across global regions (`NorthAm`, `EMEA`, `India`, `APAC`, `LATAM`; implementation: `pqc_agent/auth_guard.py` and `tools/secret_box.py`).
 
-- **Verified sign-in only.** Sign-in needs a Google credential verified with Google (OAuth access token or ID token, or a verified Cloud IAP JWT). The email must be verified and belong to an allowed domain. Email-only sign-in returns HTTP 401 (`PQC_ALLOW_UNVERIFIED_SIGNIN=true` re-enables it for local development only).
-- **Your identity is the only user id.** Chat history, sessions and GCP connections are looked up only under the signed-in identity; a different `user_id` parameter is rejected (HTTP 403).
-- **How to sign in (local and Cloud Run):** open the portal, run `gcloud auth print-access-token` in a terminal signed in with your corporate account, paste the token in the sign-in dialog and click **Verify & Sign In**. If a Google OAuth client is configured, **Sign in with Google** opens a Google popup instead.
-- **ADK developer surfaces are local-only.** `/dev-ui` and the ADK REST API (`/list-apps`, `/apps/...`, `/run`) are disabled on Cloud Run and require a signed-in user locally (sign in at `/` first).
-- **Secrets are not written to disk.** Pasted or delegated OAuth access tokens live in server memory only and expire; the session HMAC key comes from `PQC_AUTH_SECRET` (recommended) or a random per-deployment key.
+- **Direct Cloud IAP Google Sign-In (`--iap --no-allow-unauthenticated`).** Opening the Cloud Run portal URL (`https://agentic-pqc-110254026096.us-central1.run.app`) redirects directly to Google's official `Sign in with Google` page (`accounts.google.com`) via Cloud Run Native Identity-Aware Proxy (IAP). Every request is verified via signed Cloud IAP JWT assertions (`X-Goog-IAP-JWT-Assertion`), Google OAuth/OIDC tokens, or 3-Legged OAuth (3LO) delegation for authorized corporate domains (`@google.com`). Email-only sign-in is disabled (`HTTP 401`; `PQC_ALLOW_UNVERIFIED_SIGNIN=true` is for local development only).
+- **Strict Multi-Tenant Per-User Persistence & Isolation.** Each signed-in `@google.com` user has their own persistent workspace across browsers and devices: chat history (`sqlite:///data/pqc_sessions.db` in WAL mode + `/data/tenants/<user_id>/sessions.json`), uploaded artifacts (`gs://<bucket>/pqc_agent/<user_id>/`), regional profile (`NorthAm`, `EMEA`, `India`, `APAC`, `LATAM`), and GCP connection settings (`/data/tenants/<user_id>/connection.json`) are keyed exclusively to the verified identity (`contextvars.ContextVar` + `bind_user_id`); any mismatched `user_id` parameter is rejected with HTTP 403.
+- **ADK developer surfaces are local-only.** `/dev-ui` and the ADK REST API (`/list-apps`, `/apps/...`, `/run`) are disabled on Cloud Run (`PQC_ENABLE_ADK_DEV_UI=false`, `PQC_ENABLE_ADK_API=false`) and require a signed-in user locally.
+- **Encrypted credentials & Secret Manager HMAC key.** Session tokens and OAuth state are signed with a 256-bit HMAC key injected from Secret Manager (`PQC_AUTH_SECRET`), and any per-user delegated OAuth credentials are encrypted at rest with AES-GCM / Fernet (`tools/secret_box.py`).
+
 

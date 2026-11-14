@@ -73,7 +73,7 @@ When a customer signs the 6-week engagement (224 consulting hours in the Agentic
 
 ## 6. Copy-Paste Prompts for Live Demos
 
-If you are showing the Agentic PQC web interface or Gemini chat live to a customer, simply copy and paste any of these 3 plain-language prompts:
+If you are showing the Agentic PQC web interface (authenticated via Cloud IAP Google Sign-In with isolated per-user sessions across NorthAm, EMEA, India, APAC, and LATAM) or Gemini chat live to a customer, simply copy and paste any of these 3 plain-language prompts:
 
 - **Prompt 1 — Full Executive & Technical Assessment:** `Run a complete Post-Quantum Cryptography (PQC) readiness assessment across our Google Cloud organization. Show me our readiness scorecard, which encryption keys are at risk first and why (with evidence), which applications depend on them, and a step-by-step upgrade plan.`
 - **Prompt 2 — Calibrate for a Specific Industry (e.g., Banking):** `Calibrate our assessment for a Retail & Investment Bank where financial records must remain confidential for 10 years and regulatory deadlines require migration within 24 months. Recalculate our risk and top priorities.`
