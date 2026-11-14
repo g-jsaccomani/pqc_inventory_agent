@@ -73,8 +73,8 @@ gcloud beta run deploy agentic-pqc \
   --source . \
   --project="${PROJECT_ID}" \
   --region="${LOCATION}" \
-  --allow-unauthenticated \
-  --no-iap \
+  --no-allow-unauthenticated \
+  --iap \
   --execution-environment=gen2 \
   --min-instances=1 \
   --max-instances=1 \

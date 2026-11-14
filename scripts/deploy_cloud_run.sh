@@ -78,9 +78,9 @@ if [[ -n "${GOOGLE_OAUTH_CLIENT_ID:-}" ]]; then
   OAUTH_CLIENT_ENV=",GOOGLE_OAUTH_CLIENT_ID=${GOOGLE_OAUTH_CLIENT_ID}"
 fi
 
-IAP_FLAGS=("--allow-unauthenticated" "--no-iap")
-if [[ "${PQC_ENABLE_CLOUD_IAP:-false}" == "true" ]]; then
-  IAP_FLAGS=("--no-allow-unauthenticated" "--iap")
+IAP_FLAGS=("--no-allow-unauthenticated" "--iap")
+if [[ "${PQC_ENABLE_CLOUD_IAP:-true}" == "false" ]]; then
+  IAP_FLAGS=("--allow-unauthenticated" "--no-iap")
 fi
 
 echo "=================================================================="
