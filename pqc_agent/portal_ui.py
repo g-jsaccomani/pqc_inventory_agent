@@ -1732,31 +1732,10 @@ PORTAL_HTML = r"""<!DOCTYPE html>
 
   <!-- Main Canvas (#131415 + Radial Deep Blue Glow) -->
   <main class="main-canvas">
-    <header class="topbar">
-      <div class="topbar-title" onclick="goHome()" title="Return to home screen" style="display:flex;align-items:center;gap:8px;">
-        <img src="/static/pqc-favicon-64.png" alt="" style="width:20px;height:20px;object-fit:contain;" />
-        <span>Agentic PQC Workspace</span>
-      </div>
-      <div style="display:flex;align-items:center;gap:8px;">
-        <button class="top-pill" id="header-conn-badge" onclick="openGcloudModal()" title="Isolated GCP Connection for your account">
-          <span class="status-dot"></span>
-          <span id="header-conn-text">Org 31564119954 • ADC</span>
-        </button>
-        <button class="user-profile-pill" id="user-profile-pill" onclick="toggleGeminiAccountPopover(event, 'header')" title="Gerenciado por google.com">
-          <span class="user-avatar-circle" style="overflow:hidden;position:relative;">
-            <img id="header-user-avatar-img" class="user-avatar-img" alt="" referrerpolicy="no-referrer" />
-            <span id="user-avatar-initials">G</span>
-          </span>
-          <span id="user-email-label">Sign in (@google.com)</span>
-          <span class="region-tag-pill" id="user-region-badge">NorthAm</span>
-        </button>
-      </div>
-    </header>
-
     <div class="chat-scroll" id="chat-scroll">
       <!-- Centered Welcome Screen -->
       <div class="welcome-container" id="welcome-screen">
-        <img src="/static/pqc-logo-full.png" alt="Agentic PQC" style="height:118px;width:auto;object-fit:contain;margin-bottom:2px;filter:drop-shadow(0 8px 24px rgba(0,0,0,0.45));" />
+        <img src="/static/pqc-logo-shield.png" alt="Agentic PQC" style="height:96px;width:auto;object-fit:contain;margin-bottom:2px;filter:drop-shadow(0 8px 24px rgba(0,0,0,0.45));" />
         <h1 class="welcome-title">Agentic Post-Quantum Cryptography</h1>
 
         <div class="phase-chips-row">
@@ -3066,7 +3045,10 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       } else if (cfg.mode === "access_token") {
         modeShort = cfg.has_access_token ? "OAuth 3LO ✓" : "OAuth 3LO (Consent On-Demand)";
       }
-      document.getElementById("header-conn-text").textContent = `Org ${cfg.organization_id} • ${modeShort}`;
+      const headerConnEl = document.getElementById("header-conn-text");
+      if (headerConnEl) {
+        headerConnEl.textContent = `Org ${cfg.organization_id} • ${modeShort}`;
+      }
       const sidebarSummary = document.getElementById("sidebar-conn-summary");
       if (sidebarSummary) {
         sidebarSummary.innerHTML = `Org ${escapeHtml(cfg.organization_id)} • <span id="conn-status-dot" style="color:var(--gemini-link);">${escapeHtml(modeShort)}</span>`;
