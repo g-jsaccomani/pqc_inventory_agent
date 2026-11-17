@@ -769,23 +769,38 @@ def _try_workstation_auto_gcloud_token() -> Optional[str]:
         return None
     if "PYTEST_CURRENT_TEST" in os.environ and os.getenv("PQC_ENABLE_AUTO_GCLOUD_IN_TESTS") != "1":
         return None
-    try:
-        env = os.environ.copy()
-        venv_py = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".venv", "bin", "python"))
-        if os.path.isfile(venv_py) and not env.get("CLOUDSDK_PYTHON"):
-            env["CLOUDSDK_PYTHON"] = venv_py
-        out = _subprocess.check_output(
-            ["gcloud", "auth", "print-access-token", "--quiet"],
-            env=env,
-            stderr=_subprocess.DEVNULL,
-            text=True,
-            timeout=4,
-        )
-        lines = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
-        tok = lines[-1] if lines else ""
-        return tok if tok.startswith("ya29.") else None
-    except Exception:
-        return None
+    venv_py = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".venv", "bin", "python"))
+    candidate_configs: List[Optional[str]] = [
+        os.environ.get("CLOUDSDK_CONFIG"),
+        os.path.expanduser("~/.config/gcloud"),
+        os.path.expanduser("~/.config/gcloud-argolis"),
+    ]
+    seen_cfgs: set[str] = set()
+    for cfg in candidate_configs:
+        key = cfg or ""
+        if key in seen_cfgs:
+            continue
+        seen_cfgs.add(key)
+        try:
+            env = os.environ.copy()
+            if os.path.isfile(venv_py) and not env.get("CLOUDSDK_PYTHON"):
+                env["CLOUDSDK_PYTHON"] = venv_py
+            if cfg and os.path.isdir(cfg):
+                env["CLOUDSDK_CONFIG"] = cfg
+            out = _subprocess.check_output(
+                ["gcloud", "auth", "print-access-token", "--quiet"],
+                env=env,
+                stderr=_subprocess.DEVNULL,
+                text=True,
+                timeout=4,
+            )
+            lines = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
+            tok = lines[-1] if lines else ""
+            if tok.startswith("ya29."):
+                return tok
+        except Exception:
+            continue
+    return None
 
 
 def upsert_tenant_user_profile(
@@ -1853,10 +1868,12 @@ def create_workspace_app(
     def _auth_config_payload() -> Dict[str, Any]:
         oauth_cfg = load_oauth_client_config()
         client_id = oauth_cfg.get("client_id", "")
+        gis_js_enabled = auth_guard.env_flag("PQC_ENABLE_GIS_JAVASCRIPT_CLIENT") is True
         return {
             "allow_unverified_signin": auth_guard.allow_unverified_signin(),
             "google_oauth_client_configured": bool(client_id),
-            "google_oauth_client_id": client_id,
+            "google_oauth_client_id": client_id if gis_js_enabled else "",
+            "gis_javascript_origin_enabled": bool(client_id and gis_js_enabled),
             "oauth_signin_url": "/api/auth/oauth/signin" if client_id else None,
             "access_token_command": "gcloud auth print-access-token",
             "allowed_domains": list(ALLOWED_AUTH_DOMAINS),
@@ -1986,6 +2003,7 @@ def create_workspace_app(
             "iap_active": iap_active,
             "google_oauth_client_id": cfg["google_oauth_client_id"],
             "google_oauth_client_configured": cfg["google_oauth_client_configured"],
+            "gis_javascript_origin_enabled": cfg["gis_javascript_origin_enabled"],
             "allow_unverified_signin": cfg["allow_unverified_signin"],
             "oauth_3lo_enabled": True,
             "oauth_scopes": list(GCP_OAUTH_SCOPES),
@@ -2002,10 +2020,10 @@ def create_workspace_app(
     async def auth_google_signin(request: Request, payload: GoogleAuthSignInPayload) -> JSONResponse:
         """Signs a user in from a VERIFIED Google credential and sets a signed 30-day session cookie.
 
-        Accepted credentials: a Google ID token (`credential` / `id_token`) or a Google OAuth access token
-        (`google_access_token`, e.g. `gcloud auth print-access-token`), both verified with Google. The email must be
-        verified and belong to ALLOWED_AUTH_DOMAINS (403 otherwise). Email-only sign-in returns 401 unless
-        PQC_ALLOW_UNVERIFIED_SIGNIN=true (local development only).
+        Accepted credentials: a Google ID token (`credential` / `id_token`), a Google OAuth access token
+        (`google_access_token`, e.g. `gcloud auth print-access-token`), or an already-verified Cloud IAP / signed
+        session identity on the request. The email must belong to ALLOWED_AUTH_DOMAINS (403 otherwise). Email-only
+        sign-in without a verified identity returns 401 unless PQC_ALLOW_UNVERIFIED_SIGNIN=true (local dev only).
         """
         if payload.oauth_state is not None:
             st = _validate_oauth_state_for_request(request, payload.oauth_state)
@@ -2016,6 +2034,7 @@ def create_workspace_app(
         if access_tok and access_tok.lower().startswith("bearer "):
             access_tok = access_tok[7:].strip() or None
         expires_in: Optional[Any] = None
+        existing_identity = resolve_request_identity(request)
         if id_jwt or access_tok:
             verified_info, err_msg = await asyncio.to_thread(_verify_google_oauth_or_id_token, id_jwt, access_tok)
             status_code, email_or_err = _validated_google_identity(verified_info, err_msg)
@@ -2027,6 +2046,22 @@ def create_workspace_app(
             auth_method = verified_info.get("auth_method", "google_id_token")
             picture = verified_info.get("picture", "")
             expires_in = verified_info.get("expires_in")
+        elif existing_identity is not None:
+            requested_email = (payload.email or "").strip()
+            if requested_email:
+                ok, norm_req = is_allowed_corporate_email(requested_email)
+                if not ok:
+                    raise HTTPException(status_code=403, detail=norm_req)
+                if norm_req != existing_identity.email and not auth_guard.allow_unverified_signin():
+                    raise HTTPException(
+                        status_code=403,
+                        detail=f"Authenticated as {existing_identity.email}; use Switch Account to sign in as {norm_req}.",
+                    )
+            target_email = existing_identity.email
+            existing_prof = _load_tenant_users_map().get(existing_identity.user_id, {})
+            display_name = payload.name or existing_prof.get("name") or (existing_identity.claims or {}).get("name")
+            auth_method = "cloud_iap" if existing_identity.source == "iap" else (existing_prof.get("auth_method") or "google_workspace_signin")
+            picture = existing_prof.get("picture") or (existing_identity.claims or {}).get("picture")
         elif auth_guard.allow_unverified_signin():
             ok, validated_or_err = is_allowed_corporate_email((payload.email or "").strip())
             if not ok:
@@ -2419,7 +2454,7 @@ window.addEventListener('load', () => {{
             return redirect_resp
 
         google_button_html = ""
-        if client_id:
+        if client_id and auth_guard.env_flag("PQC_ENABLE_GIS_JAVASCRIPT_CLIENT") is True:
             google_button_html = (
                 '<button type="button" class="btn btn-google" onclick="openGoogleTokenClient()">'
                 "Authorize with Google Account (OAuth 2.0)"

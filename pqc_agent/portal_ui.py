@@ -1898,10 +1898,10 @@ PORTAL_HTML = r"""<!DOCTYPE html>
 
         <div style="display:flex;flex-direction:column;gap:8px;align-items:stretch;">
           <div id="gis-signin-btn-container" style="display:flex;justify-content:center;width:100%;"></div>
-          <button type="button" class="btn-modal-primary" id="auth-auto-detect-btn" onclick="startGoogleOAuthSignIn()" style="width:100%;justify-content:center;background:#004a77;color:#c2e7ff;border:1px solid #4c8df6;">
+          <button type="button" class="btn-modal-primary" id="auth-auto-detect-btn" onclick="startGoogleOAuthSignIn(false)" style="width:100%;justify-content:center;background:#004a77;color:#c2e7ff;border:1px solid #4c8df6;">
             ✦ Entrar Automaticamente com Conta Google (@google.com)
           </button>
-          <button type="button" class="btn-modal-primary" id="auth-google-oauth-btn" onclick="startGoogleOAuthSignIn()" style="display:none;width:100%;justify-content:center;">
+          <button type="button" class="btn-modal-primary" id="auth-google-oauth-btn" onclick="startGoogleOAuthSignIn(true)" style="display:none;width:100%;justify-content:center;">
             Escolher outra Conta Google (accounts.google.com)
           </button>
         </div>
@@ -2196,21 +2196,25 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       }
     }
 
+    let isCloudIapActive = false;
+
     function isDirectGisAuthorizedOrigin() {
-      const h = (window.location.hostname || "").toLowerCase();
-      return h.startsWith("agentic-pqc") || h === "localhost" || h === "127.0.0.1";
+      return Boolean(AUTH_CONFIG.gis_javascript_origin_enabled);
     }
 
     function initGoogleIdentityServicesOneTap() {
-      if (gisInitialized || !AUTH_CONFIG.google_oauth_client_configured || !AUTH_CONFIG.google_oauth_client_id) {
-        return;
-      }
-      gisInitialized = true;
-      if (!isDirectGisAuthorizedOrigin()) {
+      if (
+        gisInitialized ||
+        !AUTH_CONFIG.gis_javascript_origin_enabled ||
+        !AUTH_CONFIG.google_oauth_client_id ||
+        currentUserProfile ||
+        isCloudIapActive
+      ) {
         const btnContainer = document.getElementById("gis-signin-btn-container");
         if (btnContainer) btnContainer.innerHTML = "";
         return;
       }
+      gisInitialized = true;
       const script = document.createElement("script");
       script.src = "https://accounts.google.com/gsi/client";
       script.async = true;
@@ -2235,7 +2239,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
                 width: 360,
               });
             }
-            if (!currentUserProfile) {
+            if (!currentUserProfile && !isCloudIapActive) {
               window.google.accounts.id.prompt();
             }
           }
@@ -2278,19 +2282,24 @@ PORTAL_HTML = r"""<!DOCTYPE html>
         console.warn("Auth config warning:", e);
       }
       applyAuthConfigToModal();
-      initGoogleIdentityServicesOneTap();
+      if (AUTH_CONFIG.gis_javascript_origin_enabled && !currentUserProfile && !isCloudIapActive) {
+        initGoogleIdentityServicesOneTap();
+      }
     }
 
     function applyAuthConfigToModal() {
       const oauthBtn = document.getElementById("auth-google-oauth-btn");
       const tokenBadge = document.getElementById("auth-token-required-badge");
       const emailHint = document.getElementById("auth-email-hint");
-      if (oauthBtn) oauthBtn.style.display = AUTH_CONFIG.google_oauth_client_configured ? "inline-flex" : "none";
-      if (AUTH_CONFIG.allow_unverified_signin) {
-        if (tokenBadge) tokenBadge.textContent = "(optional: local development mode)";
-        if (emailHint) emailHint.textContent = "(required without a token: development mode)";
+      const onCloudRunHost = (window.location.hostname || "").toLowerCase().endsWith(".run.app");
+      if (oauthBtn) {
+        oauthBtn.style.display = (isCloudIapActive || onCloudRunHost || AUTH_CONFIG.gis_javascript_origin_enabled) ? "inline-flex" : "none";
+      }
+      if (AUTH_CONFIG.allow_unverified_signin || isCloudIapActive || onCloudRunHost) {
+        if (tokenBadge) tokenBadge.textContent = "(opcional — autenticado via Google Cloud IAP)";
+        if (emailHint) emailHint.textContent = "(verificado automaticamente pelo Google)";
       } else {
-        if (tokenBadge) tokenBadge.textContent = AUTH_CONFIG.google_oauth_client_configured ? "(opcional — use o botão Google acima para 1-clique)" : "(required)";
+        if (tokenBadge) tokenBadge.textContent = "(opcional se usar o botão automático acima)";
         if (emailHint) emailHint.textContent = "(taken from the verified token)";
       }
     }
@@ -2303,17 +2312,20 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       }
     }
 
-    function startGoogleOAuthSignIn() {
-      if (!isDirectGisAuthorizedOrigin() && AUTH_CONFIG.google_oauth_client_configured) {
-        const w = 480, h = 560;
-        const left = Math.max(0, Math.round((window.screen.width - w) / 2));
-        const top = Math.max(0, Math.round((window.screen.height - h) / 2));
-        const bridgeUrl = `https://agentic-pqc-110254026096.us-central1.run.app/api/auth/bridge?origin=${encodeURIComponent(window.location.origin)}`;
-        window.open(bridgeUrl, "pqc_google_signin_bridge", `width=${w},height=${h},left=${left},top=${top},resizable=yes,scrollbars=yes`);
+    async function startGoogleOAuthSignIn(forceSwitchAccount = false) {
+      const onCloudRunHost = (window.location.hostname || "").toLowerCase().endsWith(".run.app");
+      if (!forceSwitchAccount) {
+        const autoOk = await tryAutomaticGoogleSignIn(false);
+        if (autoOk) {
+          return;
+        }
+      }
+      if (isCloudIapActive || onCloudRunHost) {
+        window.location.href = "/?gcp-iap-mode=CLEAR_LOGIN_COOKIE";
         return;
       }
       if (
-        AUTH_CONFIG.google_oauth_client_configured &&
+        AUTH_CONFIG.gis_javascript_origin_enabled &&
         AUTH_CONFIG.google_oauth_client_id &&
         window.google &&
         window.google.accounts &&
@@ -2359,15 +2371,8 @@ PORTAL_HTML = r"""<!DOCTYPE html>
           console.warn("GIS initTokenClient fallback:", e);
         }
       }
-      if (!AUTH_CONFIG.google_oauth_client_configured) {
-        tryAutomaticGoogleSignIn(true);
-        return;
-      }
-      const params = new URLSearchParams({ region: selectedAuthRegion || "", timezone: detectBrowserTimezone() || "" });
-      const w = 520, h = 640;
-      const left = Math.max(0, Math.round((window.screen.width - w) / 2));
-      const top = Math.max(0, Math.round((window.screen.height - h) / 2));
-      window.open(`/api/auth/oauth/signin?${params.toString()}`, "pqc_google_signin_popup", `width=${w},height=${h},left=${left},top=${top},resizable=yes,scrollbars=yes`);
+      const autoWorked = await tryAutomaticGoogleSignIn(true);
+      if (autoWorked) return;
     }
 
     async function tryAutomaticGoogleSignIn(manualClick = false) {
@@ -2380,6 +2385,9 @@ PORTAL_HTML = r"""<!DOCTYPE html>
         if (res.ok) {
           const data = await res.json();
           if (data && data.authenticated && data.user) {
+            if (typeof data.iap_active === "boolean") {
+              isCloudIapActive = data.iap_active;
+            }
             await applySignInResult(data);
             return true;
           }
@@ -2412,13 +2420,14 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       }
 
       if (manualClick) {
-        if (AUTH_CONFIG.google_oauth_client_configured) {
-          startGoogleOAuthSignIn();
-        } else {
-          showAuthError(
-            "Nenhuma sessão ativa encontrada automaticamente neste navegador. Cole o token do comando `gcloud auth print-access-token` abaixo para autenticar sua conta @google.com (ficará salva por 30 dias no seletor de contas)."
-          );
+        const onCloudRunHost = (window.location.hostname || "").toLowerCase().endsWith(".run.app");
+        if (isCloudIapActive || onCloudRunHost) {
+          window.location.href = "/?gcp-iap-mode=CLEAR_LOGIN_COOKIE";
+          return false;
         }
+        showAuthError(
+          "Nenhuma sessão ativa encontrada automaticamente neste navegador. Cole o token do comando `gcloud auth print-access-token` abaixo para autenticar sua conta @google.com (ficará salva por 30 dias no seletor de contas)."
+        );
       }
       return false;
     }
@@ -2566,8 +2575,9 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       closeGeminiAccountPopover();
       const emailInput = document.getElementById("auth-email-input");
       if (emailInput) emailInput.value = clean;
-      if (AUTH_CONFIG.google_oauth_client_configured) {
-        startGoogleOAuthSignIn();
+      const onCloudRunHost = (window.location.hostname || "").toLowerCase().endsWith(".run.app");
+      if (isCloudIapActive || onCloudRunHost) {
+        window.location.href = "/?gcp-iap-mode=CLEAR_LOGIN_COOKIE";
       } else {
         openAuthModal(`Faça login novamente para reconectar ${clean}.`);
       }
@@ -2605,7 +2615,8 @@ PORTAL_HTML = r"""<!DOCTYPE html>
 
     function addAnotherGoogleAccount() {
       closeGeminiAccountPopover();
-      if (currentUserProfile && currentUserProfile.auth_method === "cloud_iap") {
+      const onCloudRunHost = (window.location.hostname || "").toLowerCase().endsWith(".run.app");
+      if (isCloudIapActive || onCloudRunHost || (currentUserProfile && currentUserProfile.auth_method === "cloud_iap")) {
         window.location.href = "/?gcp-iap-mode=CLEAR_LOGIN_COOKIE";
         return;
       }
@@ -2615,11 +2626,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       if (emailInput) emailInput.value = "";
       if (nameInput) nameInput.value = "";
       if (tokInput) tokInput.value = "";
-      if (AUTH_CONFIG.google_oauth_client_configured) {
-        startGoogleOAuthSignIn();
-      } else {
-        openAuthModal();
-      }
+      openAuthModal();
     }
 
     function updateTenantProfileUI(profile) {
@@ -2720,6 +2727,9 @@ PORTAL_HTML = r"""<!DOCTYPE html>
         });
         if (!res.ok) return;
         const data = await res.json();
+        if (typeof data.iap_active === "boolean") {
+          isCloudIapActive = data.iap_active;
+        }
         if (data.authenticated && data.user) {
           if (data.token) {
             currentAuthToken = data.token;
@@ -2765,7 +2775,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       const oauthToken = (document.getElementById("auth-oauth-token-input").value || "").trim();
       const bindGcp = Boolean(document.getElementById("auth-bind-gcp-token").checked);
 
-      if (!oauthToken && !AUTH_CONFIG.allow_unverified_signin) {
+      if (!oauthToken && !AUTH_CONFIG.allow_unverified_signin && !isCloudIapActive && !currentUserProfile) {
         const autoWorked = await tryAutomaticGoogleSignIn(false);
         if (autoWorked) return;
         showAuthError(
@@ -2774,7 +2784,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
         );
         return;
       }
-      if (!oauthToken && !rawEmail) {
+      if (!oauthToken && !rawEmail && !isCloudIapActive && !currentUserProfile) {
         showAuthError("Development mode: enter your corporate email or paste an access token.");
         return;
       }
@@ -2783,7 +2793,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
         const res = await fetch("/api/auth/google", {
           method: "POST",
           credentials: "same-origin",
-          headers: { "Content-Type": "application/json" },
+          headers: getAuthHeaders({ "Content-Type": "application/json" }),
           body: JSON.stringify({
             email: rawEmail || undefined,
             name: displayName || undefined,
@@ -2813,7 +2823,8 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     }
 
     async function signOutTenantUser() {
-      const wasIap = Boolean(currentUserProfile && currentUserProfile.auth_method === "cloud_iap");
+      const onCloudRunHost = (window.location.hostname || "").toLowerCase().endsWith(".run.app");
+      const wasIap = Boolean(isCloudIapActive || onCloudRunHost || (currentUserProfile && currentUserProfile.auth_method === "cloud_iap"));
       const signedOutEmail = currentUserProfile && currentUserProfile.email ? currentUserProfile.email : "";
       if (signedOutEmail) {
         markSavedBrowserAccountDisconnected(signedOutEmail);
@@ -3748,9 +3759,8 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     window.addEventListener("DOMContentLoaded", async () => {
       const linkedSession = new URLSearchParams(window.location.search).get("session");
       renderModelDropdown();
-      await loadAuthConfig();
-      await loadModelCatalog();
       await loadCurrentTenantUser();
+      await Promise.all([loadAuthConfig(), loadModelCatalog()]);
       if (!currentUserProfile) return;  // the sign-in dialog is open; tenant APIs require a verified session
       await loadConnectionConfig();
       await fetchSessions();

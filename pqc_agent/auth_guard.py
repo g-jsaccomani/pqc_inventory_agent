@@ -369,6 +369,14 @@ def verify_iap_jwt(token: Optional[str], audience: Optional[str] = None) -> Opti
             _iap_transport(),
             audience=expected_audience,
             certs_url=IAP_CERTS_URL,
+            clock_skew_in_seconds=60,
+        )
+    except TypeError:
+        claims = google_id_token.verify_token(
+            token,
+            _iap_transport(),
+            audience=expected_audience,
+            certs_url=IAP_CERTS_URL,
         )
     except Exception as exc:  # invalid signature, expired, wrong audience, malformed, key fetch failure...
         logger.warning("Rejected Cloud IAP JWT assertion: %s: %s", type(exc).__name__, str(exc)[:200])
