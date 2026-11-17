@@ -35,16 +35,27 @@ gcloud services enable \
   storage.googleapis.com \
   --project="${PROJECT_ID}"
 
-echo "[3/4] Granting IAM roles to the Vertex AI Reasoning Engine Service Agent..."
+echo "[3/4] Granting IAM roles to the Vertex AI Reasoning Engine & Cloud Run Service Accounts..."
 PROJECT_NUMBER=$(gcloud projects describe "${PROJECT_ID}" --format="value(projectNumber)")
 RE_SA="service-${PROJECT_NUMBER}@gcp-sa-aiplatform-re.iam.gserviceaccount.com"
+COMPUTE_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+ORG_ID="${GCP_ORGANIZATION_ID:-31564119954}"
 
-for ROLE in "roles/cloudkms.viewer" "roles/cloudasset.viewer" "roles/aiplatform.user"; do
-  gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
-    --member="serviceAccount:${RE_SA}" \
-    --role="${ROLE}" \
-    --condition=None \
-    --quiet >/dev/null 2>&1 || true
+for SA_EMAIL in "${RE_SA}" "${COMPUTE_SA}"; do
+  for ROLE in "roles/cloudkms.viewer" "roles/cloudasset.viewer" "roles/compute.viewer" "roles/privateca.auditor" "roles/serviceusage.serviceUsageConsumer" "roles/aiplatform.user"; do
+    gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+      --member="serviceAccount:${SA_EMAIL}" \
+      --role="${ROLE}" \
+      --condition=None \
+      --quiet >/dev/null 2>&1 || true
+  done
+  for ROLE in "roles/cloudasset.viewer" "roles/cloudkms.viewer" "roles/resourcemanager.organizationViewer" "roles/compute.viewer" "roles/privateca.auditor" "roles/certificatemanager.viewer" "roles/orgpolicy.policyViewer"; do
+    gcloud organizations add-iam-policy-binding "${ORG_ID}" \
+      --member="serviceAccount:${SA_EMAIL}" \
+      --role="${ROLE}" \
+      --condition=None \
+      --quiet >/dev/null 2>&1 || true
+  done
 done
 
 echo "[4/5] Packaging and deploying to Vertex AI Agent Engine..."

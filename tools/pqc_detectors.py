@@ -23,6 +23,7 @@ from tools.gcp_inventory import (
     SIMULATION_NOTICE,
     _cache_get,
     _cache_put,
+    _cai_search_all_resources_with_fallback,
     _compact_json,
     _get_client_kwargs,
     _now_iso,
@@ -211,16 +212,18 @@ def collect_tls_policies(scope: str = f"organizations/{DEFAULT_ORGANIZATION_ID}"
     proxies_raw: List[Dict[str, Any]] = []
     try:
         cai_client = asset_v1.AssetServiceClient(**_get_client_kwargs())
-        request = asset_v1.SearchAllResourcesRequest(
-            scope=scope_uri,
+        items = _cai_search_all_resources_with_fallback(
+            cai_client=cai_client,
+            scope_uri=scope_uri,
             asset_types=[
                 "compute.googleapis.com/SslPolicy",
                 "compute.googleapis.com/TargetHttpsProxy",
                 "compute.googleapis.com/TargetSslProxy",
             ],
             read_mask="*",
+            page_size=500,
         )
-        for item in cai_client.search_all_resources(request=request):
+        for item in items:
             proj = _project_from_cai_name(item.name, item.project or clean_id)
             attrs = _proto_struct_to_dict(item.versioned_resources[0].resource) if item.versioned_resources else {}
             name = item.display_name or item.name.split("/")[-1]
@@ -305,8 +308,11 @@ def _discover_key_rings_via_cai(scope_uri: str) -> List[Dict[str, str]]:
     keyrings: List[Dict[str, str]] = []
     excluded = excluded_key_rings()
     cai_client = asset_v1.AssetServiceClient(**_get_client_kwargs())
-    for item in cai_client.search_all_resources(
-        request={"scope": scope_uri, "asset_types": ["cloudkms.googleapis.com/KeyRing"], "page_size": 500}
+    for item in _cai_search_all_resources_with_fallback(
+        cai_client=cai_client,
+        scope_uri=scope_uri,
+        asset_types=["cloudkms.googleapis.com/KeyRing"],
+        page_size=500,
     ):
         parts = item.name.split("/")
         if len(parts) >= 9 and parts[3] == "projects" and parts[5] == "locations" and parts[7] == "keyRings":

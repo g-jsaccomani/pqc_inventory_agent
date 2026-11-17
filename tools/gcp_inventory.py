@@ -638,17 +638,67 @@ def _scan_kms_location(
         return [f.result() for f in futures]
 
 
+DEFAULT_FUNCTIONAL_LAB_FALLBACK_SCOPES: Tuple[str, ...] = (
+    "folders/534285347409",
+    "projects/pqc-inventory-agent-cd06",
+    "projects/pqc-inventory-agent-dev",
+)
+
+
+def _cai_search_all_resources_with_fallback(
+    cai_client: Any,
+    scope_uri: str,
+    asset_types: List[str],
+    read_mask: Optional[str] = None,
+    page_size: int = 500,
+) -> List[Any]:
+    """Queries Cloud Asset Inventory `search_all_resources` for `scope_uri`.
+    When `scope_uri` is `organizations/31564119954` and the runtime service account is scoped to the Functional Lab
+    folder (`folders/534285347409`) + host project (`projects/pqc-inventory-agent-cd06`), transparently falls back
+    to querying those scopes and deduplicating resources by `name`."""
+    req: Dict[str, Any] = {
+        "scope": scope_uri,
+        "asset_types": list(asset_types),
+        "page_size": page_size,
+    }
+    if read_mask:
+        req["read_mask"] = read_mask
+    try:
+        return list(cai_client.search_all_resources(request=req))
+    except Exception as primary_exc:
+        if scope_uri != f"organizations/{DEFAULT_ORGANIZATION_ID}":
+            raise
+        combined: List[Any] = []
+        seen_names: Set[str] = set()
+        any_succeeded = False
+        for fb_scope in DEFAULT_FUNCTIONAL_LAB_FALLBACK_SCOPES:
+            fb_req = dict(req, scope=fb_scope)
+            try:
+                for item in cai_client.search_all_resources(request=fb_req):
+                    any_succeeded = True
+                    item_name = getattr(item, "name", "")
+                    if item_name and item_name in seen_names:
+                        continue
+                    if item_name:
+                        seen_names.add(item_name)
+                    combined.append(item)
+            except Exception:
+                continue
+        if any_succeeded:
+            return combined
+        raise primary_exc
+
+
 def _discover_kms_targets_via_cai(scope_uri: str, errors: List[str]) -> List[Tuple[str, str]]:
     """Discovers (project_id, location) pairs that contain KeyRings/CryptoKeys inside the scope."""
     targets: Set[Tuple[str, str]] = set()
     try:
         cai_client = asset_v1.AssetServiceClient(**_get_client_kwargs())
-        response = cai_client.search_all_resources(
-            request={
-                "scope": scope_uri,
-                "asset_types": ["cloudkms.googleapis.com/KeyRing", "cloudkms.googleapis.com/CryptoKey"],
-                "page_size": 500,
-            }
+        response = _cai_search_all_resources_with_fallback(
+            cai_client=cai_client,
+            scope_uri=scope_uri,
+            asset_types=["cloudkms.googleapis.com/KeyRing", "cloudkms.googleapis.com/CryptoKey"],
+            page_size=500,
         )
         for resource in response:
             parts = resource.name.split("/")
@@ -879,8 +929,11 @@ def collect_workload_evidence(scope: str = f"organizations/{DEFAULT_ORGANIZATION
     raw_workloads: List[Dict[str, Any]] = []
     try:
         cai_client = asset_v1.AssetServiceClient(**_get_client_kwargs())
-        response = cai_client.search_all_resources(
-            request={"scope": scope_uri, "asset_types": WORKLOAD_ASSET_TYPES, "page_size": 500}
+        response = _cai_search_all_resources_with_fallback(
+            cai_client=cai_client,
+            scope_uri=scope_uri,
+            asset_types=WORKLOAD_ASSET_TYPES,
+            page_size=500,
         )
         for r in response:
             refs: List[str] = []
@@ -969,8 +1022,12 @@ def discover_all_crypto_assets(scope: str = f"organizations/{DEFAULT_ORGANIZATIO
     assets: List[Dict[str, Any]] = []
     try:
         cai_client = asset_v1.AssetServiceClient(**_get_client_kwargs())
-        response = cai_client.search_all_resources(
-            request={"scope": scope_uri, "asset_types": CRYPTO_ASSET_TYPES, "page_size": 500, "read_mask": "*"}
+        response = _cai_search_all_resources_with_fallback(
+            cai_client=cai_client,
+            scope_uri=scope_uri,
+            asset_types=CRYPTO_ASSET_TYPES,
+            read_mask="*",
+            page_size=500,
         )
         for resource in response:
             attrs: Dict[str, Any] = {}

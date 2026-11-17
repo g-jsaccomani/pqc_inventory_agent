@@ -54,6 +54,63 @@ fi
 # - No wildcard CORS (PQC_ALLOWED_ORIGINS unset => same-origin portal only).
 # Optional: PQC_AUTH_SECRET_SECRET=<Secret Manager secret name> injects the session HMAC key (recommended), and
 # PQC_IAP_AUDIENCE=<IAP audience> when the service sits behind Cloud IAP (only verified IAP JWTs are trusted).
+PROJECT_NUMBER=$(gcloud projects describe "${PROJECT_ID}" --account="${ARGOLIS_ACCOUNT}" --format="value(projectNumber)")
+RUNTIME_SA="serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+ORG_ID="${GCP_ORGANIZATION_ID:-31564119954}"
+LAB_FOLDER_ID="${PQC_LAB_FOLDER_ID:-534285347409}"
+
+echo "=================================================================="
+echo "🛡️ Onboarding Read-Only PQC Inventory IAM Roles for ${RUNTIME_SA}"
+echo "   Organization : organizations/${ORG_ID}"
+echo "   Lab Folder   : folders/${LAB_FOLDER_ID}"
+echo "   Host Project : projects/${PROJECT_ID}"
+echo "=================================================================="
+for ROLE in \
+  "roles/cloudasset.viewer" \
+  "roles/cloudkms.viewer" \
+  "roles/resourcemanager.organizationViewer" \
+  "roles/compute.viewer" \
+  "roles/privateca.auditor" \
+  "roles/certificatemanager.viewer" \
+  "roles/orgpolicy.policyViewer"; do
+  gcloud organizations add-iam-policy-binding "${ORG_ID}" \
+    --account="${ARGOLIS_ACCOUNT}" \
+    --member="${RUNTIME_SA}" \
+    --role="${ROLE}" \
+    --condition=None \
+    --format="none" --quiet >/dev/null 2>&1 || true
+done
+
+for ROLE in \
+  "roles/viewer" \
+  "roles/iam.securityReviewer" \
+  "roles/cloudasset.viewer" \
+  "roles/cloudkms.viewer" \
+  "roles/compute.viewer" \
+  "roles/privateca.auditor"; do
+  gcloud resource-manager folders add-iam-policy-binding "${LAB_FOLDER_ID}" \
+    --account="${ARGOLIS_ACCOUNT}" \
+    --member="${RUNTIME_SA}" \
+    --role="${ROLE}" \
+    --condition=None \
+    --format="none" --quiet >/dev/null 2>&1 || true
+done
+
+for ROLE in \
+  "roles/cloudasset.viewer" \
+  "roles/cloudkms.viewer" \
+  "roles/compute.viewer" \
+  "roles/privateca.auditor" \
+  "roles/serviceusage.serviceUsageConsumer" \
+  "roles/aiplatform.user"; do
+  gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+    --account="${ARGOLIS_ACCOUNT}" \
+    --member="${RUNTIME_SA}" \
+    --role="${ROLE}" \
+    --condition=None \
+    --format="none" --quiet >/dev/null 2>&1 || true
+done
+
 PQC_AUTH_SECRET_SECRET="${PQC_AUTH_SECRET_SECRET:-pqc-session-secret}"
 EXTRA_DEPLOY_FLAGS=()
 if [[ -n "${PQC_AUTH_SECRET_SECRET:-}" ]]; then
@@ -62,9 +119,8 @@ if [[ -n "${PQC_AUTH_SECRET_SECRET:-}" ]]; then
     python3 -c "import secrets; print(secrets.token_urlsafe(48), end='')" | \
       gcloud secrets create "${PQC_AUTH_SECRET_SECRET}" --account="${ARGOLIS_ACCOUNT}" --project="${PROJECT_ID}" --replication-policy="automatic" --data-file=-
   fi
-  PROJECT_NUMBER=$(gcloud projects describe "${PROJECT_ID}" --account="${ARGOLIS_ACCOUNT}" --format="value(projectNumber)")
   gcloud secrets add-iam-policy-binding "${PQC_AUTH_SECRET_SECRET}" --account="${ARGOLIS_ACCOUNT}" --project="${PROJECT_ID}" \
-    --member="serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" --role="roles/secretmanager.secretAccessor" --format="none" || true
+    --member="${RUNTIME_SA}" --role="roles/secretmanager.secretAccessor" --format="none" || true
   EXTRA_DEPLOY_FLAGS+=("--set-secrets=PQC_AUTH_SECRET=${PQC_AUTH_SECRET_SECRET}:latest")
 fi
 IAP_ENV=""

@@ -1131,10 +1131,12 @@ class PqcOAuth3LOPlugin(BasePlugin):
             if _is_builtin_demo_scope(target_scope, conn):
                 set_gcp_connection_config(mode="adc", user_id=uid)
                 return None
-            try:
-                tool_context.request_credential(auth_config)
-            except Exception as exc:
-                logger.debug("tool_context.request_credential note: %s", exc)
+            agent_name = getattr(getattr(inv_ctx, "agent", None), "name", None)
+            if not isinstance(agent_name, str) or agent_name in ("", "pqc_inventory_agent"):
+                try:
+                    tool_context.request_credential(auth_config)
+                except Exception as exc:
+                    logger.debug("tool_context.request_credential note: %s", exc)
 
             auth_uri = build_oauth_authorize_uri(user_id=uid, session_id=inv_sess, target_scope=target_scope)
             consent_card = {
@@ -1217,15 +1219,19 @@ class PqcOAuth3LOPlugin(BasePlugin):
                 or conn.get("organization_id")
                 or "organizations/31564119954"
             )
+            if _is_builtin_demo_scope(target_scope, conn):
+                return None
             auth_config = build_gcp_oauth_auth_config(
                 user_id=uid,
                 session_id=inv_sess,
                 target_scope=target_scope,
             )
-            try:
-                tool_context.request_credential(auth_config)
-            except Exception:
-                pass
+            agent_name = getattr(getattr(inv_ctx, "agent", None), "name", None)
+            if not isinstance(agent_name, str) or agent_name in ("", "pqc_inventory_agent"):
+                try:
+                    tool_context.request_credential(auth_config)
+                except Exception:
+                    pass
             auth_uri = build_oauth_authorize_uri(user_id=uid, session_id=inv_sess, target_scope=target_scope)
             consent_card = {
                 "consent_id": tool_context.function_call_id or f"consent-{uuid.uuid4().hex[:10]}",

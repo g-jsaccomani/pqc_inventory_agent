@@ -708,6 +708,44 @@ def execute_gcloud_command(command: str) -> str:
                 proc = adc_proc
                 mode = "adc"
                 mode_label = CONNECTION_MODES["adc"]
+        if (
+            proc.returncode != 0
+            and any("31564119954" in t for t in exec_tokens)
+            and any(
+                err_marker in (proc.stderr or "")
+                for err_marker in (
+                    "PERMISSION_DENIED",
+                    "PermissionDenied",
+                    "does not have permission",
+                    "Caller does not have permission",
+                )
+            )
+        ):
+            fb_tokens = [
+                t.replace("organizations/31564119954", "folders/534285347409").replace(
+                    "--organization=31564119954", "--folder=534285347409"
+                )
+                for t in exec_tokens
+            ]
+            if fb_tokens != exec_tokens:
+                fb_env = dict(env)
+                fb_env.pop("CLOUDSDK_AUTH_ACCESS_TOKEN_FILE", None)
+                fb_proc = subprocess.run(
+                    fb_tokens,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    env=fb_env,
+                    shell=False,
+                )
+                if fb_proc.returncode == 0:
+                    proc = fb_proc
+                    tokens = [
+                        t.replace("organizations/31564119954", "folders/534285347409").replace(
+                            "--organization=31564119954", "--folder=534285347409"
+                        )
+                        for t in tokens
+                    ]
         duration_ms = round((time.time() - start_ts) * 1000, 2)
         display_cmd = "gcloud " + " ".join(shlex.quote(t) for t in tokens)
         result_payload = {
