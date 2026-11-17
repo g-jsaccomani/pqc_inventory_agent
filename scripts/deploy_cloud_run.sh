@@ -112,5 +112,29 @@ gcloud beta run deploy "${SERVICE_NAME}" \
   --set-env-vars="GOOGLE_GENAI_USE_VERTEXAI=TRUE,GOOGLE_CLOUD_PROJECT=${PROJECT_ID},GOOGLE_CLOUD_LOCATION=global,GCP_ORGANIZATION_ID=31564119954,GCP_ORGANIZATION_NAME=jsaccomani.altostrat.com,PQC_AGENT_MODEL=gemini-3.1-pro-preview-customtools,PQC_SIMULATION_MODE=FALSE,SESSION_DB_URL=sqlite:///data/pqc_sessions.db,PQC_ARTIFACT_BUCKET=gs://${BUCKET_NAME},PQC_CALIBRATION_STORE_PATH=/data/calibration-history.jsonl,PQC_ALLOW_UNVERIFIED_SIGNIN=false,PQC_ENABLE_ADK_DEV_UI=false,PQC_ENABLE_ADK_API=false${IAP_ENV}${OAUTH_CLIENT_ENV}" \
   ${EXTRA_DEPLOY_FLAGS[@]+"${EXTRA_DEPLOY_FLAGS[@]}"}
 
-
-
+if [[ "${PQC_ENABLE_CLOUD_IAP:-true}" != "false" ]] && [[ -n "${GOOGLE_OAUTH_CLIENT_ID:-}" ]] && \
+   gcloud secrets describe "iap-external-oauth-secret" --account="${ARGOLIS_ACCOUNT}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+  OAUTH_SEC=$(gcloud secrets versions access latest --secret="iap-external-oauth-secret" --account="${ARGOLIS_ACCOUNT}" --project="${PROJECT_ID}")
+  URLS_JSON=$(gcloud run services describe "${SERVICE_NAME}" --account="${ARGOLIS_ACCOUNT}" --project="${PROJECT_ID}" --region="${LOCATION}" --format="value(metadata.annotations['run.googleapis.com/urls'])")
+  TMP_IAP_YAML=$(mktemp)
+  chmod 600 "${TMP_IAP_YAML}"
+  URLS_JSON="${URLS_JSON}" CID="${GOOGLE_OAUTH_CLIENT_ID}" CSEC="${OAUTH_SEC}" python3 - "${TMP_IAP_YAML}" <<'PY'
+import json, os, sys, urllib.parse
+hosts = [urllib.parse.urlparse(u).hostname for u in json.loads(os.environ.get("URLS_JSON") or "[]") if urllib.parse.urlparse(u).hostname]
+lines = [
+    "accessSettings:",
+    "  allowedDomainsSettings:",
+    "    enable: true",
+    "    domains:",
+    *[f'      - "{h}"' for h in hosts],
+    "  oauthSettings:",
+    f'    clientId: "{os.environ["CID"]}"',
+    f'    clientSecret: "{os.environ["CSEC"]}"',
+]
+open(sys.argv[1], "w", encoding="utf-8").write("\n".join(lines) + "\n")
+PY
+  unset OAUTH_SEC
+  gcloud iap settings set "${TMP_IAP_YAML}" --project="${PROJECT_ID}" --account="${ARGOLIS_ACCOUNT}" >/dev/null
+  gcloud iap settings set "${TMP_IAP_YAML}" --project="${PROJECT_ID}" --resource-type=cloud-run --region="${LOCATION}" --service="${SERVICE_NAME}" --account="${ARGOLIS_ACCOUNT}" >/dev/null
+  rm -f "${TMP_IAP_YAML}"
+fi
