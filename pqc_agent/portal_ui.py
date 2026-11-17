@@ -2025,11 +2025,11 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     ];
 
     const LAB_PROMPTS = [
-      "Run a complete post-quantum cryptography readiness assessment for scope '{ORG}'. Use the discovery, correlation and quantum risk specialists, then the remediation architect. Deliver the consulting assessment with evidence: inventory facts, key-to-workload correlations with evidence levels, the scorecard with numerators and denominators, the Mosca analysis (say whether the parameters are calibrated or default), prioritized risks and a phased plan.",
-      "Evaluate the cryptographic governance posture of scope '{ORG}': keys with quantum-vulnerable or below-target algorithms, symmetric keys without rotation and protection levels. Then have the remediation architect propose preventive Organization Policy custom constraints and rotation runbooks for the exact keys found.",
-      "Assess transport-layer exposure in scope '{ORG}': SSL policies and HTTPS/SSL target proxies (effective policy and minimum TLS version) and the signing keys used for tokens. Explain store-now-decrypt-later exposure with evidence, and propose TLS 1.3 policy changes plus the gateway, header-size and verifier impact of moving signing keys to ML-DSA, using the sizes reported by the tools.",
-      "Inspect Cloud KMS import jobs in scope '{ORG}' for classical RSA-OAEP wrapping, correlate keys to workloads, and have the report writer export a CycloneDX v1.6 CBOM that includes only validated correlations. Propose the migration of import jobs to post-quantum HPKE wrapping.",
-      "Design the target Google Cloud architecture for the PQC migration of scope '{ORG}' grounded in the discovered resources: Cloud KMS and Cloud HSM post-quantum keys, Tink HPKE for applications, VPC Service Controls, Certificate Authority Service, Binary Authorization and Security Command Center. Provide Terraform and gcloud for the specific resources found and mark every new resource name as proposed."
+      "Run a complete post-quantum cryptography readiness assessment for scope '{ORG}'. Call collect_kms_inventory, collect_workload_evidence, collect_tls_policies, collect_kms_import_jobs, discover_all_crypto_assets, compute_pqc_scorecard, get_historical_calibration_profile and run_quantum_cryptanalysis_simulation in parallel in a single tool batch, then deliver the consulting assessment with evidence: inventory facts, key-to-workload correlations with evidence levels, the scorecard with numerators and denominators, the Mosca analysis (say whether the parameters are calibrated or default), prioritized risks and a phased plan.",
+      "Evaluate the cryptographic governance posture of scope '{ORG}': call collect_kms_inventory and compute_pqc_scorecard in parallel to inspect keys with quantum-vulnerable or below-target algorithms, symmetric keys without rotation and protection levels, then propose preventive Organization Policy custom constraints and rotation runbooks for the exact keys found.",
+      "Assess transport-layer exposure in scope '{ORG}': call collect_tls_policies and collect_kms_inventory in parallel to inspect SSL policies and HTTPS/SSL target proxies (effective policy, minimum TLS version and post_quantum_key_exchange mode) and the signing keys used for tokens. Explain store-now-decrypt-later exposure with evidence, and propose TLS 1.3 policy changes plus the gateway, header-size and verifier impact of moving signing keys to ML-DSA, using the sizes reported by the tools.",
+      "Inspect Cloud KMS import jobs in scope '{ORG}': call collect_kms_import_jobs, collect_kms_inventory and collect_workload_evidence in parallel for classical RSA-OAEP wrapping, correlate keys to workloads, and call export_cyclonedx_cbom so the CycloneDX v1.6 CBOM includes only validated correlations. Propose the migration of import jobs to post-quantum HPKE wrapping.",
+      "Design the target Google Cloud architecture for the PQC migration of scope '{ORG}' grounded in the discovered resources (call collect_kms_inventory, collect_tls_policies, collect_kms_import_jobs and discover_all_crypto_assets in parallel): Cloud KMS and Cloud HSM post-quantum keys, Tink HPKE for applications, VPC Service Controls, Certificate Authority Service, Binary Authorization and Security Command Center. Provide Terraform and gcloud for the specific resources found and mark every new resource name as proposed."
     ];
 
     let MODEL_OPTIONS = [];
@@ -3363,7 +3363,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
         localStorage.setItem("pqc_active_session_id", currentSessionId);
         document.getElementById("messages-container").innerHTML = "";
         document.getElementById("welcome-screen").style.display = "flex";
-        await fetchSessions();
+        fetchSessions();
       }
     }
 

@@ -931,3 +931,79 @@ def test_live_vertex_gemini_turn_reports_model_telemetry():
     assert result["served_by"]["prompt_tokens"] > 0
 
 
+def test_all_five_phases_and_connection_modes_through_chat_api(tmp_path, monkeypatch):
+    """Verifies P1-P5 phase prompts and all connection_mode FormData fields on POST /api/chat without HTTP 500."""
+    from fastapi.testclient import TestClient
+    from google.genai import types
+    import pqc_agent.workspace_server as ws_mod
+    from tools.gcp_inventory import (
+        collect_kms_inventory,
+        collect_workload_evidence,
+        compute_pqc_scorecard,
+        discover_all_crypto_assets,
+        export_cyclonedx_cbom,
+    )
+    from tools.pqc_detectors import collect_kms_import_jobs, collect_tls_policies
+    from tools.quantum_engine import run_quantum_cryptanalysis_simulation
+
+    monkeypatch.setenv("PQC_DATA_DIR", str(tmp_path / "tenant_store"))
+    monkeypatch.setenv("PQC_ALLOW_UNVERIFIED_SIGNIN", "true")
+
+    # 1. Verify all underlying phase tools execute cleanly on DEMO_SCOPE
+    kms = json.loads(collect_kms_inventory(DEMO_SCOPE))
+    workloads = json.loads(collect_workload_evidence(DEMO_SCOPE))
+    tls = json.loads(collect_tls_policies(DEMO_SCOPE))
+    imports = json.loads(collect_kms_import_jobs(DEMO_SCOPE))
+    assets = json.loads(discover_all_crypto_assets(DEMO_SCOPE))
+    scorecard = json.loads(compute_pqc_scorecard(DEMO_SCOPE))
+    qsim = json.loads(run_quantum_cryptanalysis_simulation(DEMO_SCOPE))
+    cbom = json.loads(export_cyclonedx_cbom(DEMO_SCOPE))
+    assert len(kms["keys"]) > 0
+    assert len(workloads["workloads"]) > 0
+    assert len(tls["ssl_policies"]) > 0
+    assert len(imports["import_jobs"]) > 0
+    assert assets["scope"] == f"projects/{DEMO_SCOPE}"
+    assert "metrics" in scorecard
+    assert "illustrative_crqc_scenario_model" in qsim
+    assert cbom["bomFormat"] == "CycloneDX"
+
+    # 2. Verify all 5 phases (P1-P5) and connection_mode values ('adc', 'access_token', 'impersonation') via POST /api/chat
+    app = _make_app(tmp_path)
+
+    with TestClient(app) as client:
+        auth_resp = client.post(
+            "/api/auth/google",
+            json={"email": "jsaccomani@google.com", "name": "Joabson Saccomani", "region": "LATAM"},
+        )
+        assert auth_resp.status_code == 200
+        token = auth_resp.json()["token"]
+
+        for idx, mode in enumerate(["adc", "access_token", "impersonation", "adc", "access_token"]):
+            sess = client.post(
+                "/api/sessions",
+                headers={"X-PQC-User-Token": token},
+                json={"title": f"P{idx + 1} Phase Test", "scope": "organizations/31564119954"},
+            ).json()
+            res = client.post(
+                "/api/chat",
+                headers={"X-PQC-User-Token": token},
+                data={
+                    "message": f"Run Phase P{idx + 1} assessment on organizations/31564119954",
+                    "session_id": sess["session_id"],
+                    "model_id": "fake-ok-model",
+                    "scope": "organizations/31564119954",
+                    "connection_mode": mode,
+                    "impersonated_sa": "sa@proj.iam.gserviceaccount.com" if mode == "impersonation" else "",
+                },
+            )
+            assert res.status_code == 200, res.text
+            body = res.json()
+            assert body["status"] == "OK"
+            assert f"Run Phase P{idx + 1} assessment" in body["response"]
+
+        # Verify fast cached session listing returns all 5 sessions with accurate message_count
+        listed = client.get("/api/sessions", headers={"X-PQC-User-Token": token}).json()
+        assert listed["total"] == 5
+        assert all(s["message_count"] >= 2 for s in listed["sessions"])
+
+

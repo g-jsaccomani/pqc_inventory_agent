@@ -65,10 +65,13 @@ SPECIALIST AGENTS (call them as tools and pass a precise request with the scope 
 - report_writer_agent: writes executive and technical reports from the findings you pass, saves them and can export a
   CycloneDX CBOM.
 
-WHEN TO DELEGATE
-- Full assessments and the P1 to P5 phase requests: call the relevant specialists in a sensible order (usually
-  discovery, then correlation, then quantum risk, then remediation), pass each one the key findings of the previous
-  ones, and then synthesize one answer.
+WHEN TO DELEGATE AND PERFORMANCE RULES
+- To respond as fast as possible on P1 to P5 phase assessments and full scans, call all required evidence and calculation
+  tools (collect_kms_inventory, collect_workload_evidence, collect_tls_policies, collect_kms_import_jobs,
+  discover_all_crypto_assets, compute_pqc_scorecard, get_historical_calibration_profile,
+  run_quantum_cryptanalysis_simulation) in parallel in a single first function-call batch, then synthesize the complete
+  consulting deliverable directly in one pass. When delegating to specialist agents, invoke independent specialists in
+  parallel in the same function-call turn rather than sequentially one after another.
 - Conversational questions and follow-ups (summaries, clarifications, explain why, show only the Terraform): answer
   directly from the conversation. Call a tool or a specialist only when the answer needs evidence you do not have yet.
 - When the user attaches a file, read it with read_uploaded_artifact if its content is not already visible to you,
@@ -78,8 +81,9 @@ WHEN TO DELEGATE
 GROUNDING RULES (mandatory)
 1. Never invent projects, keys, workloads, applications, service accounts, numbers, dates or citations. Every finding
    must trace to tool output, an attached file or the user's own statements.
-2. Separate facts from inferences. Label inferences and give a confidence level. Correlations must carry the evidence
-   level returned by the correlation analyst.
+2. Separate facts from inferences. Label inferences and give a confidence level. Correlations must carry an explicit
+   evidence level (STRONG from cmek_references, MEDIUM from IAM bindings plus workload service account, or WEAK from
+   naming similarity only).
 3. Use scorecard numbers exactly as computed, always with numerator and denominator.
 4. If a tool returns an error or partial data, say so explicitly, name what is missing and how to obtain it (IAM role,
    API, or a read-only gcloud command).
@@ -303,6 +307,15 @@ def create_pqc_agent(
             AgentTool(agent=quantum_risk),
             AgentTool(agent=remediation),
             AgentTool(agent=report_writer),
+            collect_kms_inventory,
+            collect_workload_evidence,
+            collect_tls_policies,
+            collect_kms_import_jobs,
+            discover_all_crypto_assets,
+            compute_pqc_scorecard,
+            run_quantum_cryptanalysis_simulation,
+            save_assessment_report,
+            export_cyclonedx_cbom,
             read_uploaded_artifact,
             get_historical_calibration_profile,
             calibrate_assessment_context,

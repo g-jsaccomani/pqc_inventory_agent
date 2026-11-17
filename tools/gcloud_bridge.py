@@ -15,6 +15,7 @@ verb allowlisting/denylisting and shell-injection prevention.
 
 from __future__ import annotations
 
+import concurrent.futures
 import contextvars
 import datetime
 import json
@@ -328,14 +329,16 @@ def _ensure_user_connections_loaded() -> None:
         _persist_user_connections()
 
 
-def _persist_user_connections(changed_uid: Optional[str] = None) -> None:
-    """Persists ONLY non-secret connection settings per tenant (`/data/tenants/<uid>/connection.json`) and index."""
-    path = _get_user_connections_path()
+_BG_BRIDGE_IO = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="pqc-bridge-io")
+
+
+def _flush_user_connections_to_disk(
+    path: str,
+    serializable: Dict[str, Dict[str, Any]],
+    changed_uid: Optional[str] = None,
+) -> None:
     try:
-        serializable: Dict[str, Dict[str, Any]] = {}
-        for uid, cfg in _USER_CONNECTIONS.items():
-            clean_cfg = {key: cfg[key] for key in _PERSISTED_CONNECTION_KEYS if key in cfg}
-            serializable[uid] = clean_cfg
+        for uid, clean_cfg in serializable.items():
             if changed_uid is None or uid == changed_uid:
                 tenant_payload = dict(clean_cfg)
                 tenant_payload["user_id"] = uid
@@ -344,6 +347,18 @@ def _persist_user_connections(changed_uid: Optional[str] = None) -> None:
     except OSError:
         pass
 
+
+def _persist_user_connections(changed_uid: Optional[str] = None) -> None:
+    """Persists ONLY non-secret connection settings per tenant (`/data/tenants/<uid>/connection.json`) and index."""
+    path = _get_user_connections_path()
+    serializable: Dict[str, Dict[str, Any]] = {}
+    for uid, cfg in _USER_CONNECTIONS.items():
+        clean_cfg = {key: cfg[key] for key in _PERSISTED_CONNECTION_KEYS if key in cfg}
+        serializable[uid] = clean_cfg
+    if os.getenv("K_SERVICE"):
+        _BG_BRIDGE_IO.submit(_flush_user_connections_to_disk, path, serializable, changed_uid)
+    else:
+        _flush_user_connections_to_disk(path, serializable, changed_uid)
 
 
 def normalize_connection_mode(raw_mode: Optional[str]) -> str:
@@ -381,6 +396,7 @@ def set_gcp_connection_config(
     """
     with _LOCK:
         uid, target_state = _get_mutable_user_state(user_id)
+        before_snapshot = {k: target_state.get(k) for k in ("mode", "organization_id", "project_id", "location", "impersonated_service_account")}
         if mode is not None:
             target_state["mode"] = normalize_connection_mode(mode)
         if organization_id is not None and str(organization_id).strip():
@@ -404,9 +420,11 @@ def set_gcp_connection_config(
         for secret_key in _SECRET_CONNECTION_KEYS:
             target_state.pop(secret_key, None)
 
-        target_state["updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        _USER_CONNECTIONS[uid] = dict(target_state)
-        _persist_user_connections(changed_uid=uid)
+        after_snapshot = {k: target_state.get(k) for k in ("mode", "organization_id", "project_id", "location", "impersonated_service_account")}
+        if after_snapshot != before_snapshot or uid not in _USER_CONNECTIONS:
+            target_state["updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            _USER_CONNECTIONS[uid] = dict(target_state)
+            _persist_user_connections(changed_uid=uid)
         return get_gcp_connection_config(mask_token=True, user_id=uid)
 
 

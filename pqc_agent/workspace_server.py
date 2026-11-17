@@ -15,6 +15,7 @@ Guarantees implemented here:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextvars
 import datetime
 import hmac
@@ -65,6 +66,7 @@ from tools.gcloud_bridge import (
     execute_gcloud_command,
     get_gcp_connection_config,
     get_recent_gcloud_traces,
+    normalize_connection_mode,
     normalize_user_id,
     set_current_tenant_user,
     set_gcp_connection_config,
@@ -157,7 +159,9 @@ def _patched_db_session_init(self: DatabaseSessionService, db_url: str | None = 
                     cur.execute("PRAGMA busy_timeout=30000;")
                     if ":memory:" not in (db_url or ""):
                         cur.execute("PRAGMA journal_mode=WAL;")
-                    cur.execute("PRAGMA synchronous=NORMAL;")
+                    cur.execute("PRAGMA synchronous=OFF;")
+                    cur.execute("PRAGMA temp_store=MEMORY;")
+                    cur.execute("PRAGMA cache_size=-64000;")
                     cur.close()
                 except Exception:
                     pass
@@ -281,6 +285,9 @@ import subprocess as _subprocess
 import tempfile as _tempfile
 
 _STORAGE_LOCK = threading.RLock()
+_BG_STORAGE_IO = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="pqc-storage-io")
+_SESSION_METADATA_CACHE: Dict[str, Dict[str, Dict[str, Any]]] = {}
+_TENANT_USERS_CACHE: Dict[str, Dict[str, Dict[str, Any]]] = {}
 _FIRESTORE_CLIENT: Any = None
 _FIRESTORE_CHECKED = False
 
@@ -334,10 +341,11 @@ def _atomic_write_json(path: str, payload: Any) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
             f.flush()
-            try:
-                os.fsync(f.fileno())
-            except OSError:
-                pass
+            if not auth_guard.running_on_cloud_run():
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    pass
         os.replace(tmp_path, path)
     except Exception:
         try:
@@ -354,6 +362,10 @@ def _get_metadata_store_path() -> str:
 
 def _load_session_metadata_map() -> Dict[str, Dict[str, Any]]:
     with _STORAGE_LOCK:
+        cache_key = os.path.abspath(_get_data_dir())
+        cached = _SESSION_METADATA_CACHE.get(cache_key)
+        if cached is not None:
+            return {k: dict(v) for k, v in cached.items()}
         merged: Dict[str, Dict[str, Any]] = {}
         path = _get_metadata_store_path()
         if os.path.exists(path):
@@ -387,13 +399,18 @@ def _load_session_metadata_map() -> Dict[str, Dict[str, Any]]:
                             pass
             except OSError:
                 pass
-        return merged
+        _SESSION_METADATA_CACHE[cache_key] = {k: dict(v) for k, v in merged.items()}
+        return {k: dict(v) for k, v in merged.items()}
 
 
-def _save_session_metadata_map(meta_map: Dict[str, Dict[str, Any]], changed_session_id: Optional[str] = None) -> None:
+def _flush_session_metadata_to_disk(
+    meta_snapshot: Dict[str, Dict[str, Any]],
+    changed_session_id: Optional[str],
+    store_path: str,
+) -> None:
     with _STORAGE_LOCK:
         try:
-            for sid, sdata in meta_map.items():
+            for sid, sdata in meta_snapshot.items():
                 if not isinstance(sdata, dict):
                     continue
                 if changed_session_id is not None and sid != changed_session_id:
@@ -420,13 +437,28 @@ def _save_session_metadata_map(meta_map: Dict[str, Dict[str, Any]], changed_sess
                         )
                     except Exception:
                         pass
-            _atomic_write_json(_get_metadata_store_path(), meta_map)
+            _atomic_write_json(store_path, meta_snapshot)
         except OSError:
             pass
 
 
+def _save_session_metadata_map(meta_map: Dict[str, Dict[str, Any]], changed_session_id: Optional[str] = None) -> None:
+    with _STORAGE_LOCK:
+        cache_key = os.path.abspath(_get_data_dir())
+        snapshot = {k: dict(v) for k, v in meta_map.items() if isinstance(v, dict)}
+        _SESSION_METADATA_CACHE[cache_key] = snapshot
+        store_path = _get_metadata_store_path()
+        if auth_guard.running_on_cloud_run():
+            _BG_STORAGE_IO.submit(_flush_session_metadata_to_disk, snapshot, changed_session_id, store_path)
+        else:
+            _flush_session_metadata_to_disk(snapshot, changed_session_id, store_path)
+
+
 def _delete_partitioned_session_metadata(uid: str, session_id: str) -> None:
     with _STORAGE_LOCK:
+        cache_key = os.path.abspath(_get_data_dir())
+        if cache_key in _SESSION_METADATA_CACHE:
+            _SESSION_METADATA_CACHE[cache_key].pop(session_id, None)
         sess_path = os.path.join(
             _get_tenant_partition_dir(uid),
             "sessions",
@@ -462,6 +494,10 @@ def _get_tenant_users_path() -> str:
 
 def _load_tenant_users_map() -> Dict[str, Dict[str, Any]]:
     with _STORAGE_LOCK:
+        cache_key = os.path.abspath(_get_data_dir())
+        cached = _TENANT_USERS_CACHE.get(cache_key)
+        if cached is not None:
+            return {k: dict(v) for k, v in cached.items()}
         users_map: Dict[str, Dict[str, Any]] = {}
         path = _get_tenant_users_path()
         if os.path.exists(path):
@@ -491,13 +527,18 @@ def _load_tenant_users_map() -> Dict[str, Dict[str, Any]]:
                             pass
             except OSError:
                 pass
-        return users_map
+        _TENANT_USERS_CACHE[cache_key] = {k: dict(v) for k, v in users_map.items()}
+        return {k: dict(v) for k, v in users_map.items()}
 
 
-def _save_tenant_users_map(users_map: Dict[str, Dict[str, Any]], changed_uid: Optional[str] = None) -> None:
+def _flush_tenant_users_to_disk(
+    users_snapshot: Dict[str, Dict[str, Any]],
+    changed_uid: Optional[str],
+    users_path: str,
+) -> None:
     with _STORAGE_LOCK:
         try:
-            for uid, profile in users_map.items():
+            for uid, profile in users_snapshot.items():
                 if not isinstance(profile, dict):
                     continue
                 if changed_uid is not None and uid != changed_uid:
@@ -510,9 +551,21 @@ def _save_tenant_users_map(users_map: Dict[str, Dict[str, Any]], changed_uid: Op
                         fs_client.collection("pqc_tenants").document(uid).set(profile, merge=True)
                     except Exception:
                         pass
-            _atomic_write_json(_get_tenant_users_path(), users_map)
+            _atomic_write_json(users_path, users_snapshot)
         except OSError:
             pass
+
+
+def _save_tenant_users_map(users_map: Dict[str, Dict[str, Any]], changed_uid: Optional[str] = None) -> None:
+    with _STORAGE_LOCK:
+        cache_key = os.path.abspath(_get_data_dir())
+        snapshot = {k: dict(v) for k, v in users_map.items() if isinstance(v, dict)}
+        _TENANT_USERS_CACHE[cache_key] = snapshot
+        users_path = _get_tenant_users_path()
+        if auth_guard.running_on_cloud_run():
+            _BG_STORAGE_IO.submit(_flush_tenant_users_to_disk, snapshot, changed_uid, users_path)
+        else:
+            _flush_tenant_users_to_disk(snapshot, changed_uid, users_path)
 
 
 
@@ -868,11 +921,20 @@ def resolve_authenticated_tenant_from_request(request: Request) -> Tuple[Optiona
     if identity.source == "iap":
         existing = _load_tenant_users_map().get(identity.user_id, {})
         claims = identity.claims or {}
+        req_region = request.headers.get("X-PQC-User-Region")
+        req_tz = request.headers.get("X-PQC-User-Timezone")
+        if (
+            existing
+            and existing.get("auth_method") == "cloud_iap"
+            and (not req_region or req_region == existing.get("region"))
+            and (not req_tz or req_tz == existing.get("timezone"))
+        ):
+            return existing, True
         profile = upsert_tenant_user_profile(
             email=identity.email,
             name=existing.get("name") or claims.get("name"),
-            region=existing.get("region") or request.headers.get("X-PQC-User-Region"),
-            timezone_str=existing.get("timezone") or request.headers.get("X-PQC-User-Timezone"),
+            region=existing.get("region") or req_region,
+            timezone_str=existing.get("timezone") or req_tz,
             auth_method="cloud_iap",
             picture=existing.get("picture") or claims.get("picture"),
         )
@@ -1760,6 +1822,34 @@ def create_workspace_app(
         verify_models_on_startup = os.getenv("PQC_MODEL_VERIFICATION_ON_STARTUP", "true").strip().lower() == "true"
     if verify_models_on_startup:
         registry_obj.start_background_verification()
+
+        def _warm_inventory_cache() -> None:
+            try:
+                from tools.gcp_inventory import (
+                    DEFAULT_ORGANIZATION_ID,
+                    collect_kms_inventory,
+                    collect_workload_evidence,
+                    compute_pqc_scorecard,
+                    discover_all_crypto_assets,
+                )
+                from tools.pqc_detectors import collect_kms_import_jobs, collect_tls_policies
+
+                default_scope = f"organizations/{DEFAULT_ORGANIZATION_ID}"
+                with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+                    futs = [
+                        pool.submit(collect_kms_inventory, default_scope),
+                        pool.submit(collect_workload_evidence, default_scope),
+                        pool.submit(collect_tls_policies, default_scope),
+                        pool.submit(collect_kms_import_jobs, default_scope),
+                        pool.submit(discover_all_crypto_assets, default_scope),
+                    ]
+                    concurrent.futures.wait(futs, timeout=45)
+                compute_pqc_scorecard(default_scope)
+                logger.info("Pre-warmed live GCP PQC inventory cache for %s.", default_scope)
+            except Exception as exc:
+                logger.debug("Background inventory cache warm-up skipped: %s", exc)
+
+        threading.Thread(target=_warm_inventory_cache, name="pqc-inventory-warmup", daemon=True).start()
 
     telemetry_plugin = LlmCallTelemetryPlugin()
     oauth_3lo_plugin = PqcOAuth3LOPlugin()
@@ -2784,16 +2874,21 @@ async function saveClientId() {{
         meta_map = _load_session_metadata_map()
         items: List[Dict[str, Any]] = []
         for s in resp.sessions:
-            full_sess = await session_service.get_session(app_name=APP_NAME, user_id=s.user_id, session_id=s.id)
             extra = meta_map.get(s.id, {})
-            msgs, _ = _extract_messages_and_traces_from_session(full_sess or s, extra)
             state_dict = dict(getattr(s, "state", {}) or {})
-            title = (
-                extra.get("title")
-                or state_dict.get("title")
-                or next((m["content"][:72] for m in msgs if m.get("role") == "user" and m.get("content")), None)
-                or "PQC Readiness Assessment"
-            )
+            cached_title = extra.get("title") or state_dict.get("title")
+            if cached_title and "message_count" in extra:
+                title = cached_title
+                msg_count = int(extra.get("message_count") or 0)
+            else:
+                full_sess = await session_service.get_session(app_name=APP_NAME, user_id=s.user_id, session_id=s.id)
+                msgs, _ = _extract_messages_and_traces_from_session(full_sess or s, extra)
+                title = (
+                    cached_title
+                    or next((m["content"][:72] for m in msgs if m.get("role") == "user" and m.get("content")), None)
+                    or "PQC Readiness Assessment"
+                )
+                msg_count = len(msgs)
             upd_ts = getattr(s, "last_update_time", None) or time.time()
             iso_updated = extra.get("updated_at") or datetime.datetime.fromtimestamp(
                 float(upd_ts), tz=datetime.timezone.utc
@@ -2807,7 +2902,7 @@ async function saveClientId() {{
                     "created_at": extra.get("created_at") or iso_updated,
                     "updated_at": iso_updated,
                     "timestamp": float(upd_ts),
-                    "message_count": len(msgs),
+                    "message_count": msg_count,
                     "scope": extra.get("scope") or state_dict.get("scope", "organizations/31564119954"),
                 }
             )
@@ -2838,6 +2933,7 @@ async function saveClientId() {{
             "scope": scope,
             "created_at": now_iso,
             "updated_at": now_iso,
+            "message_count": 0,
             "attachments_by_turn": [],
             "turn_telemetry": {},
         }
@@ -3147,6 +3243,7 @@ async function saveClientId() {{
         sess_meta["scope"] = scope
         sess_meta["model_id"] = entry["id"]
         sess_meta["model_label"] = model_label
+        sess_meta["message_count"] = int(sess_meta.get("message_count") or 0) + (2 if assistant_text else 1)
         sess_meta.setdefault("attachments_by_turn", []).append(saved_artifacts_meta)
         if invocation_id:
             sess_meta.setdefault("turn_telemetry", {})[invocation_id] = {

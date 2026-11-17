@@ -47,7 +47,7 @@ REQUIRED_READ_ROLES = [
 
 # In-memory TTL cache so specialist agents can re-read the same evidence without repeating API calls.
 _SCAN_CACHE: Dict[str, Tuple[float, str]] = {}
-_CACHE_TTL_SECONDS = float(os.getenv("PQC_SCAN_CACHE_TTL_SECONDS", "300"))
+_CACHE_TTL_SECONDS = float(os.getenv("PQC_SCAN_CACHE_TTL_SECONDS", "1800"))
 
 # Explicit demo identifiers. Requesting one of these scopes returns the demo dataset (clearly labeled).
 SIMULATION_PROJECT_IDS = {
