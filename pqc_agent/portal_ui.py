@@ -2338,7 +2338,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       const emailHint = document.getElementById("auth-email-hint");
       const onCloudRunHost = (window.location.hostname || "").toLowerCase().endsWith(".run.app");
       if (oauthBtn) {
-        oauthBtn.style.display = (isCloudIapActive || onCloudRunHost || AUTH_CONFIG.gis_javascript_origin_enabled) ? "inline-flex" : "none";
+        oauthBtn.style.display = (isCloudIapActive || onCloudRunHost || AUTH_CONFIG.google_oauth_client_configured || AUTH_CONFIG.gis_javascript_origin_enabled) ? "inline-flex" : "none";
       }
       if (AUTH_CONFIG.allow_unverified_signin || isCloudIapActive || onCloudRunHost) {
         if (tokenBadge) tokenBadge.textContent = "(opcional — autenticado via Google Cloud IAP)";
@@ -2368,53 +2368,6 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       if (isCloudIapActive || onCloudRunHost) {
         window.location.href = "/?gcp-iap-mode=CLEAR_LOGIN_COOKIE";
         return;
-      }
-      if (
-        AUTH_CONFIG.gis_javascript_origin_enabled &&
-        AUTH_CONFIG.google_oauth_client_id &&
-        window.google &&
-        window.google.accounts &&
-        window.google.accounts.oauth2
-      ) {
-        try {
-          const tokenClient = window.google.accounts.oauth2.initTokenClient({
-            client_id: AUTH_CONFIG.google_oauth_client_id,
-            scope: "openid email profile",
-            prompt: "select_account",
-            callback: async (tokenResponse) => {
-              if (!tokenResponse || !tokenResponse.access_token) {
-                if (tokenResponse && tokenResponse.error) {
-                  showAuthError(`Google Sign-In error: ${tokenResponse.error}`);
-                }
-                return;
-              }
-              try {
-                const res = await fetch("/api/auth/google", {
-                  method: "POST",
-                  credentials: "same-origin",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({
-                    google_access_token: tokenResponse.access_token,
-                    region: selectedAuthRegion,
-                    timezone: detectBrowserTimezone(),
-                  }),
-                });
-                const data = await res.json().catch(() => ({}));
-                if (res.ok && data && data.authenticated) {
-                  await applySignInResult(data);
-                } else {
-                  openAuthModal((data && data.detail) || `Sign-in failed (HTTP ${res.status}).`);
-                }
-              } catch (err) {
-                openAuthModal(`Sign-in error: ${err}`);
-              }
-            },
-          });
-          tokenClient.requestAccessToken();
-          return;
-        } catch (e) {
-          console.warn("GIS initTokenClient fallback:", e);
-        }
       }
       if (AUTH_CONFIG.oauth_signin_url) {
         const signinUrl = `${AUTH_CONFIG.oauth_signin_url}?region=${encodeURIComponent(selectedAuthRegion)}&timezone=${encodeURIComponent(detectBrowserTimezone())}`;

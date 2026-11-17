@@ -656,7 +656,9 @@ def test_multi_tenant_google_auth_regional_sessions_and_isolated_connections(tmp
         assert alice_data["authenticated"] is True
         assert alice_data["user"]["email"] == "alice@google.com"
         assert alice_data["user"]["region"] == "NorthAm"
-        alice_token = alice_data["token"]
+        assert "token" not in alice_data
+        alice_token = alice_login.cookies.get("pqc_session_token")
+        assert alice_token
 
         rahul_login = client.post(
             "/api/auth/google",
@@ -665,7 +667,9 @@ def test_multi_tenant_google_auth_regional_sessions_and_isolated_connections(tmp
         assert rahul_login.status_code == 200
         rahul_data = rahul_login.json()
         assert rahul_data["user"]["region"] == "India"
-        rahul_token = rahul_data["token"]
+        assert "token" not in rahul_data
+        rahul_token = rahul_login.cookies.get("pqc_session_token")
+        assert rahul_token
 
         anna_login = client.post(
             "/api/auth/google",
@@ -673,7 +677,9 @@ def test_multi_tenant_google_auth_regional_sessions_and_isolated_connections(tmp
         )
         assert anna_login.status_code == 200
         assert anna_login.json()["user"]["region"] == "EMEA"
-        anna_token = anna_login.json()["token"]
+        assert "token" not in anna_login.json()
+        anna_token = anna_login.cookies.get("pqc_session_token")
+        assert anna_token
 
         kenji_login = client.post(
             "/api/auth/google",
@@ -681,7 +687,9 @@ def test_multi_tenant_google_auth_regional_sessions_and_isolated_connections(tmp
         )
         assert kenji_login.status_code == 200
         assert kenji_login.json()["user"]["region"] == "APAC"
-        kenji_token = kenji_login.json()["token"]
+        assert "token" not in kenji_login.json()
+        kenji_token = kenji_login.cookies.get("pqc_session_token")
+        assert kenji_token
 
         # 3. Isolated GCP Connection Config per @google.com user
         client.post(
@@ -976,7 +984,9 @@ def test_all_five_phases_and_connection_modes_through_chat_api(tmp_path, monkeyp
             json={"email": "jsaccomani@google.com", "name": "Joabson Saccomani", "region": "LATAM"},
         )
         assert auth_resp.status_code == 200
-        token = auth_resp.json()["token"]
+        assert "token" not in auth_resp.json()
+        token = auth_resp.cookies.get("pqc_session_token")
+        assert token
 
         for idx, mode in enumerate(["adc", "access_token", "impersonation", "adc", "access_token"]):
             sess = client.post(

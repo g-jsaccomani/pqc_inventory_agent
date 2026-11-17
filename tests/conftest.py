@@ -113,13 +113,25 @@ def google_verifier(monkeypatch):
     return calls
 
 
+@pytest.fixture(autouse=True)
+def _dispose_fallback_auth_stores():
+    yield
+    from pqc_agent import auth_store
+
+    auth_store.clear_fallback_auth_stores()
+
+
 @pytest.fixture
 def signin(google_verifier):
-    """`signin(client, email, **extra) -> session token` through POST /api/auth/google with a verified token."""
+    """`signin(client, email, **extra) -> session cookie value` through POST /api/auth/google with a verified token."""
 
     def _signin(client, email, **extra):
         resp = client.post("/api/auth/google", json={"google_access_token": f"valid:{email}", **extra})
         assert resp.status_code == 200, resp.text
-        return resp.json()["token"]
+        body = resp.json()
+        assert "token" not in body, "Session bearer token must never be serialized in JSON responses"
+        cookie_tok = resp.cookies.get("pqc_session_token") or client.cookies.get("pqc_session_token")
+        assert cookie_tok, "Expected HttpOnly pqc_session_token cookie to be set"
+        return cookie_tok
 
     return _signin

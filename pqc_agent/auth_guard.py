@@ -308,14 +308,16 @@ def _b64url_decode(data: str) -> bytes:
 
 
 def compute_pkce_challenge(code_verifier: str) -> str:
-    """Computes an RFC 7636 S256 PKCE ``code_challenge`` from ``code_verifier``."""
+    """Computes an RFC 7636 S256 PKCE ``code_challenge`` from ``code_verifier`` (43..128 ASCII chars)."""
+    if not code_verifier or not (43 <= len(code_verifier) <= 128):
+        raise ValueError("RFC 7636 PKCE code_verifier must be between 43 and 128 ASCII characters.")
     digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
     return _b64url_encode(digest)
 
 
 def generate_pkce_pair() -> Tuple[str, str]:
     """Generates a cryptographically random RFC 7636 PKCE ``(code_verifier, code_challenge)`` pair (S256)."""
-    verifier = secrets.token_urlsafe(48)
+    verifier = secrets.token_urlsafe(64)
     return verifier, compute_pkce_challenge(verifier)
 
 
@@ -514,6 +516,65 @@ def verify_iap_jwt(token: Optional[str], audience: Optional[str] = None) -> Opti
         _IAP_AUDIENCE_WARNING_EMITTED = True
         logger.warning("%s is not set: the IAP JWT audience is not checked (local dev only).", ENV_IAP_AUDIENCE)
     return dict(claims)
+
+
+def verify_google_oidc_id_token(
+    token: Optional[str],
+    *,
+    audiences: Sequence[str] = (),
+    expected_nonce: Optional[str] = None,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Cryptographically verifies a Google OpenID Connect ID token JWT (signature, iss, aud, exp, and nonce).
+
+    Uses ``google.oauth2.id_token.verify_oauth2_token`` against Google's OIDC JWKS certs (cached in-process).
+    """
+    if not token or google_id_token is None:
+        return None, "Google ID token verification is unavailable."
+    single_audience = audiences[0] if len(audiences) == 1 else None
+    try:
+        claims = google_id_token.verify_oauth2_token(
+            token,
+            _iap_transport(),
+            audience=single_audience,
+            clock_skew_in_seconds=60,
+        )
+    except TypeError:
+        try:
+            claims = google_id_token.verify_oauth2_token(
+                token,
+                _iap_transport(),
+                audience=single_audience,
+            )
+        except Exception as exc:
+            return None, f"Google ID token signature or claim verification failed: {exc}"
+    except Exception as exc:
+        return None, f"Google ID token signature or claim verification failed: {exc}"
+
+    if not isinstance(claims, Mapping):
+        return None, "Google ID token payload is malformed."
+    if claims.get("iss") not in ("accounts.google.com", "https://accounts.google.com"):
+        return None, "Google ID token has an unexpected issuer."
+    if audiences:
+        claim_aud = claims.get("aud")
+        aud_ok = (
+            claim_aud in audiences
+            if isinstance(claim_aud, str)
+            else (isinstance(claim_aud, (list, tuple)) and any(a in audiences for a in claim_aud))
+        )
+        if not aud_ok:
+            return None, "Google ID token was issued for a different OAuth client (audience mismatch)."
+    elif is_production_environment():
+        return None, "Google ID token rejected: no allowed OAuth client audience is configured in production."
+    try:
+        if int(claims.get("exp", 0)) < int(time.time()):
+            return None, "Google ID token has expired."
+    except (TypeError, ValueError):
+        return None, "Google ID token has an invalid exp claim."
+    if expected_nonce is not None:
+        claim_nonce = str(claims.get("nonce") or "")
+        if not claim_nonce or not hmac.compare_digest(claim_nonce.encode("utf-8"), expected_nonce.encode("utf-8")):
+            return None, "Google ID token nonce mismatch."
+    return dict(claims), None
 
 
 # =============================================================================
