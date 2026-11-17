@@ -28,16 +28,23 @@ LEGACY_CONSTANT_KEY = b"pqc-workspace-fallback-hmac-key-2026"
 @pytest.fixture(autouse=True)
 def _isolated_auth_state(tmp_path, monkeypatch):
     """Fresh data dir + clean auth env + empty in-memory connection/token stores for every test."""
+    from pqc_agent import workspace_server as ws
     from tools import gcloud_bridge
 
     monkeypatch.setenv("PQC_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("PQC_AUTH_SECRET", "test-only-256-bit-hmac-secret-key-0123456789abcdef")
     for name in (
         "K_SERVICE",
+        "PQC_PRODUCTION_MODE",
+        "PQC_ENV",
         "PQC_ALLOW_UNVERIFIED_SIGNIN",
         "PQC_ENABLE_ADK_API",
         "PQC_ENABLE_ADK_DEV_UI",
         "PQC_ALLOWED_ORIGINS",
         "PQC_IAP_AUDIENCE",
+        "PQC_REQUIRE_IAP_AUDIENCE",
+        "PQC_AUTH_SECRET_FILE",
+        "PQC_AUTH_SECRET_PREVIOUS",
         "PQC_ADMIN_EMAILS",
         "PQC_GOOGLE_ID_TOKEN_AUDIENCES",
         "GOOGLE_OAUTH_CLIENT_ID",
@@ -47,6 +54,9 @@ def _isolated_auth_state(tmp_path, monkeypatch):
     monkeypatch.setattr(gcloud_bridge, "_USER_CONNECTIONS", {})
     monkeypatch.setattr(gcloud_bridge, "_USER_ACCESS_TOKENS", {})
     monkeypatch.setattr(gcloud_bridge, "_USER_CONNECTIONS_LOADED", False)
+    monkeypatch.setattr(ws, "_AUTH_SECRET_CACHE", None)
+    monkeypatch.setattr(ws, "_AUTH_SECRET_CACHE_KEY", None)
+    monkeypatch.setattr(ws, "_REVOKED_SESSION_JTIS", {})
 
 
 def _registry():
@@ -720,3 +730,310 @@ def test_auto_signin_account_switcher_and_partitioned_tenant_storage(tmp_path, m
         assert sw_data["user"]["region"] == "LATAM"
         assert sw_data["connection"]["organization_id"] == "31564119954"
 
+
+# ---------------------------------------------------------------------------------------------------------------
+# Phase 1 - OAuth popup postMessage, PKCE, localStorage removal, CSRF, fixation, logout, fail-closed secrets & IAP
+# ---------------------------------------------------------------------------------------------------------------
+def test_phase1_no_wildcard_postmessage_and_popup_origin_source_and_credential_stripping(tmp_path, signin):
+    from pqc_agent import workspace_server as ws
+
+    # 1. No wildcard postMessage anywhere in server or UI source
+    for rel in ("pqc_agent/workspace_server.py", "pqc_agent/portal_ui.py"):
+        src = (REPO_ROOT / rel).read_text(encoding="utf-8")
+        assert "postMessage(msg, '*')" not in src
+        assert 'postMessage(msg, "*")' not in src
+
+    # 2. Popup result sanitizer strips all credentials and session tokens
+    sanitized = ws._sanitize_popup_postmessage_payload(
+        {
+            "authenticated": True,
+            "user_id": ALICE,
+            "token": "secret-session-token",
+            "csrf_token": "secret-csrf",
+            "access_token": "ya29.secret",
+            "id_token": "eyJ.secret",
+            "refresh_token": "1//secret",
+            "credential": "eyJ.cred",
+            "code": "4/code",
+            "nested": {"token": "nested-secret", "ok": True},
+        }
+    )
+    assert sanitized == {"authenticated": True, "user_id": ALICE, "nested": {"ok": True}}
+    html_popup = ws._oauth_popup_result_html("PQC_SIGNIN_COMPLETE", {"authenticated": True, "token": "secret-tok"}, "ok", True)
+    assert "secret-tok" not in html_popup
+
+    with TestClient(_app(tmp_path)) as client:
+        # 3. /api/auth/bridge rejects untrusted and wildcard origins, accepts same-origin, and never uses '*'
+        assert client.get("/api/auth/bridge", params={"origin": "https://evil.example.com"}).status_code == 400
+        assert client.get("/api/auth/bridge", params={"origin": "*"}).status_code == 400
+        ok_bridge = client.get("/api/auth/bridge", params={"origin": "http://testserver"})
+        assert ok_bridge.status_code == 200
+        assert "postMessage(msg, '*')" not in ok_bridge.text
+        assert "PQC_SIGNIN_COMPLETE" in ok_bridge.text
+
+        # 4. Portal UI message listener validates exact origin, expected WindowProxy source, and rejects credential payloads
+        portal_html = client.get("/").text
+        assert "event.origin !== window.location.origin" in portal_html
+        assert "!activeAuthPopupWindow || event.source !== activeAuthPopupWindow" in portal_html
+        assert "hasForbiddenPopupCredentialFields" in portal_html
+        assert "activeAuthPopupWindow = null;" in portal_html
+
+
+def test_phase1_oauth_pkce_oidc_nonce_expiry_and_redirect_uri_mismatch(tmp_path, monkeypatch):
+    import io
+    from urllib.parse import parse_qs, urlparse
+
+    from pqc_agent import auth_guard
+    from pqc_agent import workspace_server as ws
+
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_ID", "portal-client.apps.googleusercontent.com")
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_SECRET", "portal-client-secret")
+
+    exchanged_requests = []
+
+    class _FakeResp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        if url == "https://oauth2.googleapis.com/token":
+            body_params = parse_qs((req.data or b"").decode("utf-8"))
+            exchanged_requests.append(body_params)
+            return _FakeResp(
+                json.dumps({"access_token": "ya29.pkce-verified", "id_token": "jwt-from-code", "expires_in": 3599}).encode("utf-8")
+            )
+        if "id_token=" in url:
+            return _FakeResp(
+                json.dumps(
+                    {
+                        "iss": "https://accounts.google.com",
+                        "aud": "portal-client.apps.googleusercontent.com",
+                        "email": ALICE,
+                        "email_verified": "true",
+                        "exp": str(int(time.time()) + fake_urlopen.exp_offset),
+                        "nonce": fake_urlopen.expected_nonce,
+                    }
+                ).encode("utf-8")
+            )
+        raise AssertionError(f"Unexpected URL: {url}")
+
+    fake_urlopen.expected_nonce = ""
+    fake_urlopen.exp_offset = 600
+    monkeypatch.setattr(ws.urllib.request, "urlopen", fake_urlopen)
+
+    with TestClient(_app(tmp_path)) as client:
+        # 1. Open redirect / redirect_uri mismatch is rejected on signin and authorize
+        assert (
+            client.get("/api/auth/oauth/signin", params={"redirect_uri": "https://evil.example.com/cb"}, follow_redirects=False).status_code
+            == 400
+        )
+        alice_hdr = _hdr(ws.sign_tenant_session_token({"email": ALICE, "region": "NorthAm"}))
+        assert (
+            client.get(
+                "/api/auth/oauth/authorize",
+                headers=alice_hdr,
+                params={"redirect_uri": "https://evil.example.com/cb", "format": "json"},
+            ).status_code
+            == 400
+        )
+
+        # 2. /api/auth/oauth/signin includes PKCE S256 challenge and OIDC nonce, and callback verifies both
+        start = client.get("/api/auth/oauth/signin", params={"region": "NorthAm"}, follow_redirects=False)
+        assert start.status_code == 302
+        qs = parse_qs(urlparse(start.headers["location"]).query)
+        assert qs["response_type"] == ["code"]
+        assert qs["code_challenge_method"] == ["S256"]
+        state = qs["state"][0]
+        decoded_state = ws.verify_oauth_state(state)
+        assert decoded_state["code_verifier"]
+        assert auth_guard.compute_pkce_challenge(decoded_state["code_verifier"]) == qs["code_challenge"][0]
+        assert decoded_state["oidc_nonce"] == qs["nonce"][0]
+
+        # Mismatched redirect_uri on callback is rejected
+        bad_redir = client.get(
+            "/api/auth/oauth/callback",
+            params={"code": "auth-code-1", "state": state, "redirect_uri": "https://evil.example.com/cb"},
+        )
+        assert bad_redir.status_code == 400
+
+        # Issue a fresh signin state and test valid PKCE + OIDC nonce verification
+        start2 = client.get("/api/auth/oauth/signin", params={"region": "EMEA"}, follow_redirects=False)
+        qs2 = parse_qs(urlparse(start2.headers["location"]).query)
+        state2 = qs2["state"][0]
+        decoded_state2 = ws.verify_oauth_state(state2)
+        fake_urlopen.expected_nonce = decoded_state2["oidc_nonce"]
+
+        cb_ok = client.get("/api/auth/oauth/callback", params={"code": "auth-code-2", "state": state2})
+        assert cb_ok.status_code == 200
+        assert exchanged_requests and exchanged_requests[-1]["code_verifier"] == [decoded_state2["code_verifier"]]
+        # Popup HTML must NOT contain the session token or OAuth tokens
+        assert "ya29.pkce-verified" not in cb_ok.text
+        assert "jwt-from-code" not in cb_ok.text
+        assert '"token"' not in cb_ok.text
+
+        # 3. Wrong OIDC nonce and expired ID token are rejected
+        start3 = client.get("/api/auth/oauth/signin", follow_redirects=False)
+        state3 = parse_qs(urlparse(start3.headers["location"]).query)["state"][0]
+        fake_urlopen.expected_nonce = "wrong-oidc-nonce"
+        cb_bad_nonce = client.get("/api/auth/oauth/callback", params={"code": "auth-code-3", "state": state3})
+        assert cb_bad_nonce.status_code == 401
+
+        start4 = client.get("/api/auth/oauth/signin", follow_redirects=False)
+        state4 = parse_qs(urlparse(start4.headers["location"]).query)["state"][0]
+        decoded_state4 = ws.verify_oauth_state(state4)
+        fake_urlopen.expected_nonce = decoded_state4["oidc_nonce"]
+        fake_urlopen.exp_offset = -600
+        cb_expired = client.get("/api/auth/oauth/callback", params={"code": "auth-code-4", "state": state4})
+        assert cb_expired.status_code == 401
+
+
+
+def test_phase1_no_localstorage_session_token_exposure_and_cookie_flags(tmp_path, monkeypatch, google_verifier):
+    # 1. Verify no localStorage session token read/write in portal_ui.py or workspace_server.py
+    portal_src = (REPO_ROOT / "pqc_agent" / "portal_ui.py").read_text(encoding="utf-8")
+    server_src = (REPO_ROOT / "pqc_agent" / "workspace_server.py").read_text(encoding="utf-8")
+    assert 'localStorage.getItem("pqc_session_token")' not in portal_src
+    assert 'localStorage.setItem("pqc_session_token"' not in portal_src
+    assert "localStorage.getItem('pqc_session_token')" not in server_src
+    assert "localStorage.setItem('pqc_session_token'" not in server_src
+
+    # 2. Verify Secure, HttpOnly, SameSite=lax cookies on HTTPS / production requests
+    monkeypatch.setenv("K_SERVICE", "pqc-inventory-agent")
+    with TestClient(_app(tmp_path)) as client:
+        resp = client.post(
+            "/api/auth/google",
+            headers={"X-Forwarded-Proto": "https"},
+            json={"google_access_token": f"valid:{ALICE}"},
+        )
+        assert resp.status_code == 200
+        set_cookies = resp.headers.get_list("set-cookie") if hasattr(resp.headers, "get_list") else [resp.headers.get("set-cookie", "")]
+        joined = " ; ".join(set_cookies).lower()
+        assert "pqc_session_token=" in joined
+        assert "httponly" in joined
+        assert "samesite=lax" in joined
+        assert "secure" in joined
+        assert "pqc_csrf_token=" in joined
+        assert "pqc_account_jar=" in joined
+
+
+def test_phase1_csrf_protection_session_fixation_rotation_and_logout_revocation(tmp_path, google_verifier):
+    from pqc_agent import workspace_server as ws
+
+    with TestClient(_app(tmp_path)) as client:
+        # 1. Plant a pre-existing session cookie (fixation attempt) before signing in
+        planted_token = ws.sign_tenant_session_token({"email": BOB, "name": "Bob", "region": "NorthAm"})
+        client.cookies.set("pqc_session_token", planted_token)
+
+        login_resp = client.post(
+            "/api/auth/google",
+            headers={"X-PQC-Rotate-Session": "1"},
+            json={"google_access_token": f"valid:{ALICE}"},
+        )
+        assert login_resp.status_code == 200
+        alice_data = login_resp.json()
+        alice_token = alice_data["token"]
+        csrf_token = alice_data["csrf_token"]
+        assert alice_token != planted_token
+        # The pre-planted token was revoked during login rotation
+        assert ws.verify_tenant_session_token(planted_token) is None
+
+        # 2. Cookie-authenticated state-changing requests WITHOUT X-PQC-CSRF-Token are rejected with 403
+        assert client.post("/api/sessions", json={"title": "CSRF attempt"}).status_code == 403
+        assert client.post("/api/connection", json={"mode": "adc"}).status_code == 403
+        assert client.post("/api/gcloud", json={"command": "gcloud version"}).status_code == 403
+        assert client.post("/api/auth/logout").status_code == 403
+
+        # 3. Cross-origin or Sec-Fetch-Site: cross-site requests are rejected even if X-PQC-CSRF-Token is present
+        assert (
+            client.post(
+                "/api/sessions",
+                headers={"X-PQC-CSRF-Token": csrf_token, "Origin": "https://evil.example.com"},
+                json={"title": "Cross-origin"},
+            ).status_code
+            == 403
+        )
+        assert (
+            client.post(
+                "/api/sessions",
+                headers={"X-PQC-CSRF-Token": csrf_token, "Sec-Fetch-Site": "cross-site"},
+                json={"title": "Cross-site fetch"},
+            ).status_code
+            == 403
+        )
+
+        # 4. Same-origin cookie-authenticated request WITH valid X-PQC-CSRF-Token succeeds
+        ok_sess = client.post(
+            "/api/sessions",
+            headers={"X-PQC-CSRF-Token": csrf_token, "Origin": "http://testserver"},
+            json={"title": "Legitimate Session"},
+        )
+        assert ok_sess.status_code == 200
+
+        # 5. Logout revokes the session token server-side (cannot be reused via cookie OR X-PQC-User-Token header)
+        logout_resp = client.post("/api/auth/logout", headers={"X-PQC-CSRF-Token": csrf_token})
+        assert logout_resp.status_code == 200
+        assert ws.verify_tenant_session_token(alice_token) is None
+        assert client.get("/api/sessions", headers={"X-PQC-User-Token": alice_token}).status_code == 401
+        client.cookies.set("pqc_session_token", alice_token)
+        assert client.get("/api/sessions").status_code == 401
+
+
+def test_phase1_production_fail_closed_hmac_secret_rotation_and_iap_audience_enforcement(tmp_path, monkeypatch):
+    from pqc_agent import auth_guard
+    from pqc_agent import workspace_server as ws
+
+    # 1. Production fails closed when PQC_AUTH_SECRET is missing or too short (< 32 chars)
+    monkeypatch.setenv("K_SERVICE", "pqc-inventory-agent")
+    monkeypatch.delenv("PQC_AUTH_SECRET", raising=False)
+    monkeypatch.setattr(ws, "_AUTH_SECRET_CACHE", None)
+    with pytest.raises(RuntimeError, match="PQC_AUTH_SECRET"):
+        auth_guard.load_or_create_hmac_secret(str(tmp_path))
+    with pytest.raises(RuntimeError, match="PQC_AUTH_SECRET"):
+        ws._get_auth_secret()
+
+    monkeypatch.setenv("PQC_AUTH_SECRET", "short-secret")
+    monkeypatch.setattr(ws, "_AUTH_SECRET_CACHE", None)
+    with pytest.raises(RuntimeError, match="32 characters"):
+        auth_guard.load_or_create_hmac_secret(str(tmp_path))
+
+    # 2. Key rotation via PQC_AUTH_SECRET_PREVIOUS validates tokens signed with the previous secret
+    old_secret = "old-256-bit-hmac-secret-key-for-rotation-0123456789"
+    new_secret = "new-256-bit-hmac-secret-key-for-rotation-9876543210"
+    monkeypatch.setenv("PQC_AUTH_SECRET", old_secret)
+    monkeypatch.setattr(ws, "_AUTH_SECRET_CACHE", None)
+    old_token = ws.sign_tenant_session_token({"email": ALICE, "name": "Alice", "region": "NorthAm"})
+
+    monkeypatch.setenv("PQC_AUTH_SECRET", new_secret)
+    monkeypatch.setenv("PQC_AUTH_SECRET_PREVIOUS", old_secret)
+    monkeypatch.setattr(ws, "_AUTH_SECRET_CACHE", None)
+    assert ws.verify_tenant_session_token(old_token)["email"] == ALICE
+
+    # 3. Cloud IAP audience enforcement in production: missing or wrong audience is rejected
+    claims = {
+        "iss": auth_guard.IAP_ISSUER,
+        "email": ALICE,
+        "sub": "accounts.google.com:123",
+        "aud": "/projects/110254026096/locations/us-central1/services/agentic-pqc",
+        "exp": int(time.time()) + 600,
+    }
+    monkeypatch.setattr(auth_guard.google_id_token, "verify_token", lambda tok, req, audience=None, certs_url=None, **kw: dict(claims))
+
+    # Missing PQC_IAP_AUDIENCE in production (K_SERVICE set) -> rejected (None)
+    monkeypatch.delenv("PQC_IAP_AUDIENCE", raising=False)
+    assert auth_guard.verify_iap_jwt("iap-jwt") is None
+
+    # Wrong PQC_IAP_AUDIENCE -> rejected (None)
+    monkeypatch.setenv("PQC_IAP_AUDIENCE", "/projects/999/locations/us-central1/services/other-app")
+    assert auth_guard.verify_iap_jwt("iap-jwt") is None
+
+    # Exact matching PQC_IAP_AUDIENCE -> accepted
+    monkeypatch.setenv("PQC_IAP_AUDIENCE", "/projects/110254026096/locations/us-central1/services/agentic-pqc")
+    assert auth_guard.verify_iap_jwt("iap-jwt")["email"] == ALICE
+
+    # Expired IAP JWT -> rejected (None)
+    claims["exp"] = int(time.time()) - 120
+    assert auth_guard.verify_iap_jwt("iap-jwt") is None

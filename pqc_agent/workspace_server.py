@@ -18,6 +18,7 @@ import asyncio
 import concurrent.futures
 import contextvars
 import datetime
+import hashlib
 import hmac
 import html
 import json
@@ -31,7 +32,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
@@ -570,20 +571,113 @@ def _save_tenant_users_map(users_map: Dict[str, Dict[str, Any]], changed_uid: Op
 
 
 _AUTH_SECRET_CACHE: Optional[bytes] = None
+_AUTH_SECRET_CACHE_KEY: Optional[Tuple[str, ...]] = None
+_REVOKED_SESSION_JTIS: Dict[str, float] = {}
+_REVOKED_LOCK = threading.Lock()
+_ACTIVE_PKCE_VERIFIER: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("pqc_active_pkce_verifier", default=None)
+_ACTIVE_OIDC_NONCE: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("pqc_active_oidc_nonce", default=None)
+ACCOUNT_JAR_COOKIE_NAME = "pqc_account_jar"
+
+
+def _current_secret_env_key() -> Tuple[str, ...]:
+    return (
+        os.getenv(auth_guard.ENV_AUTH_SECRET, ""),
+        os.getenv(auth_guard.ENV_AUTH_SECRET_FILE, ""),
+        os.getenv("K_SERVICE", ""),
+        os.getenv(auth_guard.ENV_PRODUCTION_MODE, ""),
+        os.getenv("PQC_ENV", ""),
+        os.getenv("PQC_DATA_DIR", ""),
+    )
 
 
 def _get_auth_secret() -> bytes:
-    """Returns the HMAC key for session tokens and OAuth state: `PQC_AUTH_SECRET` > persisted random key on the data
-    dir > ephemeral random key (with a warning). There is no constant fallback key."""
-    global _AUTH_SECRET_CACHE
-    if _AUTH_SECRET_CACHE is not None:
+    """Returns the HMAC key for session tokens and OAuth state.
+
+    In production (Cloud Run / `PQC_PRODUCTION_MODE=true`), fails closed if `PQC_AUTH_SECRET` is missing or < 32 chars.
+    """
+    global _AUTH_SECRET_CACHE, _AUTH_SECRET_CACHE_KEY
+    env_key = _current_secret_env_key()
+    if _AUTH_SECRET_CACHE is not None and _AUTH_SECRET_CACHE_KEY == env_key:
         return _AUTH_SECRET_CACHE
     try:
         data_dir: Optional[str] = _get_data_dir()
     except OSError:
         data_dir = None
     _AUTH_SECRET_CACHE = auth_guard.load_or_create_hmac_secret(data_dir)
+    _AUTH_SECRET_CACHE_KEY = env_key
     return _AUTH_SECRET_CACHE
+
+
+def _get_revoked_tokens_path() -> str:
+    return os.path.join(_get_data_dir(), "pqc_revoked_tokens.json")
+
+
+def _load_revoked_tokens_unlocked() -> None:
+    now = time.time()
+    path = _get_revoked_tokens_path()
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                for k, exp_ts in raw.items():
+                    if isinstance(exp_ts, (int, float)) and float(exp_ts) > now:
+                        _REVOKED_SESSION_JTIS[str(k)] = float(exp_ts)
+        except Exception:
+            pass
+    for k, exp_ts in list(_REVOKED_SESSION_JTIS.items()):
+        if exp_ts <= now:
+            del _REVOKED_SESSION_JTIS[k]
+
+
+def _persist_revoked_tokens_unlocked() -> None:
+    try:
+        _atomic_write_json(_get_revoked_tokens_path(), _REVOKED_SESSION_JTIS)
+    except OSError:
+        pass
+
+
+def _token_revocation_keys(decoded: Optional[Mapping[str, Any]], raw_token: Optional[str]) -> List[str]:
+    keys: List[str] = []
+    if decoded and decoded.get("jti"):
+        keys.append(f"jti:{decoded['jti']}")
+    if raw_token:
+        clean = str(raw_token).strip()
+        if clean.lower().startswith("bearer "):
+            clean = clean[7:].strip()
+        if clean:
+            digest = hashlib.sha256(clean.encode("utf-8")).hexdigest()
+            keys.append(f"tok:{digest}")
+    return keys
+
+
+def revoke_tenant_session_token(token: Optional[str]) -> None:
+    """Revokes a signed session token server-side so it cannot be reused via cookie or header after logout/rotation."""
+    if not token:
+        return
+    try:
+        decoded = auth_guard.verify_signed_payload(token, _get_auth_secret(), expected_type=SESSION_TOKEN_TYPE)
+    except Exception:
+        decoded = None
+    exp_ts = float((decoded or {}).get("exp") or (time.time() + SESSION_TOKEN_TTL_SECONDS))
+    keys = _token_revocation_keys(decoded, token)
+    if not keys:
+        return
+    with _REVOKED_LOCK:
+        _load_revoked_tokens_unlocked()
+        for k in keys:
+            _REVOKED_SESSION_JTIS[k] = exp_ts
+        _persist_revoked_tokens_unlocked()
+
+
+def is_tenant_session_token_revoked(decoded: Mapping[str, Any], raw_token: Optional[str] = None) -> bool:
+    keys = _token_revocation_keys(decoded, raw_token)
+    if not keys:
+        return False
+    now = time.time()
+    with _REVOKED_LOCK:
+        _load_revoked_tokens_unlocked()
+        return any(_REVOKED_SESSION_JTIS.get(k, 0.0) > now for k in keys)
 
 
 def infer_region_from_timezone(timezone_str: Optional[str] = None, explicit_region: Optional[str] = None) -> str:
@@ -656,7 +750,7 @@ def _format_display_name(email: str, provided_name: Optional[str] = None) -> str
 
 
 def sign_tenant_session_token(user_profile: Dict[str, Any]) -> str:
-    """Creates an HMAC-SHA256 signed session token encoding the authenticated @google.com user profile."""
+    """Creates an HMAC-SHA256 signed session token encoding the authenticated @google.com user profile and a unique jti."""
     now_ts = int(time.time())
     payload = {
         "uid": normalize_user_id(user_profile["email"]),
@@ -665,6 +759,7 @@ def sign_tenant_session_token(user_profile: Dict[str, Any]) -> str:
         "picture": user_profile.get("picture") or "",
         "region": user_profile.get("region") or "NorthAm",
         "auth_method": user_profile.get("auth_method") or "google_workspace_signin",
+        "jti": str(user_profile.get("jti") or secrets.token_urlsafe(16)),
         "typ": SESSION_TOKEN_TYPE,
         "iat": now_ts,
         "exp": now_ts + SESSION_TOKEN_TTL_SECONDS,
@@ -673,9 +768,11 @@ def sign_tenant_session_token(user_profile: Dict[str, Any]) -> str:
 
 
 def verify_tenant_session_token(token: Optional[str]) -> Optional[Dict[str, Any]]:
-    """Verifies an HMAC-SHA256 signed session token (`typ` = session, unexpired, allowed corporate domain)."""
+    """Verifies an HMAC-SHA256 signed session token (`typ` = session, unexpired, unrevoked, allowed corporate domain)."""
     decoded = auth_guard.verify_signed_payload(token, _get_auth_secret(), expected_type=SESSION_TOKEN_TYPE)
     if not decoded:
+        return None
+    if is_tenant_session_token_revoked(decoded, token):
         return None
     email = normalize_user_id(decoded.get("email") or decoded.get("uid"))
     ok, _ = is_allowed_corporate_email(email)
@@ -715,12 +812,15 @@ def _accepted_id_token_audiences() -> Tuple[str, ...]:
 def _verify_google_oauth_or_id_token(
     id_token_jwt: Optional[str] = None,
     google_access_token: Optional[str] = None,
+    expected_nonce: Optional[str] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """Verifies a Google ID token (JWT) or a Google OAuth access token with Google's tokeninfo endpoint.
 
     Returns `({"email", "email_verified": True, ...}, None)` only for a VERIFIED email in `ALLOWED_AUTH_DOMAINS`;
-    ID tokens must come from accounts.google.com and, when OAuth client IDs are configured, carry one of them as `aud`.
+    ID tokens must come from accounts.google.com, must not be expired, must match `expected_nonce` when bound to an
+    OIDC state, and, when OAuth client IDs are configured, must carry one of them as `aud`.
     """
+    active_nonce = expected_nonce if expected_nonce is not None else _ACTIVE_OIDC_NONCE.get()
     if id_token_jwt:
         tok = id_token_jwt.strip()
         try:
@@ -733,6 +833,14 @@ def _verify_google_oauth_or_id_token(
             audiences = _accepted_id_token_audiences()
             if audiences and info.get("aud") not in audiences:
                 return None, "Google ID token was issued for a different OAuth client (audience mismatch)."
+            if "exp" in info:
+                try:
+                    if int(info["exp"]) < int(time.time()):
+                        return None, "Google ID token has expired."
+                except (TypeError, ValueError):
+                    return None, "Google ID token has an invalid exp claim."
+            if active_nonce and info.get("nonce") != active_nonce:
+                return None, "Google ID token nonce mismatch."
             raw_email = str(info.get("email") or "").strip()
             if not raw_email or not _is_true_claim(info.get("email_verified")):
                 return None, "Google ID token does not contain a verified email address."
@@ -760,6 +868,12 @@ def _verify_google_oauth_or_id_token(
             req = urllib.request.Request(url, headers={"Accept": "application/json"})
             with urllib.request.urlopen(req, timeout=8) as resp:
                 info = json.loads(resp.read().decode("utf-8"))
+            if "expires_in" in info:
+                try:
+                    if int(info["expires_in"]) <= 0:
+                        return None, "Google access token has expired."
+                except (TypeError, ValueError):
+                    pass
             raw_email = str(info.get("email") or "").strip()
             if not raw_email:
                 return None, (
@@ -815,10 +929,10 @@ def _verify_google_oauth_or_id_token(
 
 
 def _try_workstation_auto_gcloud_token() -> Optional[str]:
-    """On a corporate workstation (not Cloud Run), checks if `gcloud auth print-access-token` yields a valid token."""
-    if auth_guard.running_on_cloud_run():
+    """On a local developer workstation only when explicitly opted in via `PQC_AUTO_WORKSTATION_GCLOUD_AUTH=true`."""
+    if auth_guard.is_production_environment():
         return None
-    if auth_guard.env_flag("PQC_AUTO_WORKSTATION_GCLOUD_AUTH") is False:
+    if auth_guard.env_flag("PQC_AUTO_WORKSTATION_GCLOUD_AUTH") is not True:
         return None
     if "PYTEST_CURRENT_TEST" in os.environ and os.getenv("PQC_ENABLE_AUTO_GCLOUD_IN_TESTS") != "1":
         return None
@@ -913,6 +1027,47 @@ def resolve_request_identity(conn: Any) -> Optional[auth_guard.AuthenticatedIden
     return _IDENTITY_RESOLVER.resolve(conn)
 
 
+def _request_origin(request: Request) -> str:
+    proto = (request.headers.get("x-forwarded-proto") or request.url.scheme or "http").split(",")[0].strip().lower()
+    host = (request.headers.get("host") or request.url.netloc or "").strip().lower()
+    return f"{proto}://{host}" if host else ""
+
+
+def _enforce_csrf_and_origin(
+    request: Request,
+    identity: Optional[auth_guard.AuthenticatedIdentity],
+    *,
+    require_csrf_for_cookie: bool = True,
+) -> None:
+    """Enforces same-origin / allowed-CORS origin checks and session-bound CSRF token verification on state-changing requests."""
+    if request.method.upper() not in ("POST", "PUT", "PATCH", "DELETE"):
+        return
+    allowed = set(o.lower() for o in (auth_guard.allowed_cors_origins() or []))
+    own_origin = _request_origin(request)
+    if own_origin:
+        allowed.add(own_origin)
+
+    sec_fetch_site = (request.headers.get("sec-fetch-site") or "").strip().lower()
+    origin_hdr = (request.headers.get("origin") or "").strip().rstrip("/").lower()
+    referer_hdr = (request.headers.get("referer") or "").strip()
+
+    if sec_fetch_site == "cross-site" and (not origin_hdr or origin_hdr not in allowed):
+        raise HTTPException(status_code=403, detail=auth_guard.CSRF_REJECTED_DETAIL)
+    if origin_hdr and allowed and origin_hdr not in allowed:
+        raise HTTPException(status_code=403, detail=auth_guard.CSRF_REJECTED_DETAIL)
+    if not origin_hdr and referer_hdr and allowed:
+        parsed_ref = urllib.parse.urlparse(referer_hdr)
+        if parsed_ref.scheme and parsed_ref.netloc:
+            ref_origin = f"{parsed_ref.scheme.lower()}://{parsed_ref.netloc.lower()}"
+            if ref_origin not in allowed:
+                raise HTTPException(status_code=403, detail=auth_guard.CSRF_REJECTED_DETAIL)
+
+    if require_csrf_for_cookie and identity is not None and identity.auth_transport == "cookie":
+        csrf_hdr = request.headers.get(auth_guard.CSRF_HEADER_NAME)
+        if not auth_guard.verify_csrf_token(csrf_hdr, identity.raw_token, _get_auth_secret()):
+            raise HTTPException(status_code=403, detail=auth_guard.CSRF_REJECTED_DETAIL)
+
+
 def resolve_authenticated_tenant_from_request(request: Request) -> Tuple[Optional[Dict[str, Any]], bool]:
     """Returns `(tenant_profile_or_None, iap_active)` for the request's authenticated identity (if any)."""
     identity = resolve_request_identity(request)
@@ -955,10 +1110,11 @@ def activate_request_tenant_user(request: Request, explicit_user_id: Optional[st
     """Returns the authenticated user_id for a tenant-scoped request and binds it to the tenant `ContextVar`.
 
     The authenticated identity is the ONLY source of the user id: HTTP 401 without one, HTTP 403 when an explicit
-    `user_id` parameter names somebody else. `X-PQC-User-Id` is ignored entirely.
+    `user_id` parameter names somebody else or when CSRF/origin verification fails. `X-PQC-User-Id` is ignored.
     """
     identity = resolve_request_identity(request)
     uid = auth_guard.bind_user_id(identity, explicit_user_id, normalize_user_id=normalize_user_id)
+    _enforce_csrf_and_origin(request, identity)
     set_current_tenant_user(uid)
     return uid
 
@@ -1454,19 +1610,25 @@ def _validate_oauth_state_for_request(request: Request, state_value: Optional[st
     return decoded
 
 
-def _exchange_oauth_code(code: str, redirect_uri: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """Exchanges an OAuth authorization code server-side (the token is never embedded in an HTML page)."""
+def _exchange_oauth_code(
+    code: str,
+    redirect_uri: str,
+    code_verifier: Optional[str] = None,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Exchanges an OAuth authorization code server-side with PKCE `code_verifier` (tokens never touch HTML)."""
     oauth_cfg = load_oauth_client_config()
+    effective_verifier = (code_verifier if code_verifier is not None else _ACTIVE_PKCE_VERIFIER.get()) or ""
     try:
-        form_data = urllib.parse.urlencode(
-            {
-                "code": code,
-                "client_id": oauth_cfg.get("client_id", ""),
-                "client_secret": oauth_cfg.get("client_secret", ""),
-                "redirect_uri": redirect_uri,
-                "grant_type": "authorization_code",
-            }
-        ).encode("utf-8")
+        form_params: Dict[str, str] = {
+            "code": code,
+            "client_id": oauth_cfg.get("client_id", ""),
+            "client_secret": oauth_cfg.get("client_secret", ""),
+            "redirect_uri": redirect_uri,
+            "grant_type": "authorization_code",
+        }
+        if effective_verifier:
+            form_params["code_verifier"] = effective_verifier
+        form_data = urllib.parse.urlencode(form_params).encode("utf-8")
         req = urllib.request.Request(
             oauth_cfg["token_endpoint"],
             data=form_data,
@@ -1490,17 +1652,45 @@ def _bind_delegated_gcp_token(uid: str, access_token: str, expires_in: Optional[
     return set_gcp_connection_config(mode="access_token", access_token=access_token, user_id=uid, access_token_expires_in=ttl)
 
 
-def _oauth_popup_result_html(message_type: str, payload: Dict[str, Any], message: str, ok: bool) -> str:
-    """Small popup page that reports an OAuth result to the opener (same origin only) and closes itself."""
+_FORBIDDEN_POPUP_PAYLOAD_KEYS = frozenset({
+    "token",
+    "csrf_token",
+    "access_token",
+    "google_access_token",
+    "id_token",
+    "refresh_token",
+    "credential",
+    "code",
+    "client_secret",
+    "code_verifier",
+})
+
+
+def _sanitize_popup_postmessage_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    """Strips all credentials, tokens, and secrets so popup `postMessage` communicates completion status only."""
+    cleaned: Dict[str, Any] = {}
+    for k, v in (payload or {}).items():
+        if str(k).lower() in _FORBIDDEN_POPUP_PAYLOAD_KEYS:
+            continue
+        if isinstance(v, Mapping):
+            cleaned[k] = _sanitize_popup_postmessage_payload(v)
+        else:
+            cleaned[k] = v
+    return cleaned
+
+
+def _oauth_popup_result_html(message_type: str, payload: Mapping[str, Any], message: str, ok: bool) -> str:
+    """Small popup page that reports an OAuth completion status to the opener (same origin only, no credentials)."""
     color = "#81c995" if ok else "#f87171"
     close_js = "setTimeout(function () { window.close(); }, 400);" if ok else ""
+    safe_payload = _sanitize_popup_postmessage_payload(payload)
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>PQC Workspace - Google authorization</title></head>
 <body style="background:#0b0f17;color:#e2e8f0;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;">
 <div id="msg" style="color:{color};max-width:480px;text-align:center;line-height:1.5;">{html.escape(message)}</div>
 <script>
 (function () {{
-  var payload = {_js_literal(payload)};
+  var payload = {_js_literal(safe_payload)};
   if (window.opener) {{
     window.opener.postMessage({{ type: {_js_literal(message_type)}, payload: payload }}, window.location.origin);
     {close_js}
@@ -1510,7 +1700,8 @@ def _oauth_popup_result_html(message_type: str, payload: Dict[str, Any], message
 
 
 # Implicit OAuth flow (no client secret configured): Google returns the token and `state` in the URL fragment, which
-# only the browser sees. This static page forwards both to the API (state verified server-side) and reports back.
+# only the browser sees. This static page forwards both to the API (state verified server-side) and reports completion
+# (never tokens/credentials) to the same-origin opener.
 _OAUTH_IMPLICIT_CALLBACK_HTML = """<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>PQC Workspace - completing Google authorization</title></head>
 <body style="background:#0b0f17;color:#e2e8f0;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;">
@@ -1531,11 +1722,27 @@ _OAUTH_IMPLICIT_CALLBACK_HTML = """<!DOCTYPE html>
   } catch (e) { statePayload = {}; }
   var mode = statePayload.mode === 'signin' ? 'signin' : '3lo';
   var type = mode === 'signin' ? 'PQC_SIGNIN_COMPLETE' : 'PQC_OAUTH_3LO_AUTHORIZED';
+  function getCookie(name) {
+    var match = document.cookie.match(new RegExp('(?:^|; )' + name.replace(/([.$?*|{}()\\[\\]\\\\/+^])/g, '\\\\$1') + '=([^;]*)'));
+    return match ? decodeURIComponent(match[1]) : '';
+  }
+  function sanitizeCompletionPayload(raw) {
+    var copy = Object.assign({}, raw || {});
+    delete copy.token;
+    delete copy.csrf_token;
+    delete copy.access_token;
+    delete copy.google_access_token;
+    delete copy.id_token;
+    delete copy.refresh_token;
+    delete copy.credential;
+    delete copy.code;
+    return copy;
+  }
   function finish(ok, payload, text) {
     msg.textContent = text;
     msg.style.color = ok ? '#81c995' : '#f87171';
     if (window.opener) {
-      window.opener.postMessage({ type: type, payload: payload }, window.location.origin);
+      window.opener.postMessage({ type: type, payload: sanitizeCompletionPayload(payload) }, window.location.origin);
       if (ok) { setTimeout(function () { window.close(); }, 400); }
     }
   }
@@ -1544,8 +1751,8 @@ _OAUTH_IMPLICIT_CALLBACK_HTML = """<!DOCTYPE html>
     return;
   }
   var headers = { 'Content-Type': 'application/json' };
-  var sessionToken = localStorage.getItem('pqc_session_token');
-  if (sessionToken && mode !== 'signin') { headers['X-PQC-User-Token'] = sessionToken; }
+  var csrfToken = getCookie('pqc_csrf_token');
+  if (csrfToken) { headers['X-PQC-CSRF-Token'] = csrfToken; }
   var url = mode === 'signin' ? '/api/auth/google' : '/api/auth/tool-consent';
   var body = mode === 'signin'
     ? { google_access_token: accessToken, oauth_state: state, region: statePayload.region || undefined, timezone: statePayload.timezone || undefined, use_token_for_gcp_connection: false }
@@ -1917,18 +2124,70 @@ def create_workspace_app(
         )
 
     def _is_https(request: Request) -> bool:
+        if auth_guard.is_production_environment():
+            return True
         return (request.headers.get("x-forwarded-proto") or request.url.scheme).split(",")[0].strip() == "https"
 
-    def _set_session_cookie(resp: Any, request: Request, token: str) -> None:
+    def _load_account_jar(request: Request) -> Dict[str, str]:
+        raw = request.cookies.get(ACCOUNT_JAR_COOKIE_NAME)
+        if not raw:
+            return {}
+        decoded = auth_guard.verify_signed_payload(raw, _get_auth_secret(), expected_type="account_jar")
+        if not decoded or not isinstance(decoded.get("accounts"), dict):
+            return {}
+        return {normalize_user_id(k): str(v) for k, v in decoded["accounts"].items() if k and v}
+
+    def _save_account_jar(resp: Any, request: Request, jar: Dict[str, str]) -> None:
+        now_ts = int(time.time())
+        clean_jar = {normalize_user_id(k): str(v) for idx, (k, v) in enumerate(jar.items()) if k and v and idx < 5}
+        signed_jar = auth_guard.sign_payload(
+            {"typ": "account_jar", "accounts": clean_jar, "iat": now_ts, "exp": now_ts + SESSION_TOKEN_TTL_SECONDS},
+            _get_auth_secret(),
+        )
+        resp.set_cookie(
+            key=ACCOUNT_JAR_COOKIE_NAME,
+            value=signed_jar,
+            max_age=SESSION_TOKEN_TTL_SECONDS,
+            httponly=True,
+            samesite="lax",
+            secure=_is_https(request),
+            path="/api/auth",
+        )
+
+    def _set_session_cookie(resp: Any, request: Request, token: str, *, rotate_previous: bool = True) -> None:
+        decoded = verify_tenant_session_token(token)
+        if rotate_previous:
+            prev_cookie = request.cookies.get(SESSION_COOKIE_NAME)
+            if prev_cookie and prev_cookie != token:
+                prev_decoded = verify_tenant_session_token(prev_cookie)
+                # Revoke unauthenticated/invalid pre-planted cookies or explicit rotation requests;
+                # preserve valid tokens of other accounts in the multi-account switcher jar.
+                if prev_decoded is None or request.headers.get("X-PQC-Rotate-Session") == "1":
+                    revoke_tenant_session_token(prev_cookie)
+        sec = _is_https(request)
         resp.set_cookie(
             key=SESSION_COOKIE_NAME,
             value=token,
             max_age=SESSION_TOKEN_TTL_SECONDS,
             httponly=True,
             samesite="lax",
-            secure=_is_https(request),
+            secure=sec,
             path="/",
         )
+        csrf_token = auth_guard.derive_csrf_token(token, _get_auth_secret())
+        resp.set_cookie(
+            key=auth_guard.CSRF_COOKIE_NAME,
+            value=csrf_token,
+            max_age=SESSION_TOKEN_TTL_SECONDS,
+            httponly=False,
+            samesite="lax",
+            secure=sec,
+            path="/",
+        )
+        if decoded and decoded.get("email"):
+            jar = _load_account_jar(request)
+            jar[normalize_user_id(decoded["email"])] = token
+            _save_account_jar(resp, request, jar)
 
     def _set_oauth_nonce_cookie(resp: Any, request: Request, nonce: str) -> None:
         # Binds the OAuth `state` to this browser (login-CSRF / token-injection protection).
@@ -1947,11 +2206,26 @@ def create_workspace_app(
         host = request.headers.get("host") or request.url.netloc
         return f"{proto}://{host}/api/auth/oauth/callback"
 
+    def _allowed_popup_origins(request: Request) -> List[str]:
+        origins: List[str] = []
+        own = _request_origin(request)
+        if own:
+            origins.append(own)
+        for item in auth_guard.allowed_cors_origins() or []:
+            if item.lower() not in origins:
+                origins.append(item.lower())
+        for item in (os.getenv("PQC_BRIDGE_ALLOWED_ORIGINS") or "").split(","):
+            clean = item.strip().rstrip("/").lower()
+            if clean and "*" not in clean and clean.startswith(("https://", "http://")) and clean not in origins:
+                origins.append(clean)
+        return origins
+
     def _require_identity(request: Request, explicit_user_id: Optional[str] = None) -> auth_guard.AuthenticatedIdentity:
-        """401 without an authenticated identity, 403 if `explicit_user_id` names someone else; binds the tenant."""
+        """401 without an authenticated identity, 403 if `explicit_user_id` names someone else or CSRF fails."""
         identity = resolve_request_identity(request)
         auth_guard.bind_user_id(identity, explicit_user_id, normalize_user_id=normalize_user_id)
         assert identity is not None
+        _enforce_csrf_and_origin(request, identity)
         set_current_tenant_user(identity.user_id)
         return identity
 
@@ -1996,12 +2270,14 @@ def create_workspace_app(
         if gcp_access_token:
             _bind_delegated_gcp_token(uid, gcp_access_token, gcp_access_token_expires_in)
         signed_token = sign_tenant_session_token(profile)
+        csrf_token = auth_guard.derive_csrf_token(signed_token, _get_auth_secret())
         sess_resp = await session_service.list_sessions(app_name=APP_NAME, user_id=uid)
         content = {
             "authenticated": True,
             "user": profile,
             "user_id": uid,
             "token": signed_token,
+            "csrf_token": csrf_token,
             "session_count": len(sess_resp.sessions),
             "connection": get_gcp_connection_config(mask_token=True, user_id=uid),
             "supported_regions": SUPPORTED_REGIONS,
@@ -2070,15 +2346,21 @@ def create_workspace_app(
         return _auth_config_payload()
 
     @app.get("/api/auth/me")
-    async def auth_me(request: Request) -> Dict[str, Any]:
+    async def auth_me(request: Request) -> JSONResponse:
+        identity = resolve_request_identity(request)
         profile, iap_active = resolve_authenticated_tenant_from_request(request)
         uid = profile["user_id"] if profile else None
         conn: Optional[Dict[str, Any]] = None
         session_count = 0
         signed_token: Optional[str] = None
+        csrf_token: Optional[str] = None
         if uid and profile:
             set_current_tenant_user(uid)
-            signed_token = sign_tenant_session_token(profile)
+            if identity and identity.source == "session_token" and identity.raw_token:
+                signed_token = identity.raw_token
+            else:
+                signed_token = sign_tenant_session_token(profile)
+            csrf_token = auth_guard.derive_csrf_token(signed_token, _get_auth_secret())
             conn = get_gcp_connection_config(mask_token=True, user_id=uid)
             if conn.get("mode") == "access_token" and not conn.get("has_access_token") and _is_builtin_demo_scope(None, conn):
                 conn = set_gcp_connection_config(mode="adc", user_id=uid)
@@ -2088,23 +2370,37 @@ def create_workspace_app(
             except Exception:
                 session_count = 0
         cfg = _auth_config_payload()
-        return {
-            "authenticated": profile is not None,
-            "iap_active": iap_active,
-            "google_oauth_client_id": cfg["google_oauth_client_id"],
-            "google_oauth_client_configured": cfg["google_oauth_client_configured"],
-            "gis_javascript_origin_enabled": cfg["gis_javascript_origin_enabled"],
-            "allow_unverified_signin": cfg["allow_unverified_signin"],
-            "oauth_3lo_enabled": True,
-            "oauth_scopes": list(GCP_OAUTH_SCOPES),
-            "allowed_domains": list(ALLOWED_AUTH_DOMAINS),
-            "supported_regions": SUPPORTED_REGIONS,
-            "user": profile,
-            "user_id": uid,
-            "token": signed_token,
-            "session_count": session_count,
-            "connection": conn,
-        }
+        resp = JSONResponse(
+            content={
+                "authenticated": profile is not None,
+                "iap_active": iap_active,
+                "google_oauth_client_id": cfg["google_oauth_client_id"],
+                "google_oauth_client_configured": cfg["google_oauth_client_configured"],
+                "gis_javascript_origin_enabled": cfg["gis_javascript_origin_enabled"],
+                "allow_unverified_signin": cfg["allow_unverified_signin"],
+                "oauth_3lo_enabled": True,
+                "oauth_scopes": list(GCP_OAUTH_SCOPES),
+                "allowed_domains": list(ALLOWED_AUTH_DOMAINS),
+                "supported_regions": SUPPORTED_REGIONS,
+                "user": profile,
+                "user_id": uid,
+                "token": signed_token,
+                "csrf_token": csrf_token,
+                "session_count": session_count,
+                "connection": conn,
+            }
+        )
+        if signed_token and csrf_token:
+            resp.set_cookie(
+                key=auth_guard.CSRF_COOKIE_NAME,
+                value=csrf_token,
+                max_age=SESSION_TOKEN_TTL_SECONDS,
+                httponly=False,
+                samesite="lax",
+                secure=_is_https(request),
+                path="/",
+            )
+        return resp
 
     @app.post("/api/auth/google")
     async def auth_google_signin(request: Request, payload: GoogleAuthSignInPayload) -> JSONResponse:
@@ -2115,6 +2411,7 @@ def create_workspace_app(
         session identity on the request. The email must belong to ALLOWED_AUTH_DOMAINS (403 otherwise). Email-only
         sign-in without a verified identity returns 401 unless PQC_ALLOW_UNVERIFIED_SIGNIN=true (local dev only).
         """
+        st: Optional[Dict[str, Any]] = None
         if payload.oauth_state is not None:
             st = _validate_oauth_state_for_request(request, payload.oauth_state)
             if not st or st.get("mode") != "signin":
@@ -2125,8 +2422,19 @@ def create_workspace_app(
             access_tok = access_tok[7:].strip() or None
         expires_in: Optional[Any] = None
         existing_identity = resolve_request_identity(request)
+        _enforce_csrf_and_origin(
+            request,
+            existing_identity,
+            require_csrf_for_cookie=bool(
+                existing_identity is not None and not id_jwt and not access_tok and payload.oauth_state is None
+            ),
+        )
         if id_jwt or access_tok:
-            verified_info, err_msg = await asyncio.to_thread(_verify_google_oauth_or_id_token, id_jwt, access_tok)
+            nonce_token = _ACTIVE_OIDC_NONCE.set((st or {}).get("oidc_nonce"))
+            try:
+                verified_info, err_msg = await asyncio.to_thread(_verify_google_oauth_or_id_token, id_jwt, access_tok)
+            finally:
+                _ACTIVE_OIDC_NONCE.reset(nonce_token)
             status_code, email_or_err = _validated_google_identity(verified_info, err_msg)
             if status_code != 200:
                 raise HTTPException(status_code=status_code, detail=email_or_err)
@@ -2175,28 +2483,43 @@ def create_workspace_app(
             gcp_access_token_expires_in=expires_in,
         )
         resp = JSONResponse(content=content)
-        _set_session_cookie(resp, request, signed_token)
+        _set_session_cookie(resp, request, signed_token, rotate_previous=True)
         return resp
 
     @app.post("/api/auth/logout")
     async def auth_logout(request: Request) -> JSONResponse:
         identity = resolve_request_identity(request)
+        _enforce_csrf_and_origin(request, identity)
+        cookie_tok = request.cookies.get(SESSION_COOKIE_NAME)
+        if cookie_tok:
+            revoke_tenant_session_token(cookie_tok)
         if identity is not None:
+            if identity.raw_token and identity.source == "session_token":
+                revoke_tenant_session_token(identity.raw_token)
             clear_user_access_token(identity.user_id)
         resp = JSONResponse(content={"authenticated": False, "status": "logged_out"})
         resp.delete_cookie(key=SESSION_COOKIE_NAME, path="/")
+        resp.delete_cookie(key=auth_guard.CSRF_COOKIE_NAME, path="/")
+        if identity is not None:
+            jar = _load_account_jar(request)
+            if identity.user_id in jar:
+                del jar[identity.user_id]
+                _save_account_jar(resp, request, jar)
         return resp
 
     @app.post("/api/auth/auto")
     async def auth_auto_signin(request: Request) -> JSONResponse:
-        """Automatic zero-typing sign-in: restores an existing verified session/IAP identity or, on a corporate
-        workstation, automatically verifies the active `gcloud` corporate identity with Google (`tokeninfo` + `userinfo`).
+        """Automatic zero-typing sign-in: restores an existing verified session/IAP identity or, on a local
+        workstation when `PQC_AUTO_WORKSTATION_GCLOUD_AUTH=true`, verifies the active `gcloud` identity with Google.
         """
+        identity = resolve_request_identity(request)
+        _enforce_csrf_and_origin(request, identity, require_csrf_for_cookie=False)
         profile, iap_active = resolve_authenticated_tenant_from_request(request)
         if profile is not None:
             uid = profile["user_id"]
             set_current_tenant_user(uid)
             signed_token = sign_tenant_session_token(profile)
+            csrf_token = auth_guard.derive_csrf_token(signed_token, _get_auth_secret())
             conn = get_gcp_connection_config(mask_token=True, user_id=uid)
             if conn.get("mode") == "access_token" and not conn.get("has_access_token") and _is_builtin_demo_scope(None, conn):
                 conn = set_gcp_connection_config(mode="adc", user_id=uid)
@@ -2208,12 +2531,13 @@ def create_workspace_app(
                     "user": profile,
                     "user_id": uid,
                     "token": signed_token,
+                    "csrf_token": csrf_token,
                     "session_count": len(sess_resp.sessions),
                     "connection": conn,
                     "supported_regions": SUPPORTED_REGIONS,
                 }
             )
-            _set_session_cookie(resp, request, signed_token)
+            _set_session_cookie(resp, request, signed_token, rotate_previous=True)
             return resp
 
         auto_tok = await asyncio.to_thread(_try_workstation_auto_gcloud_token)
@@ -2230,22 +2554,27 @@ def create_workspace_app(
                     picture=verified_info.get("picture", ""),
                 )
                 resp = JSONResponse(content=content)
-                _set_session_cookie(resp, request, signed_token)
+                _set_session_cookie(resp, request, signed_token, rotate_previous=True)
                 return resp
 
         return JSONResponse(status_code=200, content={"authenticated": False})
 
     @app.post("/api/auth/switch")
     async def auth_switch_account(request: Request) -> JSONResponse:
-        """Switches the active browser session between verified Google accounts stored in the Gemini Account Switcher."""
+        """Switches the active browser session between verified Google accounts stored in the HttpOnly Account Jar."""
         try:
             body = await request.json()
         except Exception:
             body = {}
+        identity = resolve_request_identity(request)
         candidate_token = str((body or {}).get("token") or "").strip()
+        target_email_req = normalize_user_id((body or {}).get("email") or "")
+        _enforce_csrf_and_origin(request, identity, require_csrf_for_cookie=not bool(candidate_token))
+        if not candidate_token and target_email_req:
+            jar = _load_account_jar(request)
+            candidate_token = jar.get(target_email_req, "")
         decoded = verify_tenant_session_token(candidate_token) if candidate_token else None
         if not decoded:
-            identity = resolve_request_identity(request)
             if identity and identity.source == "iap":
                 existing = _load_tenant_users_map().get(identity.user_id, {})
                 decoded = {
@@ -2256,6 +2585,8 @@ def create_workspace_app(
                     "auth_method": "cloud_iap",
                     "picture": existing.get("picture"),
                 }
+            elif identity and (not target_email_req or target_email_req == identity.email):
+                decoded = dict(identity.claims or {"email": identity.email, "uid": identity.user_id})
             else:
                 raise HTTPException(status_code=401, detail="Saved account session has expired. Please sign in again.")
         email = normalize_user_id(decoded.get("email") or decoded.get("uid"))
@@ -2270,20 +2601,21 @@ def create_workspace_app(
         uid = profile["user_id"]
         set_current_tenant_user(uid)
         fresh_token = sign_tenant_session_token(profile)
+        csrf_token = auth_guard.derive_csrf_token(fresh_token, _get_auth_secret())
         sess_resp = await session_service.list_sessions(app_name=APP_NAME, user_id=uid)
         content = {
             "authenticated": True,
             "user": profile,
             "user_id": uid,
             "token": fresh_token,
+            "csrf_token": csrf_token,
             "session_count": len(sess_resp.sessions),
             "connection": get_gcp_connection_config(mask_token=True, user_id=uid),
             "supported_regions": SUPPORTED_REGIONS,
         }
         resp = JSONResponse(content=content)
-        _set_session_cookie(resp, request, fresh_token)
+        _set_session_cookie(resp, request, fresh_token, rotate_previous=False)
         return resp
-
 
     @app.get("/api/auth/tenants")
     async def list_registered_tenants(request: Request) -> Dict[str, Any]:
@@ -2336,17 +2668,20 @@ def create_workspace_app(
         origin: Optional[str] = Query(default=None),
         target_origin: Optional[str] = Query(default=None),
     ) -> HTMLResponse:
-        """Public Verified Google Identity Bridge popup for canonical agentic-*.run.app origins."""
-        import re as _re
-
-        raw_origin = (origin or target_origin or "").strip().rstrip("/")
-        if not _re.match(
-            r"^(https://[a-z0-9-]+(\.[a-z0-9-]+)*\.run\.app|https://[a-z0-9-]+\.jsaccomani\.altostrat\.com|http://(localhost|127\.0\.0\.1)(:\d+)?)$",
-            raw_origin,
-        ):
-            raw_origin = "https://agentic-pqc-110254026096.us-central1.run.app"
+        """Public Verified Google Identity Bridge popup for allowlisted origins only (no wildcard postMessage)."""
+        allowed_origins = _allowed_popup_origins(request)
+        raw_origin = (origin or target_origin or "").strip().rstrip("/").lower()
+        if raw_origin:
+            if raw_origin not in allowed_origins:
+                return HTMLResponse(
+                    status_code=400,
+                    content="<!DOCTYPE html><html><body>Untrusted popup origin.</body></html>",
+                )
+            resolved_origin = raw_origin
+        else:
+            resolved_origin = _request_origin(request)
         oauth_cfg = load_oauth_client_config()
-        client_id = oauth_cfg.get("client_id", "") or "110254026096-f16ns988ibh6v3ku6rjj9i4ib17t4p9b.apps.googleusercontent.com"
+        client_id = oauth_cfg.get("client_id", "")
         bridge_html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2376,14 +2711,30 @@ def create_workspace_app(
   <div id="errBox" class="err"></div>
 </div>
 <script>
-const TARGET_ORIGIN = {_js_literal(raw_origin)};
+const TARGET_ORIGIN = {_js_literal(resolved_origin)};
 const CLIENT_ID = {_js_literal(client_id)};
-function sendToOpener(payload) {{
-  const msg = Object.assign({{ type: 'AGENTIC_GOOGLE_AUTH' }}, payload);
-  if (window.opener) {{
-    try {{ window.opener.postMessage(msg, TARGET_ORIGIN); }} catch (e) {{}}
-    try {{ window.opener.postMessage(msg, '*'); }} catch (e) {{}}
-    setTimeout(() => window.close(), 150);
+async function completeServerSignIn(authPayload) {{
+  try {{
+    const res = await fetch('/api/auth/google', {{
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify(authPayload)
+    }});
+    const data = await res.json().catch(() => ({{}}));
+    if (!res.ok || !data.authenticated) {{
+      showErr((data && data.detail) || ('Sign-in failed (HTTP ' + res.status + ').'));
+      return;
+    }}
+    if (window.opener && TARGET_ORIGIN) {{
+      window.opener.postMessage(
+        {{ type: 'PQC_SIGNIN_COMPLETE', payload: {{ authenticated: true, status: 'OK', user_id: data.user_id }} }},
+        TARGET_ORIGIN
+      );
+      setTimeout(() => window.close(), 150);
+    }}
+  }} catch (e) {{
+    showErr('Sign-in error: ' + e);
   }}
 }}
 function showErr(m) {{
@@ -2402,7 +2753,7 @@ function openChooser() {{
     prompt: 'select_account',
     callback: (resp) => {{
       if (resp && resp.access_token) {{
-        sendToOpener({{ access_token: resp.access_token }});
+        completeServerSignIn({{ google_access_token: resp.access_token }});
       }} else if (resp && resp.error) {{
         showErr('Google OAuth: ' + resp.error);
       }}
@@ -2418,7 +2769,7 @@ window.addEventListener('load', () => {{
         client_id: CLIENT_ID,
         callback: (resp) => {{
           if (resp && resp.credential) {{
-            sendToOpener({{ credential: resp.credential }});
+            completeServerSignIn({{ credential: resp.credential }});
           }}
         }},
         auto_select: true,
@@ -2448,8 +2799,12 @@ window.addEventListener('load', () => {{
         request: Request,
         region: Optional[str] = Query(default=None),
         timezone: Optional[str] = Query(default=None),
+        redirect_uri: Optional[str] = Query(default=None),
     ) -> Any:
-        """Public: starts 'Sign in with Google' (OpenID Connect, popup) when an OAuth client is configured."""
+        """Public: starts 'Sign in with Google' (OpenID Connect + PKCE, popup) when an OAuth client is configured."""
+        cb_uri = _oauth_callback_uri(request)
+        if redirect_uri and redirect_uri.strip() != cb_uri:
+            raise HTTPException(status_code=400, detail="Redirect URI mismatch: open redirects are not permitted.")
         oauth_cfg = load_oauth_client_config()
         client_id = oauth_cfg.get("client_id", "")
         if not client_id:
@@ -2464,13 +2819,28 @@ window.addEventListener('load', () => {{
                 ),
             )
         nonce = secrets.token_urlsafe(16)
-        state = sign_oauth_state({"mode": "signin", "nonce": nonce, "region": region or "", "timezone": timezone or ""})
+        oidc_nonce = secrets.token_urlsafe(24)
+        code_verifier, code_challenge = auth_guard.generate_pkce_pair()
+        state = sign_oauth_state(
+            {
+                "mode": "signin",
+                "nonce": nonce,
+                "oidc_nonce": oidc_nonce,
+                "code_verifier": code_verifier,
+                "redirect_uri": cb_uri,
+                "region": region or "",
+                "timezone": timezone or "",
+            }
+        )
         params = {
             "client_id": client_id,
-            "redirect_uri": _oauth_callback_uri(request),
+            "redirect_uri": cb_uri,
             "response_type": "code" if oauth_cfg.get("client_secret") else "token",
             "scope": "openid email profile",
             "state": state,
+            "nonce": oidc_nonce,
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
             "prompt": "select_account",
         }
         resp = RedirectResponse(url=f"{oauth_cfg['authorization_endpoint']}?{urllib.parse.urlencode(params)}", status_code=302)
@@ -2489,19 +2859,31 @@ window.addEventListener('load', () => {{
         """Initiates the 3-Legged OAuth 2.0 (3LO) flow for Google Cloud APIs on behalf of the SIGNED-IN user.
 
         - Requires an authenticated identity (401) and `user_id`, if given, must be that identity (403).
-        - The OAuth `state` is HMAC-signed, expires in 10 minutes, is single use and bound to this browser (nonce
-          cookie). `redirect_uri` is ignored: the callback is always this service's `/api/auth/oauth/callback`.
-        - `format=json` returns the authorization URL; `direct=1` redirects to Google; otherwise renders a popup.
+        - The OAuth `state` is HMAC-signed, expires in 10 minutes, is single use, includes PKCE `code_verifier`, and
+          is bound to this browser (`pqc_oauth_nonce` cookie) and exact `redirect_uri`.
         """
         uid = activate_request_tenant_user(request, explicit_user_id=user_id)
+        cb_uri = _oauth_callback_uri(request)
+        if redirect_uri and redirect_uri.strip() != cb_uri:
+            raise HTTPException(status_code=400, detail="Redirect URI mismatch: open redirects are not permitted.")
         oauth_cfg = load_oauth_client_config()
         client_id = oauth_cfg.get("client_id", "")
         has_secret = bool(oauth_cfg.get("client_secret"))
-        cb_uri = _oauth_callback_uri(request)
         target_scope = scope or "organizations/31564119954"
         nonce = secrets.token_urlsafe(16)
+        oidc_nonce = secrets.token_urlsafe(24)
+        code_verifier, code_challenge = auth_guard.generate_pkce_pair()
         encoded_state = sign_oauth_state(
-            {"mode": "3lo", "uid": uid, "session_id": session_id or "", "target_scope": target_scope, "nonce": nonce}
+            {
+                "mode": "3lo",
+                "uid": uid,
+                "session_id": session_id or "",
+                "target_scope": target_scope,
+                "nonce": nonce,
+                "oidc_nonce": oidc_nonce,
+                "code_verifier": code_verifier,
+                "redirect_uri": cb_uri,
+            }
         )
 
         google_auth_url = ""
@@ -2514,6 +2896,9 @@ window.addEventListener('load', () => {{
                 "include_granted_scopes": "true",
                 "prompt": "consent",
                 "state": encoded_state,
+                "nonce": oidc_nonce,
+                "code_challenge": code_challenge,
+                "code_challenge_method": "S256",
             }
             if has_secret:
                 params["access_type"] = "online"
@@ -2533,6 +2918,7 @@ window.addEventListener('load', () => {{
                     "scopes": list(GCP_OAUTH_SCOPES),
                     "google_auth_url": google_auth_url,
                     "state": encoded_state,
+                    "code_challenge_method": "S256",
                 }
             )
             _set_oauth_nonce_cookie(json_resp, request, nonce)
@@ -2609,11 +2995,25 @@ window.addEventListener('load', () => {{
 const PQC_SESSION_ID = {_js_literal(session_id or "")};
 const PQC_TARGET_SCOPE = {_js_literal(target_scope)};
 const PQC_CLIENT_ID = {_js_literal(client_id or "")};
+function getCookie(name) {{
+  const match = document.cookie.match(new RegExp('(?:^|; )' + name.replace(/([.$?*|{{}}()\\[\\]\\\\/+^])/g, '\\\\$1') + '=([^;]*)'));
+  return match ? decodeURIComponent(match[1]) : '';
+}}
 function pqcAuthHeaders() {{
   const headers = {{ 'Content-Type': 'application/json' }};
-  const sessionToken = localStorage.getItem('pqc_session_token');
-  if (sessionToken) headers['X-PQC-User-Token'] = sessionToken;
+  const csrfToken = getCookie('pqc_csrf_token');
+  if (csrfToken) headers['X-PQC-CSRF-Token'] = csrfToken;
   return headers;
+}}
+function sanitizePopupData(raw) {{
+  const copy = Object.assign({{}}, raw || {{}});
+  delete copy.token;
+  delete copy.csrf_token;
+  delete copy.access_token;
+  delete copy.id_token;
+  delete copy.refresh_token;
+  delete copy.credential;
+  return copy;
 }}
 function showError(message) {{
   const err = document.getElementById('errBox');
@@ -2652,7 +3052,7 @@ async function switchToAdcMode() {{
     const conn = await res.json();
     if (!res.ok) throw new Error(conn.detail || 'Failed to switch to ADC.');
     if (window.opener) {{
-      window.opener.postMessage({{ type: 'PQC_OAUTH_3LO_AUTHORIZED', payload: {{ status: 'AUTHORIZED', connection: conn }} }}, window.location.origin);
+      window.opener.postMessage({{ type: 'PQC_OAUTH_3LO_AUTHORIZED', payload: {{ status: 'AUTHORIZED', connection: sanitizePopupData(conn) }} }}, window.location.origin);
       window.close();
     }} else {{
       window.location.href = '/';
@@ -2675,7 +3075,7 @@ async function submitConsent() {{
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || 'Consent authorization failed.');
     if (window.opener) {{
-      window.opener.postMessage({{ type: 'PQC_OAUTH_3LO_AUTHORIZED', payload: data }}, window.location.origin);
+      window.opener.postMessage({{ type: 'PQC_OAUTH_3LO_AUTHORIZED', payload: sanitizePopupData(data) }}, window.location.origin);
       window.close();
     }} else {{
       window.location.href = '/';
@@ -2714,13 +3114,13 @@ async function saveClientId() {{
         code: Optional[str] = Query(default=None),
         state: Optional[str] = Query(default=None),
         error: Optional[str] = Query(default=None),
+        redirect_uri: Optional[str] = Query(default=None),
     ) -> HTMLResponse:
         """Public OAuth redirect target for both 'Sign in with Google' and 3LO consent.
 
-        The signed `state` is mandatory (HMAC, `typ`, 10 min expiry, single use, nonce cookie of this browser). Codes
-        are exchanged server-side and tokens are never embedded in the returned page. Implicit-flow results (token in
-        the URL fragment) are forwarded by the browser to `/api/auth/google` or `/api/auth/tool-consent`, which verify
-        the same state.
+        The signed `state` is mandatory (HMAC, `typ`, 10 min expiry, single use, nonce cookie of this browser, PKCE
+        `code_verifier`, and exact `redirect_uri`). Codes are exchanged server-side and tokens are never embedded in
+        the returned page or `postMessage`.
         """
         hinted = verify_oauth_state(state) or {}
         message_type = "PQC_SIGNIN_COMPLETE" if hinted.get("mode") == "signin" else "PQC_OAUTH_3LO_AUTHORIZED"
@@ -2748,7 +3148,24 @@ async function saveClientId() {{
                     ok=False,
                 ),
             )
-        tok_data, exchange_err = await asyncio.to_thread(_exchange_oauth_code, code, _oauth_callback_uri(request))
+        expected_cb_uri = _oauth_callback_uri(request)
+        if (redirect_uri and redirect_uri.strip() != expected_cb_uri) or (
+            st.get("redirect_uri") and st.get("redirect_uri") != expected_cb_uri
+        ):
+            return HTMLResponse(
+                status_code=400,
+                content=_oauth_popup_result_html(
+                    message_type,
+                    {"authenticated": False, "status": "REDIRECT_URI_MISMATCH"},
+                    "Redirect URI mismatch. Close this window and start again from the portal.",
+                    ok=False,
+                ),
+            )
+        pkce_ctx = _ACTIVE_PKCE_VERIFIER.set(st.get("code_verifier"))
+        try:
+            tok_data, exchange_err = await asyncio.to_thread(_exchange_oauth_code, code, expected_cb_uri)
+        finally:
+            _ACTIVE_PKCE_VERIFIER.reset(pkce_ctx)
         if not tok_data:
             return HTMLResponse(
                 status_code=502,
@@ -2759,9 +3176,13 @@ async function saveClientId() {{
 
         if st.get("mode") == "signin":
             id_tok = tok_data.get("id_token")
-            verified_info, err_msg = await asyncio.to_thread(
-                _verify_google_oauth_or_id_token, id_tok, None if id_tok else tok_data.get("access_token")
-            )
+            nonce_ctx = _ACTIVE_OIDC_NONCE.set(st.get("oidc_nonce"))
+            try:
+                verified_info, err_msg = await asyncio.to_thread(
+                    _verify_google_oauth_or_id_token, id_tok, None if id_tok else tok_data.get("access_token")
+                )
+            finally:
+                _ACTIVE_OIDC_NONCE.reset(nonce_ctx)
             status_code, email_or_err = _validated_google_identity(verified_info, err_msg)
             if status_code != 200 or verified_info is None:
                 return HTMLResponse(
@@ -2781,7 +3202,7 @@ async function saveClientId() {{
             signin_resp = HTMLResponse(
                 content=_oauth_popup_result_html(message_type, content, "Signed in. You can close this window.", ok=True)
             )
-            _set_session_cookie(signin_resp, request, signed_token)
+            _set_session_cookie(signin_resp, request, signed_token, rotate_previous=True)
             signin_resp.delete_cookie(key=OAUTH_NONCE_COOKIE_NAME, path="/api/auth")
             return signin_resp
 

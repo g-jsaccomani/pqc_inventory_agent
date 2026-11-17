@@ -86,9 +86,15 @@ ENV_ENABLE_ADK_API = "PQC_ENABLE_ADK_API"
 ENV_ENABLE_ADK_DEV_UI = "PQC_ENABLE_ADK_DEV_UI"
 ENV_ALLOWED_ORIGINS = "PQC_ALLOWED_ORIGINS"
 ENV_IAP_AUDIENCE = "PQC_IAP_AUDIENCE"
+ENV_REQUIRE_IAP_AUDIENCE = "PQC_REQUIRE_IAP_AUDIENCE"
 ENV_AUTH_SECRET = "PQC_AUTH_SECRET"
+ENV_AUTH_SECRET_FILE = "PQC_AUTH_SECRET_FILE"
+ENV_AUTH_SECRET_PREVIOUS = "PQC_AUTH_SECRET_PREVIOUS"
+ENV_PRODUCTION_MODE = "PQC_PRODUCTION_MODE"
 ENV_ADMIN_EMAILS = "PQC_ADMIN_EMAILS"
 AUTH_SECRET_FILENAME = ".pqc_auth_secret"
+CSRF_COOKIE_NAME = "pqc_csrf_token"
+CSRF_HEADER_NAME = "X-PQC-CSRF-Token"
 
 IAP_JWT_HEADER = "X-Goog-IAP-JWT-Assertion"
 IAP_ISSUER = "https://cloud.google.com/iap"
@@ -101,6 +107,9 @@ UNAUTHENTICATED_DETAIL = (
 USER_MISMATCH_DETAIL = (
     "Forbidden: the requested user_id does not match the authenticated identity. Requests can only act on the "
     "signed-in user's own data."
+)
+CSRF_REJECTED_DETAIL = (
+    "Forbidden: CSRF verification failed (missing or invalid X-PQC-CSRF-Token or untrusted cross-origin request)."
 )
 
 _TRUE_VALUES = ("true", "1", "yes")
@@ -123,6 +132,15 @@ def env_flag(name: str) -> Optional[bool]:
 def running_on_cloud_run() -> bool:
     """True when running on Cloud Run (the platform always sets ``K_SERVICE``)."""
     return bool(os.getenv("K_SERVICE"))
+
+
+def is_production_environment() -> bool:
+    """True when running on Cloud Run (``K_SERVICE``) or when ``PQC_PRODUCTION_MODE=true`` / ``PQC_ENV=production``."""
+    if env_flag(ENV_PRODUCTION_MODE) is True:
+        return True
+    if (os.getenv("PQC_ENV") or "").strip().lower() in ("prod", "production"):
+        return True
+    return running_on_cloud_run()
 
 
 def adk_dev_ui_enabled() -> bool:
@@ -151,7 +169,12 @@ def adk_api_enabled() -> bool:
 
 
 def allow_unverified_signin() -> bool:
-    """Development-only escape hatch that re-enables email-only sign-in (``PQC_ALLOW_UNVERIFIED_SIGNIN=true``)."""
+    """Development-only escape hatch that re-enables email-only sign-in (``PQC_ALLOW_UNVERIFIED_SIGNIN=true``).
+
+    Never permitted in production (Cloud Run / ``PQC_PRODUCTION_MODE=true``).
+    """
+    if is_production_environment():
+        return False
     return env_flag(ENV_ALLOW_UNVERIFIED_SIGNIN) is True
 
 
@@ -180,14 +203,29 @@ def admin_emails() -> FrozenSet[str]:
 
 
 # =============================================================================
-# HMAC secret and signed payloads
+# HMAC secret, key rotation, PKCE and signed payloads
 # =============================================================================
 def _read_secret_file(path: str) -> Optional[str]:
     try:
         with open(path, "r", encoding="utf-8") as f:
             return f.read().strip()
-    except FileNotFoundError:
+    except OSError:
         return None
+
+
+def load_previous_hmac_secrets(env_var: str = ENV_AUTH_SECRET_PREVIOUS) -> Tuple[bytes, ...]:
+    """Returns previous HMAC keys configured in ``PQC_AUTH_SECRET_PREVIOUS`` (comma-separated) for safe rotation."""
+    raw = (os.getenv(env_var) or "").strip()
+    if not raw:
+        return ()
+    keys: List[bytes] = []
+    for item in raw.split(","):
+        cleaned = item.strip()
+        if len(cleaned) >= 32:
+            keys.append(cleaned.encode("utf-8"))
+        elif cleaned:
+            logger.warning("Ignoring rotation secret in %s shorter than 32 characters.", env_var)
+    return tuple(keys)
 
 
 def load_or_create_hmac_secret(
@@ -195,18 +233,37 @@ def load_or_create_hmac_secret(
     *,
     env_var: str = ENV_AUTH_SECRET,
     filename: str = AUTH_SECRET_FILENAME,
+    require_stable_secret: Optional[bool] = None,
 ) -> bytes:
     """Returns the HMAC key used to sign session tokens and OAuth state. Never returns a constant.
 
-    Order: ``$PQC_AUTH_SECRET`` (recommended: inject from Secret Manager) > ``<data_dir>/.pqc_auth_secret`` (created
-    with 256 random bits, mode 0600) > an ephemeral ``secrets.token_hex(32)`` with a warning (sessions then do not
-    survive restarts and are not shared between instances, which is safe but inconvenient).
+    * **Production (Cloud Run / ``PQC_PRODUCTION_MODE=true``):** fails closed (raises :class:`RuntimeError`) if
+      ``$PQC_AUTH_SECRET`` (or ``$PQC_AUTH_SECRET_FILE``, e.g. a Secret Manager volume mount) is missing or shorter
+      than 32 characters. Never generates an ephemeral or local-file secret in production.
+    * **Local development:** ``$PQC_AUTH_SECRET`` > ``$PQC_AUTH_SECRET_FILE`` > ``<data_dir>/.pqc_auth_secret``
+      (created with 256 random bits, mode 0600) > ephemeral ``secrets.token_hex(32)`` with a warning.
     """
     env_secret = (os.getenv(env_var) or "").strip()
+    if not env_secret:
+        secret_file = (os.getenv(ENV_AUTH_SECRET_FILE) or "").strip()
+        if secret_file:
+            env_secret = (_read_secret_file(secret_file) or "").strip()
+
+    must_have_stable = is_production_environment() if require_stable_secret is None else bool(require_stable_secret)
     if env_secret:
         if len(env_secret) < 32:
+            if must_have_stable:
+                raise RuntimeError(
+                    f"Production security failure: {env_var} must be at least 32 characters (256 bits) from Secret Manager."
+                )
             logger.warning("%s is shorter than 32 characters; use a random 256-bit value.", env_var)
         return env_secret.encode("utf-8")
+
+    if must_have_stable:
+        raise RuntimeError(
+            f"Production security failure: {env_var} is not configured. Inject a 256-bit secret from Secret Manager "
+            f"(or set {ENV_AUTH_SECRET_FILE}); refusing to generate an ephemeral production HMAC secret."
+        )
 
     if data_dir:
         path = os.path.join(data_dir, filename)
@@ -235,8 +292,7 @@ def load_or_create_hmac_secret(
             logger.warning("Cannot read or persist the HMAC secret in %s: %s", data_dir, exc)
 
     logger.warning(
-        "No %s and no writable secret file: using an EPHEMERAL random HMAC key. Signed sessions will not survive "
-        "restarts or be shared across instances. Set %s (e.g. from Secret Manager) in production.",
+        "No %s and no writable secret file: using an EPHEMERAL random HMAC key (local dev only). Set %s in production.",
         env_var,
         env_var,
     )
@@ -249,6 +305,41 @@ def _b64url_encode(raw: bytes) -> str:
 
 def _b64url_decode(data: str) -> bytes:
     return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
+
+
+def compute_pkce_challenge(code_verifier: str) -> str:
+    """Computes an RFC 7636 S256 PKCE ``code_challenge`` from ``code_verifier``."""
+    digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+    return _b64url_encode(digest)
+
+
+def generate_pkce_pair() -> Tuple[str, str]:
+    """Generates a cryptographically random RFC 7636 PKCE ``(code_verifier, code_challenge)`` pair (S256)."""
+    verifier = secrets.token_urlsafe(48)
+    return verifier, compute_pkce_challenge(verifier)
+
+
+def derive_csrf_token(session_token: str, secret: bytes) -> str:
+    """Derives a session-bound CSRF token from the active session token using HMAC-SHA256."""
+    raw = (session_token or "").strip()
+    if raw.lower().startswith("bearer "):
+        raw = raw[7:].strip()
+    return hmac.new(secret, f"pqc-csrf-v1:{raw}".encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def verify_csrf_token(csrf_token: Optional[str], session_token: Optional[str], secret: bytes) -> bool:
+    """Verifies that ``csrf_token`` matches the HMAC-derived CSRF token for ``session_token`` (or a rotated key)."""
+    if not csrf_token or not session_token:
+        return False
+    candidate = str(csrf_token).strip()
+    if not candidate:
+        return False
+    candidate_secrets: List[bytes] = [secret, *load_previous_hmac_secrets()]
+    for key in candidate_secrets:
+        expected = derive_csrf_token(session_token, key)
+        if hmac.compare_digest(candidate.encode("utf-8"), expected.encode("ascii")):
+            return True
+    return False
 
 
 def sign_payload(payload: Mapping[str, Any], secret: bytes) -> str:
@@ -264,11 +355,13 @@ def verify_signed_payload(
     secret: bytes,
     *,
     expected_type: Optional[str] = None,
+    previous_secrets: Optional[Sequence[bytes]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Verifies a token produced by :func:`sign_payload` (constant-time). Returns the payload or None.
 
     ``exp`` (unix seconds) is mandatory; when ``expected_type`` is given the payload ``typ`` must match it, which
-    prevents using e.g. an OAuth ``state`` value as a session token.
+    prevents using e.g. an OAuth ``state`` value as a session token. Supports seamless key rotation via
+    ``previous_secrets`` or ``PQC_AUTH_SECRET_PREVIOUS``.
     """
     if not token:
         return None
@@ -278,11 +371,21 @@ def verify_signed_payload(
     body, sep, signature = raw.partition(".")
     if not sep or not body or not signature:
         return None
-    try:
-        expected = hmac.new(secret, body.encode("ascii"), hashlib.sha256).hexdigest()
-    except UnicodeEncodeError:
-        return None
-    if not hmac.compare_digest(signature.encode("utf-8"), expected.encode("ascii")):
+    keys_to_try: List[bytes] = [secret]
+    if previous_secrets is not None:
+        keys_to_try.extend(previous_secrets)
+    else:
+        keys_to_try.extend(load_previous_hmac_secrets())
+    sig_matched = False
+    for key in keys_to_try:
+        try:
+            expected = hmac.new(key, body.encode("ascii"), hashlib.sha256).hexdigest()
+        except UnicodeEncodeError:
+            continue
+        if hmac.compare_digest(signature.encode("utf-8"), expected.encode("ascii")):
+            sig_matched = True
+            break
+    if not sig_matched:
         return None
     try:
         decoded = json.loads(_b64url_decode(body).decode("utf-8"))
@@ -353,16 +456,19 @@ def verify_iap_jwt(token: Optional[str], audience: Optional[str] = None) -> Opti
     """Verifies a Cloud IAP ``X-Goog-IAP-JWT-Assertion`` and returns its claims, or None if it is not valid.
 
     Uses ``google.oauth2.id_token.verify_token(token, google.auth.transport.requests.Request(), audience=...,
-    certs_url="https://www.gstatic.com/iap/verify/public_key")`` (signature, expiry, optional audience) and then
-    requires ``iss == "https://cloud.google.com/iap"`` and an ``email`` claim. The audience is ``audience`` or
-    ``$PQC_IAP_AUDIENCE`` (``/projects/<num>/global/backendServices/<id>`` or ``/projects/<num>/apps/<project>``);
-    configure it in production so JWTs minted for other IAP-protected apps are rejected.
+    certs_url="https://www.gstatic.com/iap/verify/public_key")`` (signature, expiry, audience) and requires
+    ``iss == "https://cloud.google.com/iap"``, a valid ``email`` claim, and (in production or when configured)
+    an exact match on ``aud == expected_audience``.
     The plain ``X-Goog-Authenticated-User-Email`` header is NEVER trusted: anyone can send it to a public service.
     """
     global _IAP_AUDIENCE_WARNING_EMITTED
     if not token or google_id_token is None:
         return None
     expected_audience = audience or (os.getenv(ENV_IAP_AUDIENCE) or "").strip() or None
+    require_audience = is_production_environment() or (env_flag(ENV_REQUIRE_IAP_AUDIENCE) is True)
+    if expected_audience is None and require_audience:
+        logger.error("Rejected Cloud IAP JWT assertion: %s is required in production.", ENV_IAP_AUDIENCE)
+        return None
     try:
         claims = google_id_token.verify_token(
             token,
@@ -384,12 +490,29 @@ def verify_iap_jwt(token: Optional[str], audience: Optional[str] = None) -> Opti
     if not isinstance(claims, Mapping) or claims.get("iss") != IAP_ISSUER:
         logger.warning("Rejected Cloud IAP JWT assertion: unexpected issuer.")
         return None
+    if expected_audience is not None:
+        claim_aud = claims.get("aud")
+        aud_matches = (
+            claim_aud == expected_audience
+            if isinstance(claim_aud, str)
+            else (isinstance(claim_aud, (list, tuple)) and expected_audience in claim_aud)
+        )
+        if not aud_matches:
+            logger.warning("Rejected Cloud IAP JWT assertion: audience mismatch (expected %r, got %r).", expected_audience, claim_aud)
+            return None
+    if "exp" in claims:
+        try:
+            if int(claims["exp"]) < int(time.time()) - 60:
+                logger.warning("Rejected Cloud IAP JWT assertion: token is expired.")
+                return None
+        except (TypeError, ValueError):
+            return None
     email = str(claims.get("email") or "").strip()
     if not email:
         return None
     if expected_audience is None and not _IAP_AUDIENCE_WARNING_EMITTED:
         _IAP_AUDIENCE_WARNING_EMITTED = True
-        logger.warning("%s is not set: the IAP JWT audience is not checked. Configure it in production.", ENV_IAP_AUDIENCE)
+        logger.warning("%s is not set: the IAP JWT audience is not checked (local dev only).", ENV_IAP_AUDIENCE)
     return dict(claims)
 
 
@@ -411,6 +534,8 @@ class AuthenticatedIdentity:
     email: str
     source: str  # "session_token" | "iap"
     claims: Mapping[str, Any] = field(default_factory=dict, compare=False, hash=False, repr=False)
+    auth_transport: str = field(default="header", compare=False, hash=False, repr=False)  # "iap" | "header" | "cookie"
+    raw_token: str = field(default="", compare=False, hash=False, repr=False)
 
 
 class IdentityResolver:
@@ -448,11 +573,18 @@ class IdentityResolver:
             if claims and claims.get("email"):
                 email = self._normalize(str(claims["email"]))
                 if self._is_allowed_email(email):
-                    return AuthenticatedIdentity(user_id=email, email=email, source="iap", claims=dict(claims))
+                    return AuthenticatedIdentity(
+                        user_id=email,
+                        email=email,
+                        source="iap",
+                        claims=dict(claims),
+                        auth_transport="iap",
+                        raw_token=assertion,
+                    )
 
-        candidates = [conn.headers.get(h) for h in self._session_token_headers]
-        candidates.append(conn.cookies.get(self._session_cookie_name))
-        for candidate in candidates:
+        header_candidates = [(conn.headers.get(h), "header") for h in self._session_token_headers]
+        cookie_candidate = (conn.cookies.get(self._session_cookie_name), "cookie")
+        for candidate, transport in [*header_candidates, cookie_candidate]:
             if not candidate:
                 continue
             decoded = self._verify_session_token(candidate)
@@ -460,7 +592,14 @@ class IdentityResolver:
                 continue
             email = self._normalize(str(decoded.get("email") or decoded.get("uid") or ""))
             if email and self._is_allowed_email(email):
-                return AuthenticatedIdentity(user_id=email, email=email, source="session_token", claims=dict(decoded))
+                return AuthenticatedIdentity(
+                    user_id=email,
+                    email=email,
+                    source="session_token",
+                    claims=dict(decoded),
+                    auth_transport=transport,
+                    raw_token=str(candidate).strip(),
+                )
         return None
 
 

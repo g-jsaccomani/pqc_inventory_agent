@@ -2060,7 +2060,11 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       return "NorthAm";
     }
 
-    let currentAuthToken = localStorage.getItem("pqc_session_token") || "";
+    // Session authentication relies on HttpOnly cookies (pqc_session_token + pqc_account_jar);
+    // reusable session/bearer tokens are NEVER stored in localStorage or sessionStorage.
+    try { localStorage.removeItem("pqc_session_token"); } catch (e) {}
+    let currentCsrfToken = "";
+    let activeAuthPopupWindow = null;
     let currentUserProfile = null;
     let currentUserId = localStorage.getItem("pqc_user_id") || "sec-architect";
     let selectedAuthRegion = localStorage.getItem("pqc_user_region") || detectBrowserRegion();
@@ -2072,22 +2076,56 @@ PORTAL_HTML = r"""<!DOCTYPE html>
 
     let AUTH_CONFIG = { allow_unverified_signin: false, google_oauth_client_configured: false, oauth_signin_url: null };
 
-    // The server derives the user ONLY from the signed session token/cookie (or a verified IAP JWT):
-    // no client-asserted user id header is ever sent.
+    function readBrowserCookie(name) {
+      try {
+        const escaped = name.replace(/([.$?*|{}()[\]\\/+^])/g, "\\$1");
+        const match = document.cookie.match(new RegExp("(?:^|; )" + escaped + "=([^;]*)"));
+        return match ? decodeURIComponent(match[1]) : "";
+      } catch (e) {
+        return "";
+      }
+    }
+
+    function getCsrfToken() {
+      return currentCsrfToken || readBrowserCookie("pqc_csrf_token") || "";
+    }
+
+    // The server derives the user ONLY from the HttpOnly signed session cookie (or a verified IAP JWT):
+    // no client-asserted user id header or localStorage bearer token is ever sent.
     function getAuthHeaders(extra = {}) {
       const headers = Object.assign({}, extra);
       headers["X-PQC-User-Timezone"] = detectBrowserTimezone();
       headers["X-PQC-User-Region"] = selectedAuthRegion;
-      if (currentAuthToken) {
-        headers["X-PQC-User-Token"] = currentAuthToken;
+      const csrf = getCsrfToken();
+      if (csrf) {
+        headers["X-PQC-CSRF-Token"] = csrf;
       }
       return headers;
     }
 
-    // Any HTTP 401 from the portal API opens the sign-in dialog instead of breaking the page.
+    // Attach X-PQC-CSRF-Token on same-origin state-changing requests and open the sign-in dialog on HTTP 401.
     const pqcNativeFetch = window.fetch.bind(window);
     window.fetch = async function (input, init) {
-      const response = await pqcNativeFetch(input, init);
+      let nextInit = init ? Object.assign({}, init) : {};
+      try {
+        const rawUrl = typeof input === "string" ? input : (input && input.url) || "";
+        const parsedUrl = new URL(rawUrl, window.location.origin);
+        const method = String((nextInit && nextInit.method) || "GET").toUpperCase();
+        if (
+          parsedUrl.origin === window.location.origin &&
+          ["POST", "PUT", "PATCH", "DELETE"].includes(method)
+        ) {
+          const csrf = getCsrfToken();
+          if (csrf) {
+            const hdrs = new Headers(nextInit.headers || {});
+            if (!hdrs.has("X-PQC-CSRF-Token")) {
+              hdrs.set("X-PQC-CSRF-Token", csrf);
+            }
+            nextInit.headers = hdrs;
+          }
+        }
+      } catch (e) {}
+      const response = await pqcNativeFetch(input, nextInit);
       try {
         const rawUrl = typeof input === "string" ? input : (input && input.url) || "";
         const path = new URL(rawUrl, window.location.origin).pathname;
@@ -2103,10 +2141,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       try {
         detail = (await res.json()).detail || "";
       } catch (e) {}
-      if (currentAuthToken) {
-        currentAuthToken = "";
-        localStorage.removeItem("pqc_session_token");
-      }
+      currentCsrfToken = "";
       updateTenantProfileUI(null);
       openAuthModal(detail || "Your session is missing or expired. Please sign in again.");
     }
@@ -2114,11 +2149,22 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     let popoverAccountsExpanded = true;
     let gisInitialized = false;
 
+    function sanitizeSavedAccountEntry(acct) {
+      if (!acct || typeof acct !== "object") return null;
+      const copy = Object.assign({}, acct);
+      delete copy.token;
+      delete copy.access_token;
+      delete copy.id_token;
+      delete copy.credential;
+      return copy;
+    }
+
     function loadSavedBrowserAccounts() {
       try {
         const raw = localStorage.getItem("pqc_saved_accounts");
         const parsed = raw ? JSON.parse(raw) : [];
-        return Array.isArray(parsed) ? parsed : [];
+        if (!Array.isArray(parsed)) return [];
+        return parsed.map(sanitizeSavedAccountEntry).filter(Boolean);
       } catch (e) {
         return [];
       }
@@ -2126,11 +2172,12 @@ PORTAL_HTML = r"""<!DOCTYPE html>
 
     function saveBrowserAccountsList(list) {
       try {
-        localStorage.setItem("pqc_saved_accounts", JSON.stringify(list));
+        const cleanList = (Array.isArray(list) ? list : []).map(sanitizeSavedAccountEntry).filter(Boolean);
+        localStorage.setItem("pqc_saved_accounts", JSON.stringify(cleanList));
       } catch (e) {}
     }
 
-    function upsertSavedBrowserAccount(profile, token, connected = true) {
+    function upsertSavedBrowserAccount(profile, connected = true) {
       if (!profile || !profile.email) return;
       const email = String(profile.email).toLowerCase();
       const list = loadSavedBrowserAccounts();
@@ -2141,7 +2188,6 @@ PORTAL_HTML = r"""<!DOCTYPE html>
         picture: profile.picture || (existingIdx >= 0 ? list[existingIdx].picture : "") || "",
         region: profile.region || selectedAuthRegion || "NorthAm",
         domain: profile.domain || email.split("@")[1] || "google.com",
-        token: connected ? (token || (existingIdx >= 0 ? list[existingIdx].token : "") || "") : "",
         connected: Boolean(connected),
         updated_at: new Date().toISOString(),
       };
@@ -2160,7 +2206,6 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       list.forEach((acct) => {
         if (String(acct.email || "").toLowerCase() === clean) {
           acct.connected = false;
-          acct.token = "";
         }
       });
       saveBrowserAccountsList(list);
@@ -2371,6 +2416,14 @@ PORTAL_HTML = r"""<!DOCTYPE html>
           console.warn("GIS initTokenClient fallback:", e);
         }
       }
+      if (AUTH_CONFIG.oauth_signin_url) {
+        const signinUrl = `${AUTH_CONFIG.oauth_signin_url}?region=${encodeURIComponent(selectedAuthRegion)}&timezone=${encodeURIComponent(detectBrowserTimezone())}`;
+        const w = 520, h = 640;
+        const left = Math.max(0, Math.round((window.screen.width - w) / 2));
+        const top = Math.max(0, Math.round((window.screen.height - h) / 2));
+        activeAuthPopupWindow = window.open(signinUrl, "pqc_oauth_signin_popup", `width=${w},height=${h},left=${left},top=${top},resizable=yes,scrollbars=yes`);
+        return;
+      }
       const autoWorked = await tryAutomaticGoogleSignIn(true);
       if (autoWorked) return;
     }
@@ -2394,17 +2447,17 @@ PORTAL_HTML = r"""<!DOCTYPE html>
         }
       } catch (e) {}
 
-      // Try any connected account saved in the browser's Gemini Account Switcher
+      // Try any connected account saved in the browser's Gemini Account Switcher (backed by HttpOnly pqc_account_jar cookie)
       const saved = loadSavedBrowserAccounts();
-      const connectedAcct = saved.find((a) => a.connected && a.token);
-      if (connectedAcct && connectedAcct.token) {
+      const connectedAcct = saved.find((a) => a.connected && a.email);
+      if (connectedAcct && connectedAcct.email) {
         try {
           const sRes = await fetch("/api/auth/switch", {
             method: "POST",
             credentials: "same-origin",
-            headers: { "Content-Type": "application/json" },
+            headers: getAuthHeaders({ "Content-Type": "application/json" }),
             body: JSON.stringify({
-              token: connectedAcct.token,
+              email: connectedAcct.email,
               region: connectedAcct.region || selectedAuthRegion,
               timezone: detectBrowserTimezone(),
             }),
@@ -2433,12 +2486,11 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     }
 
     async function applySignInResult(data) {
-      currentAuthToken = data.token || "";
-      if (currentAuthToken) {
-        localStorage.setItem("pqc_session_token", currentAuthToken);
+      if (data && data.csrf_token) {
+        currentCsrfToken = data.csrf_token;
       }
       if (data.user && data.user.email) {
-        upsertSavedBrowserAccount(data.user, currentAuthToken, true);
+        upsertSavedBrowserAccount(data.user, true);
       }
       const tokInput = document.getElementById("auth-oauth-token-input");
       if (tokInput) tokInput.value = "";
@@ -2523,7 +2575,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       others.forEach((acct) => {
         const item = document.createElement("div");
         item.className = "gemini-saved-acct-item";
-        const isConnected = Boolean(acct.connected && acct.token);
+        const isConnected = Boolean(acct.connected);
         const safeEmail = escapeHtml(acct.email || "");
         const safeName = escapeHtml(acct.name || acct.email || "");
         const avatarInner =
@@ -2551,14 +2603,14 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     async function switchOrLoginSavedAccount(email) {
       const clean = String(email || "").toLowerCase();
       const found = loadSavedBrowserAccounts().find((a) => String(a.email || "").toLowerCase() === clean);
-      if (found && found.connected && found.token) {
+      if (found && found.connected) {
         try {
           const res = await fetch("/api/auth/switch", {
             method: "POST",
             credentials: "same-origin",
-            headers: { "Content-Type": "application/json" },
+            headers: getAuthHeaders({ "Content-Type": "application/json" }),
             body: JSON.stringify({
-              token: found.token,
+              email: clean,
               region: found.region || selectedAuthRegion,
               timezone: detectBrowserTimezone(),
             }),
@@ -2588,16 +2640,16 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       localStorage.setItem("pqc_user_region", selectedAuthRegion);
       if (currentUserProfile) {
         currentUserProfile.region = selectedAuthRegion;
-        upsertSavedBrowserAccount(currentUserProfile, currentAuthToken, true);
+        upsertSavedBrowserAccount(currentUserProfile, true);
         updateTenantProfileUI(currentUserProfile);
       }
       try {
         const res = await fetch("/api/auth/switch", {
           method: "POST",
           credentials: "same-origin",
-          headers: { "Content-Type": "application/json" },
+          headers: getAuthHeaders({ "Content-Type": "application/json" }),
           body: JSON.stringify({
-            token: currentAuthToken || undefined,
+            email: currentUserProfile && currentUserProfile.email ? currentUserProfile.email : undefined,
             region: selectedAuthRegion,
             timezone: detectBrowserTimezone(),
           }),
@@ -2605,8 +2657,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
         if (res.ok) {
           const data = await res.json();
           if (data && data.user) {
-            currentAuthToken = data.token || currentAuthToken;
-            if (currentAuthToken) localStorage.setItem("pqc_session_token", currentAuthToken);
+            if (data.csrf_token) currentCsrfToken = data.csrf_token;
             updateTenantProfileUI(data.user);
           }
         }
@@ -2731,11 +2782,10 @@ PORTAL_HTML = r"""<!DOCTYPE html>
           isCloudIapActive = data.iap_active;
         }
         if (data.authenticated && data.user) {
-          if (data.token) {
-            currentAuthToken = data.token;
-            localStorage.setItem("pqc_session_token", currentAuthToken);
+          if (data.csrf_token) {
+            currentCsrfToken = data.csrf_token;
           }
-          upsertSavedBrowserAccount(data.user, currentAuthToken, true);
+          upsertSavedBrowserAccount(data.user, true);
           updateTenantProfileUI(data.user);
           currentSessionId = localStorage.getItem(`pqc_active_session_id:${currentUserId}`) || null;
           if (data.connection) {
@@ -2748,10 +2798,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
         if (autoOk) {
           return;
         }
-        if (currentAuthToken) {
-          currentAuthToken = "";
-          localStorage.removeItem("pqc_session_token");
-        }
+        currentCsrfToken = "";
         updateTenantProfileUI(null);
         openAuthModal();
       } catch (e) {
@@ -2831,13 +2878,16 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       }
       closeGeminiAccountPopover();
       try {
-        await fetch("/api/auth/logout", { method: "POST", credentials: "same-origin" });
+        await fetch("/api/auth/logout", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: getAuthHeaders({ "Content-Type": "application/json" }),
+        });
       } catch (e) {}
-      currentAuthToken = "";
+      currentCsrfToken = "";
       currentUserProfile = null;
       currentUserId = "sec-architect";
       currentSessionId = null;
-      localStorage.removeItem("pqc_session_token");
       localStorage.removeItem("pqc_user_id");
       if (wasIap) {
         window.location.href = "/?gcp-iap-mode=CLEAR_LOGIN_COOKIE";
@@ -3100,7 +3150,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       const w = 520, h = 640;
       const left = Math.max(0, Math.round((window.screen.width - w) / 2));
       const top = Math.max(0, Math.round((window.screen.height - h) / 2));
-      window.open(targetUri, "pqc_oauth_3lo_popup", `width=${w},height=${h},left=${left},top=${top},resizable=yes,scrollbars=yes`);
+      activeAuthPopupWindow = window.open(targetUri, "pqc_oauth_3lo_popup", `width=${w},height=${h},left=${left},top=${top},resizable=yes,scrollbars=yes`);
     }
 
     async function submitInlineToolConsent(cardDomId, toolName, targetScope, resumePrompt) {
@@ -3167,51 +3217,55 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       }
     }
 
-    window.addEventListener("message", async (event) => {
-      const trustedBridgeOrigins = [
-        window.location.origin,
-        "https://agentic-pqc-110254026096.us-central1.run.app",
-        "https://agentic-pqc-dt7a7ayxsa-uc.a.run.app",
-        "https://cspr-copilot-301423082258.us-central1.run.app",
-        "https://cspr-copilot-gqvpblre3a-uc.a.run.app"
-      ];
-      if (!trustedBridgeOrigins.includes(event.origin)) return;
-      if (event.data && event.data.type === "AGENTIC_GOOGLE_AUTH") {
-        try {
-          const res = await fetch("/api/auth/google", {
-            method: "POST",
-            credentials: "same-origin",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              credential: event.data.credential || undefined,
-              google_access_token: event.data.access_token || undefined,
-              region: selectedAuthRegion,
-              timezone: detectBrowserTimezone(),
-            }),
-          });
-          const data = await res.json().catch(() => ({}));
-          if (res.ok && data && data.authenticated) {
-            await applySignInResult(data);
-          } else {
-            openAuthModal((data && data.detail) || `Sign-in failed (HTTP ${res.status}).`);
-          }
-        } catch (err) {
-          openAuthModal(`Sign-in error: ${err}`);
+    function hasForbiddenPopupCredentialFields(obj) {
+      if (!obj || typeof obj !== "object") return false;
+      const forbidden = ["token", "csrf_token", "access_token", "google_access_token", "id_token", "refresh_token", "credential", "code", "client_secret"];
+      for (const k of forbidden) {
+        if (Object.prototype.hasOwnProperty.call(obj, k) && obj[k]) {
+          return true;
         }
+      }
+      return false;
+    }
+
+    window.addEventListener("message", async (event) => {
+      // 1. Validate exact trusted origin (same-origin only)
+      if (event.origin !== window.location.origin) return;
+      // 2. Validate expected popup WindowProxy source (rejects untrusted frames, tabs, and replayed messages)
+      if (!activeAuthPopupWindow || event.source !== activeAuthPopupWindow) return;
+      // 3. Reject malformed or credential-bearing messages (popup messages communicate completion only)
+      if (!event.data || typeof event.data !== "object") return;
+      const msgType = event.data.type;
+      if (msgType !== "PQC_OAUTH_3LO_AUTHORIZED" && msgType !== "PQC_SIGNIN_COMPLETE") return;
+      const payload = event.data.payload && typeof event.data.payload === "object" ? event.data.payload : {};
+      if (hasForbiddenPopupCredentialFields(event.data) || hasForbiddenPopupCredentialFields(payload)) {
         return;
       }
-      if (event.origin !== window.location.origin) return;
-      if (event.data && event.data.type === "PQC_OAUTH_3LO_AUTHORIZED") {
-        if (event.data.payload && event.data.payload.status === "AUTHORIZED") {
-          await handleOAuth3LOAuthorized(event.data.payload, activeOAuthConsentCardId, activeOAuthResumePrompt);
+      // Consume popup reference so replayed messages from the popup are ignored
+      activeAuthPopupWindow = null;
+
+      if (msgType === "PQC_OAUTH_3LO_AUTHORIZED") {
+        if (payload.status === "AUTHORIZED") {
+          await handleOAuth3LOAuthorized(payload, activeOAuthConsentCardId, activeOAuthResumePrompt);
         }
-      } else if (event.data && event.data.type === "PQC_SIGNIN_COMPLETE") {
-        const payload = event.data.payload || {};
-        if (payload.authenticated && payload.token) {
-          await applySignInResult(payload);
+      } else if (msgType === "PQC_SIGNIN_COMPLETE") {
+        if (payload.authenticated) {
+          await loadCurrentTenantUser();
+          await fetchSessions();
+          closeAuthModal();
+          closeGeminiAccountPopover();
         } else {
           openAuthModal(payload.detail || payload.error || "Google sign-in did not complete.");
         }
+      }
+    });
+
+    // Multi-tab session state synchronization via non-sensitive profile keys (never tokens)
+    window.addEventListener("storage", async (event) => {
+      if (!event) return;
+      if (event.key === "pqc_user_id" || event.key === "pqc_user_region") {
+        await loadCurrentTenantUser();
+        await fetchSessions();
       }
     });
 
