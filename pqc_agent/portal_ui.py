@@ -1913,8 +1913,8 @@ PORTAL_HTML = r"""<!DOCTYPE html>
           </div>
           <input type="password" id="auth-oauth-token-input" placeholder="Paste the output of: gcloud auth print-access-token" autocomplete="off" />
           <label style="display:flex;align-items:center;gap:6px;margin-top:4px;cursor:pointer;font-size:12px;color:var(--text-secondary);">
-            <input type="checkbox" id="auth-bind-gcp-token" style="width:auto;" checked />
-            <span>Usar também na minha conexão isolada GCP / gcloud (mantido apenas em memória)</span>
+            <input type="checkbox" id="auth-bind-gcp-token" style="width:auto;" />
+            <span>Usar também na minha conexão isolada GCP / gcloud (apenas para projetos externos onde o ADC não tem acesso)</span>
           </label>
         </div>
 
@@ -3204,6 +3204,30 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       }
     });
 
+    async function switchToAdcAndResume(cardDomId, resumePrompt) {
+      const statusEl = document.getElementById(`consent-status-${cardDomId}`);
+      if (statusEl) {
+        statusEl.style.color = "var(--text-secondary)";
+        statusEl.textContent = "Switching connection to Cloud Run Service Account (ADC)...";
+      }
+      try {
+        const res = await fetch("/api/connection", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: getAuthHeaders({ "Content-Type": "application/json" }),
+          body: JSON.stringify({ mode: "adc" }),
+        });
+        const conn = await res.json();
+        if (!res.ok) {
+          if (statusEl) statusEl.textContent = (conn && conn.detail) || "Failed to switch to ADC.";
+          return;
+        }
+        await handleOAuth3LOAuthorized({ status: "AUTHORIZED", connection: conn }, cardDomId, resumePrompt);
+      } catch (err) {
+        if (statusEl) statusEl.textContent = `ADC switch error: ${err}`;
+      }
+    }
+
     function buildOAuthConsentCardHtml(consentCard, cardDomId) {
       if (!consentCard) return "";
       const toolName = consentCard.tool_name || "collect_kms_inventory";
@@ -3231,9 +3255,12 @@ PORTAL_HTML = r"""<!DOCTYPE html>
             <div><strong style="color:var(--text-primary);">Tool:</strong> ${escapeHtml(toolName)} &nbsp;•&nbsp; <strong style="color:var(--text-primary);">Target:</strong> ${escapeHtml(targetScope)}</div>
             <div><strong style="color:var(--text-primary);">OAuth 2.0 Scopes:</strong> ${escapeHtml(scopes.join(" "))}</div>
           </div>
-          <div class="oauth-consent-actions">
+          <div class="oauth-consent-actions" style="display:flex;gap:8px;flex-wrap:wrap;">
             <button type="button" class="btn-oauth-popup" onclick='openOAuth3LOPopup(${escapeHtml(JSON.stringify(authUri))}, ${escapeHtml(JSON.stringify(cardDomId))}, ${escapeHtml(JSON.stringify(resumePrompt))})'>
               <span>Authorize with Google Cloud (OAuth 2.0 Popup)</span>
+            </button>
+            <button type="button" class="btn-minimal-action" onclick='switchToAdcAndResume(${escapeHtml(JSON.stringify(cardDomId))}, ${escapeHtml(JSON.stringify(resumePrompt))})' style="padding:8px 14px;border:1px solid rgba(129,201,149,0.45);color:#81c995;font-weight:600;">
+              <span>Use Cloud Run Service Account (ADC) &amp; Resume</span>
             </button>
           </div>
           <div style="display:flex;gap:8px;align-items:center;margin-top:2px;">

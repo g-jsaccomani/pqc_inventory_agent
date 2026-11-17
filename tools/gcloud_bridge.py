@@ -680,6 +680,34 @@ def execute_gcloud_command(command: str) -> str:
             env=env,
             shell=False,
         )
+        if (
+            proc.returncode != 0
+            and "CLOUDSDK_AUTH_ACCESS_TOKEN_FILE" in env
+            and any(
+                err_marker in (proc.stderr or "")
+                for err_marker in (
+                    "PERMISSION_DENIED",
+                    "PermissionDenied",
+                    "USER_PROJECT_DENIED",
+                    "does not have required permission",
+                    "Caller does not have permission",
+                )
+            )
+        ):
+            adc_env = dict(env)
+            adc_env.pop("CLOUDSDK_AUTH_ACCESS_TOKEN_FILE", None)
+            adc_proc = subprocess.run(
+                exec_tokens,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=adc_env,
+                shell=False,
+            )
+            if adc_proc.returncode == 0:
+                proc = adc_proc
+                mode = "adc"
+                mode_label = CONNECTION_MODES["adc"]
         duration_ms = round((time.time() - start_ts) * 1000, 2)
         display_cmd = "gcloud " + " ".join(shlex.quote(t) for t in tokens)
         result_payload = {

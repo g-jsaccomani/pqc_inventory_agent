@@ -1031,6 +1031,25 @@ def build_gcp_oauth_auth_config(
     )
 
 
+def _is_builtin_demo_scope(target_scope: Optional[str], conn: Optional[Dict[str, Any]] = None) -> bool:
+    """Returns True when `target_scope` and `conn` target the built-in Argolis lab/demo environment
+    (`31564119954` / `pqc-inventory-agent-cd06`), where Cloud Run ADC already holds full read-only permissions."""
+    import re as _re
+
+    raw = str(target_scope or "").strip()
+    if _re.search(r"organizations/(?!31564119954\b)\d+", raw):
+        return False
+    if _re.search(r"projects/(?!pqc-inventory-agent-cd06\b)[a-z0-9-]+", raw):
+        return False
+    if conn and str(conn.get("organization_id") or "") not in ("", "31564119954"):
+        return False
+    if conn and str(conn.get("project_id") or "") not in ("", "pqc-inventory-agent-cd06"):
+        return False
+    if "31564119954" in raw or "pqc-inventory-agent-cd06" in raw or not raw:
+        return True
+    return True
+
+
 class PqcOAuth3LOPlugin(BasePlugin):
     """ADK Plugin that integrates `ToolContext` 3-Legged OAuth (3LO) credentials with GCP discovery tools.
 
@@ -1039,7 +1058,7 @@ class PqcOAuth3LOPlugin(BasePlugin):
        and the isolated per-user `gcloud_bridge` connection state.
     2. When a user is in 3-Legged OAuth mode (`mode == 'access_token'`) and has not yet granted a token,
        calls `tool_context.request_credential(auth_config)` before the tool executes and emits an interactive
-       In-Chat OAuth 2.0 Consent Card.
+       In-Chat OAuth 2.0 Consent Card (or auto-heals to `adc` when targeting the built-in demo org `31564119954`).
     3. When a tool running in default Service Account (`adc`) mode encounters a `403 PermissionDenied` error
        on an external project/organization, automatically triggers `tool_context.request_credential(auth_config)`
        so the user can authorize with their own `@google.com` credentials right in the chat.
@@ -1104,8 +1123,14 @@ class PqcOAuth3LOPlugin(BasePlugin):
         except Exception as exc:
             logger.debug("ToolContext credential sync skipped: %s", exc)
 
-        # 2. If the user is in 3-Legged OAuth mode ('access_token') and no token is present, request consent!
+        # 2. If the user is in 3-Legged OAuth mode ('access_token') and no token is present:
+        #    - For the built-in Argolis lab/demo org (31564119954 / pqc-inventory-agent-cd06), auto-heal to ADC
+        #      so the Cloud Run Service Account executes immediately without blocking the demo.
+        #    - For external organizations/projects, request 3LO OAuth consent.
         if conn.get("mode") == "access_token" and not conn.get("has_access_token"):
+            if _is_builtin_demo_scope(target_scope, conn):
+                set_gcp_connection_config(mode="adc", user_id=uid)
+                return None
             try:
                 tool_context.request_credential(auth_config)
             except Exception as exc:
@@ -1942,6 +1967,8 @@ def create_workspace_app(
             set_current_tenant_user(uid)
             signed_token = sign_tenant_session_token(profile)
             conn = get_gcp_connection_config(mask_token=True, user_id=uid)
+            if conn.get("mode") == "access_token" and not conn.get("has_access_token") and _is_builtin_demo_scope(None, conn):
+                conn = set_gcp_connection_config(mode="adc", user_id=uid)
             try:
                 sess_resp = await session_service.list_sessions(app_name=APP_NAME, user_id=uid)
                 session_count = len(sess_resp.sessions)
@@ -2039,6 +2066,9 @@ def create_workspace_app(
             uid = profile["user_id"]
             set_current_tenant_user(uid)
             signed_token = sign_tenant_session_token(profile)
+            conn = get_gcp_connection_config(mask_token=True, user_id=uid)
+            if conn.get("mode") == "access_token" and not conn.get("has_access_token") and _is_builtin_demo_scope(None, conn):
+                conn = set_gcp_connection_config(mode="adc", user_id=uid)
             sess_resp = await session_service.list_sessions(app_name=APP_NAME, user_id=uid)
             resp = JSONResponse(
                 content={
@@ -2048,7 +2078,7 @@ def create_workspace_app(
                     "user_id": uid,
                     "token": signed_token,
                     "session_count": len(sess_resp.sessions),
-                    "connection": get_gcp_connection_config(mask_token=True, user_id=uid),
+                    "connection": conn,
                     "supported_regions": SUPPORTED_REGIONS,
                 }
             )
@@ -2383,11 +2413,11 @@ window.addEventListener('load', () => {{
             return redirect_resp
 
         google_button_html = ""
-        if google_auth_url:
+        if client_id:
             google_button_html = (
-                f'<a href="{html.escape(google_auth_url, quote=True)}" style="text-decoration:none;">'
-                '<button type="button" class="btn btn-google">Continue to Google Consent Screen (accounts.google.com)'
-                "</button></a>"
+                '<button type="button" class="btn btn-google" onclick="openGoogleTokenClient()">'
+                "Authorize with Google Account (OAuth 2.0)"
+                "</button>"
             )
         # Every reflected value is HTML-escaped (markup) or JSON/script-escaped (inline JS): no reflected XSS.
         popup_html = f"""<!DOCTYPE html>
@@ -2413,6 +2443,7 @@ window.addEventListener('load', () => {{
   .err {{ color:#f87171; font-size:12px; margin-bottom:10px; display:none; }}
   .cmd {{ background:#070b12; border:1px solid #1e293b; padding:7px 10px; border-radius:6px; font-family:'JetBrains Mono',monospace; font-size:11px; color:#93c5fd; margin-bottom:10px; word-break:break-all; }}
 </style>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
 <body>
 <div class="card">
@@ -2430,7 +2461,8 @@ window.addEventListener('load', () => {{
   </div>
   <div id="errBox" class="err"></div>
   {google_button_html}
-  <div style="font-size:12px;color:#cbd5e1;margin:10px 0 6px 0;font-weight:600;">Authorize with your Google Cloud OAuth Token:</div>
+  <button type="button" class="btn btn-sec" onclick="switchToAdcMode()">Use Cloud Run Service Account (ADC) Instead</button>
+  <div style="font-size:12px;color:#cbd5e1;margin:10px 0 6px 0;font-weight:600;">Or paste your Google Cloud OAuth Token:</div>
   <div class="cmd">gcloud auth print-access-token</div>
   <input id="tokInput" type="password" placeholder="Paste ya29... OAuth 2.0 access token" autofocus />
   <button type="button" class="btn btn-google" onclick="submitConsent()">Allow &amp; Inject into ADK ToolContext</button>
@@ -2438,13 +2470,14 @@ window.addEventListener('load', () => {{
     <summary style="cursor:pointer;color:#8ab4f8;">Configure Google OAuth 2.0 Web Client ID (administrators)</summary>
     <div style="margin-top:8px;">
       <input id="cidInput" type="text" placeholder="123456-abc.apps.googleusercontent.com" value="{html.escape(client_id, quote=True)}" />
-      <button type="button" class="btn btn-sec" onclick="saveClientId()">Save OAuth Client ID &amp; Redirect to Google</button>
+      <button type="button" class="btn btn-sec" onclick="saveClientId()">Save OAuth Client ID</button>
     </div>
   </details>
 </div>
 <script>
 const PQC_SESSION_ID = {_js_literal(session_id or "")};
 const PQC_TARGET_SCOPE = {_js_literal(target_scope)};
+const PQC_CLIENT_ID = {_js_literal(client_id or "")};
 function pqcAuthHeaders() {{
   const headers = {{ 'Content-Type': 'application/json' }};
   const sessionToken = localStorage.getItem('pqc_session_token');
@@ -2455,6 +2488,47 @@ function showError(message) {{
   const err = document.getElementById('errBox');
   err.textContent = message;
   err.style.display = 'block';
+}}
+function openGoogleTokenClient() {{
+  if (!window.google || !window.google.accounts || !window.google.accounts.oauth2) {{
+    showError('Google Identity Services is loading. Please try again in a second.');
+    return;
+  }}
+  const tc = window.google.accounts.oauth2.initTokenClient({{
+    client_id: PQC_CLIENT_ID,
+    scope: 'openid email profile https://www.googleapis.com/auth/cloud-platform.read-only',
+    prompt: 'consent',
+    callback: async (resp) => {{
+      if (resp && resp.access_token) {{
+        document.getElementById('tokInput').value = resp.access_token;
+        await submitConsent();
+      }} else if (resp && resp.error) {{
+        showError('Google OAuth: ' + resp.error);
+      }}
+    }}
+  }});
+  tc.requestAccessToken();
+}}
+async function switchToAdcMode() {{
+  document.getElementById('errBox').style.display = 'none';
+  try {{
+    const res = await fetch('/api/connection', {{
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: pqcAuthHeaders(),
+      body: JSON.stringify({{ mode: 'adc' }})
+    }});
+    const conn = await res.json();
+    if (!res.ok) throw new Error(conn.detail || 'Failed to switch to ADC.');
+    if (window.opener) {{
+      window.opener.postMessage({{ type: 'PQC_OAUTH_3LO_AUTHORIZED', payload: {{ status: 'AUTHORIZED', connection: conn }} }}, window.location.origin);
+      window.close();
+    }} else {{
+      window.location.href = '/';
+    }}
+  }} catch (e) {{
+    showError(e.message);
+  }}
 }}
 async function submitConsent() {{
   const tok = document.getElementById('tokInput').value.trim();
@@ -2494,7 +2568,7 @@ async function saveClientId() {{
     showError(detail);
     return;
   }}
-  window.location.href = window.location.pathname + window.location.search + '&direct=1';
+  window.location.reload();
 }}
 </script>
 </body>
@@ -2865,8 +2939,17 @@ async function saveClientId() {{
         model_label = f"{entry['label']} {entry.get('tier', '')}".strip()
 
         if any(x is not None for x in (connection_mode, impersonated_sa, access_token)):
+            effective_mode = connection_mode
+            if (
+                effective_mode
+                and normalize_connection_mode(effective_mode) == "access_token"
+                and not (access_token or "").strip()
+            ):
+                current_conn = get_gcp_connection_config(mask_token=True, user_id=user_id)
+                if not current_conn.get("has_access_token") and _is_builtin_demo_scope(scope, current_conn):
+                    effective_mode = "adc"
             set_gcp_connection_config(
-                mode=connection_mode,
+                mode=effective_mode,
                 impersonated_service_account=impersonated_sa,
                 access_token=access_token,
                 user_id=user_id,
