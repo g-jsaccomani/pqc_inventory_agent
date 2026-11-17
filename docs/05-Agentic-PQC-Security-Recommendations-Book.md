@@ -88,23 +88,23 @@ To remediate discovered vulnerabilities without disrupting production SLAs, Goog
 - Domain 6 (Edge TLS 1.3 X25519MLKEM768 & CAS PKI): Set post-quantum key exchange to ENABLED on the SSL policies of all Google Cloud HTTPS/SSL load balancer target proxies (hybrid X25519MLKEM768 for TLS 1.3 clients; verify with a read-only gcloud compute ssl-policies describe) and treat any policy set to DEFERRED as an explicit harvest-now-decrypt-later exposure; require TLS 1.3 (MODERN/RESTRICTED/CUSTOM profile) where clients allow, which removes classical-only handshakes from older clients; tune TCP initial congestion windows (initcwnd) and MTU for the 1,216-byte client / 1,120-byte server hybrid key shares on self-managed proxies, backends and on-prem middleboxes (not on Google-managed load balancer frontends); and deploy parallel cross-signed ML-DSA-65 subordinate CAs in Certificate Authority Service (CAS).
 - Domain 7 (CI/CD Supply Chain & Binary Authorization): Migrate container image and CI/CD artifact signing attestors in Binary Authorization from ECDSA P-256 / RSA-PSS to Cloud HSM PQ-SIGN-ML-DSA-65, and adopt stateless hash-based SLH-DSA (FIPS 205) for long-lived firmware roots.
 
-## 7. Preventive Governance: Declarative GCP Organization Policy Guardrails
+## 7. Preventive Governance Advisory: Declarative GCP Organization Policy Reference Templates
 
-Remediation without preventive governance leads to cryptographic regression as engineering teams provision new cloud resources. Google Cloud PSO recommends enforcing three declarative GCP Organization Policy guardrails upon completing Phase 3 pilot validation:
+Remediation without preventive governance leads to cryptographic regression as engineering teams provision new cloud resources. Google Cloud PSO delivers three declarative GCP Organization Policy reference templates (for the Customer's governance team to evaluate and enforce during future PQC adoption waves):
 
 1. Enforce Hardware Root of Trust (constraints/cloudkms.allowedProtectionLevels): Configure the Organization Policy constraint on production folders to permit only HSM and EXTERNAL protection levels, blocking creation of software-backed asymmetric keys.
 2. Block New Classical Asymmetric Key Provisioning (Custom Org Policy Constraint): Deploy a Custom Organization Policy constraint on googleapis.com/CryptoKey resources evaluating resource.versionTemplate.algorithm to deny creation of new RSA-SIGN-*, RSA-DECRYPT-*, and EC-SIGN-* algorithms in migrated production projects without an approved exception label.
 3. Enforce TLS 1.3 & Post-Quantum Key Exchange (Custom Compute SSL Policy Constraint): Enforce custom constraints on compute.googleapis.com/SslPolicy resources across external load balancers requiring minTlsVersion == TLS_1_3 and postQuantumKeyExchange != DEFERRED (or == ENABLED); verify that the postQuantumKeyExchange field is supported in custom constraints before rollout. Requiring profile == RESTRICTED is optional hardening.
 
-## 8. Phased Multi-Horizon Security Modernization Roadmap (2026–2035)
+## 8. Phased Multi-Horizon PQC Adoption Roadmap (2026–2035)
 
-The table below sequences the recommended security engineering workstreams across three operational horizons—from the initial 6-week PSO assessment through full classical algorithm disallowance under NIST IR 8547 and EO 14412:
+The table below sequences the recommended PQC adoption workstreams across three operational horizons—starting with the 6-week PSO Cryptographic Security Posture Review, Inventory & Area Readiness Assessment, followed by Customer-led hybrid adoption and full classical algorithm disallowance under NIST IR 8547 and EO 14412:
 
-| Migration Horizon & Timeline | Strategic Security Objective | Core Engineering & Governance Deliverables | Target Maturity & Exposure Outcome |
+| Migration Horizon & Timeline | Strategic Security Objective | Core Posture Review & Customer-Led Adoption Milestones | Target Maturity & Exposure Outcome |
 | --- | --- | --- | --- |
-| Horizon 1: Days 1–45<br>(6-Week PSO Assessment & Pilot) | Baseline Discovery, Calibration, Edge Containment & Non-Prod HSM Pilot | Complete 7-Domain Discovery Questionnaire, CycloneDX v1.6 CBOM, Executive Risk Scorecard (optional Q-VaR from customer inputs), VPC-SC HNDL containment, and Week 5 Non-Prod Cloud HSM PQC Key Pilot. | Maturity: 45% -> 70%<br>Exposure: Tier-0 HNDL paths contained |
-| Horizon 2: Months 3–12<br>(Hybrid Dual-Stack Production Rollout) | Production Edge TLS 1.3 (X25519MLKEM768), Tink SDK KEM & Dual-Key JWKS | Set L7 Load Balancer SSL policies to post-quantum key exchange ENABLED (X25519MLKEM768) and require TLS 1.3; tune Envoy/Apigee to 16KB–32KB; refactor Tier-0 apps to Google Tink KEM-XWING; rotate P0 ECDSA/RSA keys in Cloud HSM. | Maturity: 70% -> 92%<br>Exposure: Tier-0 keys migrated to PQC |
-| Horizon 3: Months 12–36+<br>(Full NIST IR 8547 2030/2035 Compliance) | Full Classical Asymmetric Deprecation, PQC Root PKI & Preventive Org Policies | Complete CAS ML-DSA-65 / SLH-DSA PKI cutover; enforce preventive GCP Organization Policies blocking RSA/ECC; disable all legacy classical key versions ahead of 2030 mandate. | Maturity: 92% -> 100%<br>Exposure: classical asymmetric keys retired |
+| Horizon 1: Weeks 1–6<br>(6-Week PSO Posture Review & Readiness Assessment) | Automated Inventory (CBOM), 7-Domain Area Readiness Interviews & Cryptographic Security Posture Review | Complete 100% read-only 4-Vector GCP Inventory & CycloneDX v1.6 CBOM (Weeks 1–2), 7-Domain Area Readiness Questionnaire & Stakeholder Interviews + Mosca/Risk Scorecard (Weeks 3–4), and Cryptographic Key Security Posture Review + Advisory Recommendations Book & Adoption Roadmap (Weeks 5–6). | Complete CBOM, Area Readiness Baseline & Prioritized PQC Adoption Plan |
+| Horizon 2: Months 3–12<br>(Customer-Led Hybrid PQC Rollout) | Edge TLS 1.3 (X25519MLKEM768), Tink SDK Crypto-Agility & High-Priority Key Adoption | Customer engineering teams apply advisory guidelines to enable hybrid PQC on L7 Load Balancer SSL policies (`postQuantumKeyExchange = ENABLED`), expand Envoy/Apigee header buffers (16KB–32KB), adopt Google Tink KEM-XWING in Tier-0 apps, and transition P0 classical keys in Cloud HSM. | Maturity: 45% -> 85%<br>Exposure: Tier-0 HNDL paths remediated by Customer |
+| Horizon 3: Months 12–36+<br>(Full NIST IR 8547 2030/2035 Compliance) | Full Classical Asymmetric Deprecation, PQC Root PKI & Preventive Org Policies | Customer completes CAS ML-DSA-65 / SLH-DSA PKI hierarchy transition, enforces preventive GCP Organization Policies blocking legacy RSA/ECC, and retires classical key versions ahead of the 2030 mandate. | Maturity: 85% -> 100%<br>Exposure: classical asymmetric keys retired |
 
 ## 9. Reference Golden Sample: Live GCP Telemetry Assessment & CBOM Report (Org 31564119954)
 
@@ -130,20 +130,22 @@ Sample Notice: Illustrative sample output, shown only to explain the report form
 | Quantum-Safe | pqc-hybrid-kem-key (payments-kr) | KEM-XWING (X25519 + ML-KEM-768) | NIST PQC Category 3 | Quantum-Safe (NIST FIPS 203 Hybrid) |
 | Quantum-Safe | pqc-mldsa-signing-key (auth-kr) | PQ-SIGN-ML-DSA-65 | NIST PQC Category 3 | Quantum-Safe (NIST FIPS 204 Level 3) |
 
-## 3. Per-Key Remediation Runbooks from the Actual Inventory (100% of Vulnerable Keys)
+## 3. Advisory Per-Key Reference Guidelines from the Actual Inventory (For Future Customer-Led Adoption)
 
-### 3.1 Runbook 1 — jwt-signing-ecdsa-key (EC-SIGN-P256-SHA256 -> PQ-SIGN-ML-DSA-65)
+> **Advisory Scope Notice:** Google Cloud Consulting (PSO) does not execute key creation, IAM changes, or cutovers in the Customer's environment. The reference steps below are generated from the read-only inventory as **consultative advisory guidelines** for the Customer's engineering teams to review and execute under their own change-management governance.
 
-1. Step 1 — Provision PQC Key in Cloud HSM: gcloud kms keys create jwt-signing-ecdsa-key-pqc --keyring=auth-kr --location=global --purpose=asymmetric-signing --default-algorithm=pq-sign-ml-dsa-65 --protection-level=hsm --project=<TARGET-PROJECT-ID>
-2. Step 2 — Replicate Least-Privilege IAM Binding: gcloud kms keys add-iam-policy-binding jwt-signing-ecdsa-key-pqc --keyring=auth-kr --location=global --member="serviceAccount:Workload-SA@<TARGET-PROJECT-ID>.iam.gserviceaccount.com" --role="roles/cloudkms.signerVerifier" (consumer not identified in this sample: bind only a service account confirmed at STRONG or MEDIUM evidence)
-3. Step 3 — Gateway & JWT Header Adaptation: If the consumer is confirmed to issue JWTs (today WEAK evidence: key name only), increase max-request-headers-kb to 16KB-32KB in Envoy/Cloud Armor/NGINX to accommodate 3,309-byte ML-DSA-65 signatures.
-4. Step 4 — Dual-Signing Canary Cutover: Publish both ECDSA P-256 and ML-DSA-65 public keys in JWKS endpoint during canary rollout.
-5. Step 5 — Post-Change Verification & Legacy Disablement: Run gcloud kms keys versions list --key=jwt-signing-ecdsa-key-pqc --keyring=auth-kr --location=global and disable legacy version via gcloud kms keys versions disable 1 --key=jwt-signing-ecdsa-key --keyring=auth-kr --location=global. Rollback: re-enable it with gcloud kms keys versions enable 1 --key=jwt-signing-ecdsa-key --keyring=auth-kr --location=global and revert verifiers to the ECDSA public key.
+### 3.1 Advisory Reference 1 — jwt-signing-ecdsa-key (EC-SIGN-P256-SHA256 -> PQ-SIGN-ML-DSA-65)
 
-### 3.2 Runbook 2 — legacy-payment-rsa-key (RSA-2048 -> KEM-XWING / ML-KEM-768)
+1. Reference Step 1 — Target PQC Key Specification in Cloud HSM: `gcloud kms keys create jwt-signing-ecdsa-key-pqc --keyring=auth-kr --location=global --purpose=asymmetric-signing --default-algorithm=pq-sign-ml-dsa-65 --protection-level=hsm --project=<TARGET-PROJECT-ID>`
+2. Reference Step 2 — Least-Privilege IAM Binding Alignment: `gcloud kms keys add-iam-policy-binding jwt-signing-ecdsa-key-pqc --keyring=auth-kr --location=global --member="serviceAccount:Workload-SA@<TARGET-PROJECT-ID>.iam.gserviceaccount.com" --role="roles/cloudkms.signerVerifier"` (consumer not identified in this sample: bind only a service account confirmed at STRONG or MEDIUM evidence)
+3. Reference Step 3 — Gateway & JWT Header Sizing Prerequisite: If the consumer is confirmed to issue JWTs (today WEAK evidence: key name only), increase `max-request-headers-kb` to 16KB-32KB in Envoy/Cloud Armor/NGINX to accommodate 3,309-byte ML-DSA-65 signatures before any future key transition.
+4. Reference Step 4 — Dual-Signing Canary Strategy: Publish both ECDSA P-256 and ML-DSA-65 public keys in the JWKS endpoint during future canary validation by the Customer's team.
+5. Reference Step 5 — Verification & Rollback Reference: Verify key state via `gcloud kms keys versions list --key=jwt-signing-ecdsa-key-pqc --keyring=auth-kr --location=global` before retiring the legacy version under Customer CAB governance.
 
-1. Step 1 — Provision Hybrid PQC KEM Key in Cloud HSM: gcloud kms keys create legacy-payment-rsa-key-pqc --keyring=payments-kr --location=us-central1 --purpose=key-encapsulation --default-algorithm=kem-xwing --protection-level=hsm --project=<TARGET-PROJECT-ID>
-2. Step 2 — Replicate Least-Privilege IAM Binding: Grant roles/cloudkms.cryptoOperator only to the consuming service account once confirmed at STRONG or MEDIUM evidence (the payment-workload link in this sample is WEAK: naming only).
-3. Step 3 — Refactor AsymmetricDecrypt to KEM Decapsulate / Google Tink: Replace raw RSA decryption calls with Cloud KMS Decapsulate() or Google Tink AEAD envelope encryption.
-4. Step 4 — Historical Data Re-Encryption (HNDL Mitigation): Re-wrap stored data encrypted under RSA-2048 (payment archives, once the WEAK link is confirmed) using AES-256-GCM DEKs protected by KEM-XWING.
-5. Step 5 — Post-Change Verification & Legacy Disablement: Verify ENABLED state via gcloud kms keys versions list and disable the classical RSA-2048 version. Rollback: re-enable that version and restore the previous decrypt path until the issue is resolved.
+### 3.2 Advisory Reference 2 — legacy-payment-rsa-key (RSA-2048 -> KEM-XWING / ML-KEM-768)
+
+1. Reference Step 1 — Target Hybrid PQC KEM Key Specification in Cloud HSM: `gcloud kms keys create legacy-payment-rsa-key-pqc --keyring=payments-kr --location=us-central1 --purpose=key-encapsulation --default-algorithm=kem-xwing --protection-level=hsm --project=<TARGET-PROJECT-ID>`
+2. Reference Step 2 — Least-Privilege IAM Binding Alignment: Grant `roles/cloudkms.cryptoOperator` only to the consuming service account once confirmed at STRONG or MEDIUM evidence (the payment-workload link in this sample is WEAK: naming only).
+3. Reference Step 3 — Application API Readiness (`AsymmetricDecrypt` -> KEM `Decapsulate` / Google Tink): Plan application refactoring from raw RSA decryption calls to Cloud KMS `Decapsulate()` or Google Tink AEAD envelope encryption.
+4. Reference Step 4 — Historical Data Re-Wrapping Advisory (HNDL Mitigation): Plan re-wrapping of long-lived archives encrypted under RSA-2048 using AES-256-GCM DEKs protected by `KEM-XWING`.
+5. Reference Step 5 — Verification & Rollback Reference: Verify `ENABLED` state via `gcloud kms keys versions list` and retain rollback procedures under Customer CAB governance.

@@ -103,7 +103,7 @@ The questionnaire is structured across 7 weighted technical domains. The table b
 
 ## 4. Quantitative Maturity Scoring Rubric & Automated Calibration Parameter Mapping
 
-During the Phase 1 workshop, the PSO Architect scores each of the 7 domains on a 1-to-5 verification rubric and maps the extracted parameters directly into the agent's calibrate-assessment-context() tool (detailed in Agentic PQC Technical Architecture and Consultant Guide):
+During the Weeks 3–4 Area Readiness Interviews, the PSO Architect scores each of the 7 organizational and technical areas on a 1-to-5 verification rubric and maps the extracted parameters directly into the agent's calibrate-assessment-context() tool (detailed in Agentic PQC Technical Architecture and Consultant Guide):
 
 | Maturity Level | Posture Classification | Verification Criteria & Evidence Threshold | Calibrated Impact on Mosca (Y) & Risk Exposure |
 | --- | --- | --- | --- |

@@ -5,28 +5,28 @@
 ---
 
 ## Banner
-- **Title:** Agentic PQC Readiness — *Future-proof your Google Cloud security with us*
-- **Header Badge:** Overview: Agentic PQC Readiness
+- **Title:** Agentic PQC Readiness — *Cryptographic Inventory, Area Readiness & Security Posture Review*
+- **Header Badge:** Overview: Agentic PQC Posture Review
 
 ## What is the Agentic PQC Accelerator?
-The Agentic PQC Readiness Accelerator is a Google Cloud Consulting offering where Gemini AI agents inventory your encryption, map which applications depend on each key with evidence, and guide safe migration to NIST Post-Quantum Cryptography.
+The Agentic PQC Readiness Accelerator is a 6-week Google Cloud Consulting engagement where Gemini AI agents perform a 100% read-only cryptographic inventory, map which applications depend on each key with evidence, and pair with structured readiness interviews across your teams to review your cryptographic security posture and deliver a prioritized PQC adoption roadmap.
 
 ## Is this offering right for you?
-- **Quantum Readiness:** You want a clear roadmap to NIST Post-Quantum Cryptography (FIPS 203/204).
-- **Fast Discovery:** You need to find vulnerable RSA/ECC keys and the applications that depend on them, with evidence.
-- **HNDL Protection:** You need to protect long-life data against "Harvest Now, Decrypt Later" attacks before 2030 mandates.
+- **Cryptographic Visibility:** You need a complete, automated inventory (CBOM) of RSA/ECC/AES/PQC keys, certificates, SSL policies, and the applications that depend on them.
+- **Area Readiness Assessment:** You want to evaluate the PQC readiness of your Security, PKI, Network, Application, IAM, CI/CD, and GRC teams via a structured 7-domain questionnaire and interviews.
+- **Key Security Posture Review:** You need an evidence-backed review of key hygiene (rotation, HSM vs. software protection, HNDL exposure) and an advisory roadmap before 2030 NIST mandates.
 
 ## What does your team gain?
-- **Evidence-Based CBOM:** An automated CycloneDX v1.6 inventory of Cloud KMS keys, certificates, and the workloads that use them.
-- **Auditable Risk & Impact:** Transparent scorecard, business impact sized with your own data, and Org Policies that block legacy keys.
-- **Zero-Downtime Upgrade:** Safe transition using per-key Cloud HSM runbooks from your inventory, hybrid TLS 1.3, and Google Tink SDK refactoring.
+- **Evidence-Based CBOM:** An automated CycloneDX v1.6 inventory of Cloud KMS keys, TLS policies (`postQuantumKeyExchange`), certificates, and workload dependencies.
+- **7-Domain Area Readiness & Posture Scorecard:** Maturity assessment across 7 areas, auditable key posture scorecard, Mosca ($X+Y>Z$) analysis, and business impact sized with your own data.
+- **Advisory PQC Adoption Blueprint:** Target architecture recommendations, Organization Policy reference templates, and advisory per-key reference guides for future customer-led implementation (zero changes executed in your environment).
 
 ## Engagement Overview (Right Column Badges)
 - **Key deliverables:**
-  - `Executive Risk Scorecard`
-  - `Security Recs Book`
   - `CycloneDX v1.6 CBOM`
-  - `Per-Key HSM Runbooks`
+  - `7-Domain Readiness Report`
+  - `Executive Posture Scorecard`
+  - `Security Recs & Roadmap Book`
 - **Google team could include:**
   - `GSD Security Architect`
   - `PSO Security Consultant`
@@ -35,7 +35,7 @@ The Agentic PQC Readiness Accelerator is a Google Cloud Consulting offering wher
 - **Your team includes:**
   - `Security Executive`
   - `Cryptography / PKI Lead`
-  - `AppMod / Tink Dev Lead`
+  - `App Architecture Lead`
   - `Cloud KMS & Infra Lead`
   - `Network & Edge TLS Lead`
   - `GRC & Risk Committee`
@@ -43,9 +43,9 @@ The Agentic PQC Readiness Accelerator is a Google Cloud Consulting offering wher
   - `Delivery time est: 6 weeks - 224 hours`
 
 ## Key items we need from you
-- Engaged Security, PKI, Network, AppMod & Risk teams
+- Participation of Security, PKI, Network, App, IAM & GRC teams in readiness interviews
 - Read-only IAM roles enabled before Week 1 Kickoff
-- Access to Cloud KMS, Cloud Asset Inventory & TLS policies
+- Read-only metadata access to Cloud KMS, Cloud Asset Inventory & TLS policies
 
 ## Other Google Cloud solutions that complement your cloud journey
 ### Complementary Google Cloud Offerings (`Complementary Solutions`)
@@ -54,3 +54,4 @@ The Agentic PQC Readiness Accelerator is a Google Cloud Consulting offering wher
 - VPC Service Controls (VPC-SC) Perimeters
 - Binary Authorization & Container Signing
 - Google Tink SDK Crypto-Agility Advisory
+
