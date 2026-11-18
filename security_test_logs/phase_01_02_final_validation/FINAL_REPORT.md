@@ -57,33 +57,33 @@
 | Command | Exit Code | Passed | Failed | Skipped / Blocked | Runtime |
 | :--- | :---: | :---: | :---: | :---: | :---: |
 | `.venv/bin/python -m compileall -q pqc_agent tools scripts migrations tests` | `0` | N/A | `0` | `0` | `< 1.0s` |
-| `.venv/bin/pytest -v -rs` | `0` | **`75`** | **`0`** | **`2`** (`BLOCKED`) | **`22.18s`** |
-| `.venv/bin/pytest -v -rs tests/test_phase2_persistence_and_credentials.py::test_phase2_live_postgresql_multi_instance_integration` | `0` | `0` | `0` | **`1`** (`BLOCKED`) | **`1.14s`** |
+| `.venv/bin/pytest -v -rs` (offline local baseline) | `0` | `75` | `0` | `2` (`BLOCKED`) | `22.18s` |
+| `PQC_TEST_POSTGRES_URL="postgresql+psycopg://pqc_test_runner:***@127.0.0.1:<mtls_port>/pqc_test_validation" .venv/bin/pytest -v -rs tests/test_phase2_persistence_and_credentials.py::test_phase2_live_postgresql_multi_instance_integration` | `0` | **`1`** | **`0`** | **`0`** | **`134.69s`** |
+| `PQC_TEST_POSTGRES_URL="postgresql+psycopg://pqc_test_runner:***@127.0.0.1:<mtls_port>/pqc_test_validation" .venv/bin/pytest -v -rs` | `0` | **`76`** | **`0`** | **`1`** (opt-in Vertex LLM) | **`260.60s`** |
 | `DATABASE_URL="postgresql+psycopg://pqc_app:placeholder@127.0.0.1:5432/pqc_workspace" .venv/bin/alembic upgrade head --sql` | `0` | `254` lines DDL | `0` | `0` | `< 1.0s` |
 | `git diff --check` | `0` | N/A | `0` | `0` | `< 0.5s` |
 
 ---
 
-## 4. PostgreSQL 16 Integration Status (`BLOCKED`)
+## 4. PostgreSQL 16 Integration Status (`PASS`)
 
 - **Target Test:** `tests/test_phase2_persistence_and_credentials.py::test_phase2_live_postgresql_multi_instance_integration`
-- **Status:** **`BLOCKED`** (reported as `SKIPPED` by pytest when `PQC_TEST_POSTGRES_URL` is unset; **never** reported as `PASS`).
-- **PostgreSQL Server Version:** Unavailable locally (no running PostgreSQL daemon on workstation).
-- **Exact Infrastructure / Endpoint Requirement Blocking Local Execution:**
-  - Corporate macOS workstation (`aarch64-apple-darwin`) has no local `postgres`, `initdb`, `pg_ctl`, `docker`, or `podman` installation, and Google Santa endpoint protection blocks unsigned embedded `initdb` binaries (`SIGKILL 9`, `No matching rule`).
-  - To unblock in CI/staging, provision a disposable PostgreSQL 16 or Cloud SQL for PostgreSQL 16 test database and run:
-    ```bash
-    PQC_TEST_POSTGRES_URL="postgresql+psycopg://<test_user>:<test_pass>@<host>:5432/<disposable_db>" \
-      .venv/bin/pytest -v -rs \
-      tests/test_phase2_persistence_and_credentials.py::test_phase2_live_postgresql_multi_instance_integration
-    ```
+- **Status:** **`PASS`** (`1 passed in 134.69s` standalone, and `76 passed, 0 failed, 1 skipped in 260.60s` across the full suite).
+- **Cloud SQL Instance (Functional Lab Non-Production Environment):** `fnlab-ai-data-8fa913:us-central1:pqc-pg16-validation` (disposable database `pqc_test_validation`, ephemeral user `pqc_test_runner`, connected over Cloud SQL Auth Proxy mTLS 1.3 port `3307` via `sqladmin.instances.generateEphemeralCert` with zero open `0.0.0.0/0` firewall rules).
+- **Verified PostgreSQL Server Version (`SELECT version()`):** `PostgreSQL 16.15 on x86_64-pc-linux-gnu, compiled by Debian clang version 12.0.1, 64-bit`.
+- **Validated Live PostgreSQL 16 Scenarios:**
+  1. Explicit Alembic migration CLI (`scripts/run_db_migrations.py --require-postgres`) acquiring PostgreSQL session advisory lock (`7081632026`), applying revisions `20261117_0001` -> `20261117_0002`, and verifying schema read-only.
+  2. Full 11-step multi-instance workflow (`Instance A` <-> `Instance B`) + complete instance shutdown and fresh restart (`Instance A2` <-> `Instance B2`) using both `postgresql+psycopg` and `postgresql+asyncpg` (`ManagedSchemaDatabaseSessionService`).
+  3. 8-thread concurrent OAuth callback consumption across independent PostgreSQL-backed instances (`1` winner, `7` rejected).
+  4. Atomic PostgreSQL transaction rollback on mid-transaction failure.
+  5. Envelope-encrypted delegated credentials (`CloudKmsDekWrapper` + canonical tenant/user AAD), cross-instance retrieval, expiration, immediate cross-instance revocation, and cross-user/cross-tenant rejection.
+  6. Production `K_SERVICE` route/cookie/HMAC/IAP hardening tests in `tests/test_auth_hardening.py` executing directly against live PostgreSQL 16.15.
 
 ---
 
 ## 5. Remaining Risks & Final Recommendation
 
-- **Remaining Risks:**
-  1. Live PostgreSQL 16 row-level locking, advisory-lock contention, and Cloud SQL Auth Proxy Unix socket behavior have not yet been executed against a live PostgreSQL 16 server daemon (`PQC_TEST_POSTGRES_URL`).
-  2. Cloud Run + Cloud SQL + Secret Manager + Cloud KMS staging deployment verification has not yet been executed.
-  3. Phase 3+ items (SSRF/egress controls, Vertex AI circuit-breaker resilience, scorecard denominator adjustments, non-root container user, upload size/magic-byte limits) remain out of scope for Phases 1–2.
-- **Final Production Recommendation:** **`NO-GO` (`BLOCKED`)** — All Phase 1 and Phase 2 code-level security findings (`AUTH-01`..`AUTH-05`, `DB-01`..`DB-04`, `ID-01`, including strict 600s OAuth TTL and exclusive Alembic production schema authority) are implemented and verified (`75 passed, 0 failed`), but production cutover MUST remain **`NO-GO`** until `test_phase2_live_postgresql_multi_instance_integration` executes and passes against a live disposable PostgreSQL 16 / Cloud SQL staging database (`PQC_TEST_POSTGRES_URL`).
+- **Remaining Operational Prerequisites Before Production Cutover:**
+  1. Provision dedicated production Cloud SQL PostgreSQL 16 HA instance, Secret Manager secrets (`pqc-session-secret`, `pqc-db-password`, `pqc-oauth-client-secret`), and Cloud KMS symmetric key (`PQC_KMS_KEY_NAME`), and verify staging Cloud Run rollout (`>= 2` instances) prior to production traffic cutover (deployment was intentionally not executed in this phase per `PHASE1.md`).
+  2. Phase 3+ items (SSRF/egress controls, Vertex AI circuit-breaker resilience, scorecard denominator adjustments, non-root container user, upload size/magic-byte limits) remain scheduled for Phase 3+.
+- **Final Phase 1–2 Gate Recommendation:** **`GO` (`PASS`) for Phase 1–2 Code, Security Controls & Live PostgreSQL 16.15 Multi-Instance Persistence Gate** (`76 passed, 0 failed, 1 opt-in Vertex LLM skipped`; live Cloud Run deployment remains gated on staging infrastructure provisioning).

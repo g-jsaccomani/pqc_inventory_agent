@@ -40,12 +40,11 @@
 
 ---
 
-## 3. How to Unblock Production Release (`NO-GO` -> `GO`)
+## 3. Live PostgreSQL 16.15 Validation Completed (`PASS` / `GO` for Phase 3)
 
-1. Provision a disposable PostgreSQL 16 (or Cloud SQL for PostgreSQL 16) test database in CI/staging (never use production credentials) and run:
-   ```bash
-   PQC_TEST_POSTGRES_URL="postgresql+psycopg://<user>:<pass>@<host>:5432/<test_db>" \
-     .venv/bin/pytest -v -rs \
-     tests/test_phase2_persistence_and_credentials.py::test_phase2_live_postgresql_multi_instance_integration
-   ```
-2. Provision staging Cloud SQL PostgreSQL 16, Secret Manager secrets (`pqc-session-secret`, `pqc-db-password`, `pqc-oauth-client-secret`), and Cloud KMS symmetric key (`PQC_KMS_KEY_NAME`), execute `scripts/run_db_migrations.py --require-postgres`, and verify `/api/health` across `>= 2` Cloud Run instances before proceeding to Phase 3.
+1. **Validated Against Real Cloud SQL for PostgreSQL 16 (`PASS`):**
+   - Instance: `fnlab-ai-data-8fa913:us-central1:pqc-pg16-validation` (`Functional Lab - AI and Data`, `PostgreSQL 16.15 on x86_64-pc-linux-gnu`, disposable DB `pqc_test_validation`, connected via ephemeral Cloud SQL mTLS 1.3 port `3307`).
+   - Standalone `test_phase2_live_postgresql_multi_instance_integration`: **`1 passed in 134.69s`** (exit `0`).
+   - Full regression suite with `PQC_TEST_POSTGRES_URL` active: **`76 passed, 0 failed, 1 skipped in 260.60s`** (exit `0`).
+2. **Next Engineering Steps (Phase 3 / Staging Rollout):**
+   - Proceed to Phase 3 security remediation items (`SSRF`/egress hardening, Vertex AI circuit-breaker resilience, scorecard denominator adjustments, non-root container user, upload size/magic-byte limits), or provision staging Secret Manager + Cloud KMS (`PQC_KMS_KEY_NAME`) and execute `scripts/deploy_cloud_run.sh` in staging.

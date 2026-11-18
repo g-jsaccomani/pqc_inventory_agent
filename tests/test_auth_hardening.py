@@ -81,7 +81,18 @@ def _registry():
 
 
 def _allow_unit_test_db_when_no_live_pg(monkeypatch):
-    """Allows route/cookie unit tests that toggle K_SERVICE to use tmp_path SQLite when PQC_TEST_POSTGRES_URL is unset."""
+    """Allows route/cookie unit tests that toggle K_SERVICE to run without live GCS ADC or when PQC_TEST_POSTGRES_URL is unset."""
+    from pqc_agent import workspace_server as ws
+
+    monkeypatch.setattr(
+        ws.ResilientGcsArtifactService,
+        "__init__",
+        lambda self, bucket_name, **kw: (
+            setattr(self, "_local_fallback_store", {})
+            or setattr(self, "_gcs_online", False)
+            or setattr(self, "bucket_name", bucket_name)
+        ),
+    )
     if os.getenv("PQC_TEST_POSTGRES_URL"):
         return
     from pqc_agent import auth_store
@@ -93,10 +104,15 @@ def _app(tmp_path):
     from pqc_agent.migration_tool import run_alembic_upgrade_head
     from pqc_agent.workspace_server import create_workspace_app
 
-    db_url = os.getenv("PQC_TEST_POSTGRES_URL") or f"sqlite:///{tmp_path / 'sessions.db'}"
-    if os.getenv("K_SERVICE"):
+    is_prod_test = bool(os.getenv("K_SERVICE"))
+    db_url = (
+        os.environ["PQC_TEST_POSTGRES_URL"]
+        if (is_prod_test and os.getenv("PQC_TEST_POSTGRES_URL"))
+        else f"sqlite:///{tmp_path / 'sessions.db'}"
+    )
+    if is_prod_test:
         run_alembic_upgrade_head(db_url)
-    bucket = "gs://test-unit-bucket" if os.getenv("K_SERVICE") else None
+    bucket = "gs://test-unit-bucket" if is_prod_test else None
     return create_workspace_app(
         session_db_url=db_url,
         artifact_bucket=bucket,
@@ -1088,6 +1104,8 @@ def test_phase1_production_fail_closed_hmac_secret_rotation_and_iap_audience_enf
     from pqc_agent import workspace_server as ws
     from pqc_agent.migration_tool import run_alembic_upgrade_head
 
+    if os.getenv("PQC_TEST_POSTGRES_URL"):
+        monkeypatch.setenv("SESSION_DB_URL", os.environ["PQC_TEST_POSTGRES_URL"])
     run_alembic_upgrade_head(os.environ["SESSION_DB_URL"])
 
     # 1. Production fails closed when PQC_AUTH_SECRET is missing or too short (< 32 chars)

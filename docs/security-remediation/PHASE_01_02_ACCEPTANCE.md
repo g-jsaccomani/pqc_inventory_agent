@@ -44,8 +44,8 @@ Status Legend (per `PHASE1.md` Section 6):
 | **Concurrent OAuth Callbacks & Concurrent Multi-Instance DB Writes** | **`PASS`** | `tests/test_phase2_persistence_and_credentials.py::test_phase2_concurrent_oauth_callbacks_and_concurrent_multi_instance_db_writes` (`1 x 200`, `7 x 400`; 12 concurrent writers verified). |
 | **Database Interruption (Fail-Closed), Atomic Transaction Rollback & Database Recovery** | **`PASS`** | `tests/test_phase2_persistence_and_credentials.py::test_phase2_database_interruption_fail_closed_rollback_and_recovery`. |
 | **Credential Expiration, Revocation, Cross-User Session Isolation & Cross-Tenant Credential AAD Isolation** | **`PASS`** | `tests/test_phase2_persistence_and_credentials.py::test_phase2_kms_envelope_encryption_refresh_expiry_revocation_and_cross_tenant_isolation` & `tests/test_pqc_inventory.py::test_multi_tenant_google_auth_*`. |
-| **Live PostgreSQL Server Execution (`PQC_TEST_POSTGRES_URL`)** | **`BLOCKED`** | `tests/test_phase2_persistence_and_credentials.py::test_phase2_live_postgresql_multi_instance_integration` — Corporate macOS host lacks `postgres`/`docker`/`podman` and Google Santa killed embedded `pgserver` `initdb` (`SIGKILL 9`, `No matching rule`). Must be run in CI/staging with `PQC_TEST_POSTGRES_URL` set. |
-| **Cloud Run / Cloud SQL / Cloud KMS Live Deployment Verification** | **`BLOCKED`** | Production deployment prohibited by `PHASE1.md` rules; no live Cloud SQL / Cloud KMS staging environment attached to this local session. |
+| **Live PostgreSQL Server Execution (`PQC_TEST_POSTGRES_URL`)** | **`PASS`** | `tests/test_phase2_persistence_and_credentials.py::test_phase2_live_postgresql_multi_instance_integration` — Executed over Cloud SQL mTLS 1.3 (`port 3307`) against `fnlab-ai-data-8fa913:us-central1:pqc-pg16-validation` (`PostgreSQL 16.15 on x86_64-pc-linux-gnu`, disposable DB `pqc_test_validation`): **`1 passed in 134.69s`** standalone and **`76 passed, 0 failed, 1 skipped in 260.60s`** across the full suite. |
+| **Cloud Run / Cloud SQL / Cloud KMS Live Deployment Verification** | **`BLOCKED`** | Production/Cloud Run service deployment intentionally not executed per `PHASE1.md` rules (`no deployment` in this phase). |
 
 ---
 
@@ -56,15 +56,14 @@ Status Legend (per `PHASE1.md` Section 6):
 | Deployment Config, `Dockerfile`, `app.yaml`, `.env.example`, Lockfiles (`uv.lock`, `requirements.txt`) free of SQLite/FUSE & real secrets | **`PASS`** | Verified by `test_deployment_configuration_disables_simulation_and_keeps_persistence` and secret scan. |
 | Cloud SQL, Secret Manager, IAM, KMS Credential Justification, Migration & Rollback Documentation | **`PASS`** | [`docs/security-remediation/MIGRATION_AND_ROLLBACK.md`](./MIGRATION_AND_ROLLBACK.md), [`README.md`](../../README.md), [`docs/06-Agentic-PQC-Technical-Architecture-and-Consultant-Guide.md`](../06-Agentic-PQC-Technical-Architecture-and-Consultant-Guide.md). |
 | Mandatory Test Evidence Report & Acceptance Checklist | **`PASS`** | [`security_test_logs/phase_01_02_remediation/REPORT.md`](../../security_test_logs/phase_01_02_remediation/REPORT.md), [`security_test_logs/phase_01_02_final_validation/FINAL_REPORT.md`](../../security_test_logs/phase_01_02_final_validation/FINAL_REPORT.md) & this file. |
-| Remediation Commits Preserved (`no force-push`, `no deploy`, `no merge to main`, `no commit rewrite`) | **`PASS`** | `60ffaa2`, `02b53e9`, `d43e17e` + corrective-pass commit on `security-hardening/phase-01-02`. |
+| Remediation Commits Preserved (`no force-push`, `no deploy`, `no merge to main`, `no commit rewrite`) | **`PASS`** | `60ffaa2`, `02b53e9`, `d43e17e`, `bdcf692` + PostgreSQL 16 live validation commit on `security-hardening/phase-01-02`. |
 
 ---
 
-## 5. Final Corrective Pass Summary (`AUTH-02` & `DB-01`)
+## 5. Final Corrective Pass Summary (`AUTH-02`, `DB-01` & Live PostgreSQL 16.15 Validation)
 
 - **Original Findings Fixed:**
   1. `AUTH-02`: `DistributedAuthStore.create_oauth_transaction()` and `_oauth_ttl_seconds()` previously allowed `ttl_seconds` up to `1800`s; root cause was `min(..., 1800)`. Corrected to strict `[1, 600]` clamping + `created_at > (now - 600.0)` enforcement (`PASS`).
   2. `DB-01`: Production startup previously called `PqcPersistenceBase.metadata.create_all()` and ADK `BaseV1.metadata.create_all()`; root cause was default `create_schema=True` without read-only Alembic verification. Corrected by making Alembic (`20261117_0001` -> `20261117_0002`) the exclusive production schema authority via `scripts/run_db_migrations.py`, prohibiting `metadata.create_all()` in production, and failing closed on missing, outdated, or inconsistent schema (`PASS`).
-- **Actual Test Results:** `75 passed, 0 failed, 2 skipped` (`22.18s`, exit `0`).
-- **Remaining Blockers:** Live PostgreSQL 16 integration (`PQC_TEST_POSTGRES_URL`) and live Cloud SQL / Cloud Run staging verification remain **`BLOCKED`**.
-- **Overall Production Release Status:** **`BLOCKED` (`NO-GO` until `PQC_TEST_POSTGRES_URL` integration suite passes against disposable PostgreSQL 16 / Cloud SQL staging)**.
+- **Actual Test Results (with Live Cloud SQL PostgreSQL 16.15 Active):** **`76 passed, 0 failed, 1 skipped`** (`260.60s`, exit `0`; standalone PostgreSQL 16 multi-instance suite: **`1 passed in 134.69s`**).
+- **Phase 1–2 Acceptance Status:** **`PASS` (`GO` for Phase 1–2 code & PostgreSQL 16 persistence gate; Cloud Run staging rollout remains a separate deployment step)**.

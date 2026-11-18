@@ -1174,9 +1174,19 @@ def test_phase2_live_postgresql_multi_instance_integration(tmp_path, monkeypatch
 
     pg_engine = auth_store.build_sync_sqlalchemy_engine(auth_store.normalize_sync_db_url(pg_url))
     try:
-        with pg_engine.connect() as conn:
+        with pg_engine.begin() as conn:
             pg_version = str(conn.execute(text("SELECT version()")).scalar() or "")
             assert "PostgreSQL" in pg_version
+            conn.execute(
+                text(
+                    "TRUNCATE TABLE "
+                    "events, sessions, user_states, app_states, "
+                    "pqc_session_metadata, pqc_delegated_credentials, pqc_user_connections, "
+                    "pqc_calibration_events, pqc_oauth_client_configs, pqc_auth_sessions, "
+                    "pqc_consumed_nonces, pqc_oauth_transactions, pqc_tenant_users "
+                    "CASCADE"
+                )
+            )
     finally:
         pg_engine.dispose()
 
@@ -1232,19 +1242,33 @@ def test_phase2_live_postgresql_multi_instance_integration(tmp_path, monkeypatch
         monkeypatch.setenv("PQC_KMS_KEY_NAME", "projects/p/locations/us-central1/keyRings/kr/cryptoKeys/pg-kek")
         cred_a = credential_service.EncryptedDatabaseCredentialService(store=store_a, kms_client=kms_mock)
         cred_b = credential_service.EncryptedDatabaseCredentialService(store=store_b, kms_client=kms_mock)
-        cred_a.save_delegated_token(user_id=ALICE, access_token="ya29.pg-live-secret-token", expires_in_seconds=300)
-        assert cred_b.load_delegated_token(user_id=ALICE) == "ya29.pg-live-secret-token"
+        cred_a.store_delegated_token(
+            user_id=ALICE,
+            access_token="ya29.pg-live-secret-token",
+            expires_in=300.0,
+            caller_user_id=ALICE,
+        )
+        loaded_pg = cred_b.load_delegated_token(
+            user_id=ALICE,
+            caller_user_id=ALICE,
+            caller_tenant_domain="google.com",
+        )
+        assert loaded_pg is not None and loaded_pg.access_token == "ya29.pg-live-secret-token"
         with pytest.raises(PermissionError):
-            cred_b.load_delegated_token(user_id=BOB, requested_owner_id=ALICE)
+            cred_b.load_delegated_token(user_id=ALICE, caller_user_id=BOB)
         with pytest.raises(PermissionError):
-            cred_b.load_delegated_token(user_id=EXT_TENANT_USER, requested_owner_id=ALICE)
+            cred_b.load_delegated_token(user_id=ALICE, caller_tenant_domain="othercorp.example.com")
 
-        cred_a.save_delegated_token(user_id=BOB, access_token="ya29.pg-expiring", expires_in_seconds=1)
-        time.sleep(1.15)
-        assert cred_b.load_delegated_token(user_id=BOB) is None
+        cred_a.store_delegated_token(
+            user_id=BOB,
+            access_token="ya29.pg-expiring",
+            expires_in=1.0,
+            caller_user_id=BOB,
+        )
+        assert cred_b.load_delegated_token(user_id=BOB, caller_user_id=BOB, now_override=time.time() + 5.0) is None
 
-        assert cred_a.revoke_user_credentials(ALICE) >= 1
-        assert cred_b.load_delegated_token(user_id=ALICE) is None
+        assert cred_a.revoke_delegated_tokens(user_id=ALICE, reason="pg_live_logout") >= 1
+        assert cred_b.load_delegated_token(user_id=ALICE, caller_user_id=ALICE) is None
     finally:
         store_a.close()
         store_b.close()
