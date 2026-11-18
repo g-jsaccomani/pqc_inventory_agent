@@ -15,3 +15,22 @@
 - [x] **5. `PRE-MERGE-03` Fixed (`app.yaml`, `docs/security-remediation/MIGRATION_AND_ROLLBACK.md`):** Updated drifted `20261117_0001` references to head revision `20261117_0002` and `DRY_RUN_VALIDATED` to `DRY_RUN_OK`.
 - [x] **6. Full Regression Validation Passed:** `compileall` (`exit 0`), `bash -n` (`exit 0`), `alembic upgrade head --sql` (`exit 0`, `254` lines), `pytest -v -rs` (`81 passed, 0 failed, 3 skipped` in `49.51s`, `exit 0`), `git diff --check` (`exit 0`).
 - [x] **7. Scope Control Verified:** Zero Phase 1–2 security controls weakened or rewritten; zero historical evidence reports modified; no merge or cloud deployment executed.
+
+---
+
+## Follow-Up Correction Checkpoint — Prevent Duplicate Workspace App Initialization
+
+- **Timestamp (Local):** `2026-11-18T13:44:00-03:00`
+- **Working Branch:** `security-hardening/phase-01-02`
+- **Original Pre-Hotfix Baseline `HEAD` SHA:** `5eff14fc0e676b335b695ea0813a6620af29c296`
+- **Follow-Up Correction Baseline `HEAD` SHA:** `d24004489b0c83a4813361d8832f338d9e673e74`
+- **Final Commit Message (Direct Child of `d24004489b0c83a4813361d8832f338d9e673e74`):** `fix(security): prevent duplicate workspace app initialization` *(single unamended commit; exact self-SHA inspectable via `git rev-parse HEAD`)*
+
+### Completed Follow-Up Steps
+- [x] **1. Preconditions Verified:** Checked out `security-hardening/phase-01-02` at exact `HEAD` `d24004489b0c83a4813361d8832f338d9e673e74` with clean working tree; `main` untouched; zero commits amended or rewritten.
+- [x] **2. Lazy Application Singleton Fixed (`main.py`):** Removed `preloaded` check and second `_ws.create_workspace_app()` call in `main.get_workspace_app()`; always reuses `_ws.app` under `_WORKSPACE_APP_LOCK` while preserving PEP 562 `__getattr__`, non-server CLI decoupling, and fail-closed production PostgreSQL validation.
+- [x] **3. Import-Order Regression Test Added (`tests/test_pre_merge_hotfix.py`):** Added `test_pre_merge_02_workspace_server_first_import_order_reuses_singleton_app` verifying `import pqc_agent.workspace_server` -> `import main` -> `main.get_workspace_app()` returns `workspace_server.app` identically with `0` extra `create_workspace_app()` calls and `1` total `DistributedAuthStore` initialization (`PASSED`).
+- [x] **4. Docker Build Validation Checked:** Confirmed local `docker`/`podman` CLIs are absent (`NOT_INSTALLED`) and no `.github/workflows` CI workflow exists in repository (`NO_DOT_GITHUB_DIR`; `gh workflow list` shows only `Dependency Graph`). Preserved live Docker build validation as **`BLOCKED`** without introducing unrelated CI infrastructure or claiming an image build.
+- [x] **5. PostgreSQL Validation Checked:** Destructive test safety guard (`validate_destructive_postgres_test_target`) verified `PASS` without weakening any check; live PostgreSQL 16 integration test (`test_phase2_live_postgresql_multi_instance_integration`) cleanly `SKIPPED` / **`BLOCKED`** in current local shell (`NO_LOCAL_PG_OR_PROXY_RUNNING`, disposable `PQC_TEST_POSTGRES_URL` + `PQC_ALLOW_DESTRUCTIVE_TEST_DB=true` unset; historical Cloud SQL PG16 validation preserved in `686e4ff`).
+- [x] **6. Regression Suite Verified:** `compileall` (`exit 0`), `bash -n scripts/setup_and_deploy_vertex.sh` (`exit 0`), `bash -n scripts/deploy_cloud_run.sh` (`exit 0`), `.venv/bin/pytest -v -rs` (**`82 passed, 0 failed, 3 skipped` in `54.95s`, `exit 0`**), `git diff --check` (`exit 0`).
+- [x] **7. Remaining Blockers Recorded:** (1) Live Docker image build & container smoke test (`BLOCKED` until run on a host with Docker or Cloud Build); (2) Live Cloud Run + Cloud SQL staging/production rollout execution (`NOT EXECUTED`).
