@@ -53,9 +53,9 @@ from google.adk.sessions.database_session_service import DatabaseSessionService
 from google.adk.tools.base_tool import BaseTool
 from google.adk.tools.tool_context import ToolContext
 from google.genai import types
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
-from pqc_agent import auth_guard, auth_store, credential_service
+from pqc_agent import auth_guard, auth_store, credential_service, egress_guard
 from pqc_agent.agent import create_pqc_agent
 from pqc_agent.model_registry import ModelRegistry
 from pqc_agent.portal_ui import PORTAL_HTML
@@ -507,10 +507,15 @@ def _verify_google_oauth_or_id_token(
             try:
                 url = f"https://oauth2.googleapis.com/tokeninfo?id_token={urllib.parse.quote(tok)}"
                 req = urllib.request.Request(url, headers={"Accept": "application/json"})
-                with urllib.request.urlopen(req, timeout=8) as resp:
+                with egress_guard.safe_urlopen(
+                    req,
+                    timeout=8.0,
+                    max_bytes=egress_guard.DEFAULT_MAX_RESPONSE_BYTES,
+                    allowed_hosts=egress_guard.GOOGLE_OAUTH_ALLOWED_HOSTS,
+                ) as resp:
                     info = json.loads(resp.read().decode("utf-8"))
             except Exception as exc:
-                return None, f"Google ID token verification failed: {exc}"
+                return None, f"Google ID token verification failed: {egress_guard.redact_sensitive_text(exc)}"
             if info.get("iss") not in ("accounts.google.com", "https://accounts.google.com"):
                 return None, "Google ID token has an unexpected issuer."
             if audiences and info.get("aud") not in audiences:
@@ -556,7 +561,12 @@ def _verify_google_oauth_or_id_token(
         try:
             url = f"https://oauth2.googleapis.com/tokeninfo?access_token={urllib.parse.quote(tok)}"
             req = urllib.request.Request(url, headers={"Accept": "application/json"})
-            with urllib.request.urlopen(req, timeout=8) as resp:
+            with egress_guard.safe_urlopen(
+                req,
+                timeout=8.0,
+                max_bytes=egress_guard.DEFAULT_MAX_RESPONSE_BYTES,
+                allowed_hosts=egress_guard.GOOGLE_OAUTH_ALLOWED_HOSTS,
+            ) as resp:
                 info = json.loads(resp.read().decode("utf-8"))
             if "expires_in" in info:
                 try:
@@ -591,7 +601,12 @@ def _verify_google_oauth_or_id_token(
                         "https://www.googleapis.com/oauth2/v3/userinfo",
                         headers={"Authorization": f"Bearer {tok}", "Accept": "application/json"},
                     )
-                    with urllib.request.urlopen(u_req, timeout=3) as u_resp:
+                    with egress_guard.safe_urlopen(
+                        u_req,
+                        timeout=3.0,
+                        max_bytes=egress_guard.DEFAULT_MAX_RESPONSE_BYTES,
+                        allowed_hosts=egress_guard.GOOGLE_OAUTH_ALLOWED_HOSTS,
+                    ) as u_resp:
                         u_info = json.loads(u_resp.read().decode("utf-8"))
                     if isinstance(u_info, dict) and normalize_user_id(u_info.get("email") or "") == email:
                         if u_info.get("name"):
@@ -613,7 +628,7 @@ def _verify_google_oauth_or_id_token(
                 "expires_in": expires_in,
             }, None
         except Exception as exc:
-            return None, f"Google OAuth access token verification failed: {exc}"
+            return None, f"Google OAuth access token verification failed: {egress_guard.redact_sensitive_text(exc)}"
 
     return None, "No token provided."
 
@@ -1228,6 +1243,8 @@ class ConnectionConfigPayload(BaseModel):
 
 
 class GcloudCommandPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     command: str
     user_id: Optional[str] = None
 
@@ -1302,10 +1319,15 @@ def _exchange_oauth_code(
             data=form_data,
             headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with egress_guard.safe_urlopen(
+            req,
+            timeout=10.0,
+            max_bytes=egress_guard.DEFAULT_MAX_RESPONSE_BYTES,
+            allowed_hosts=egress_guard.GOOGLE_OAUTH_ALLOWED_HOSTS,
+        ) as resp:
             tok_data = json.loads(resp.read().decode("utf-8"))
     except Exception as exc:
-        return None, f"OAuth code exchange failed: {exc}"
+        return None, f"OAuth code exchange failed: {egress_guard.redact_sensitive_text(exc)}"
     if not tok_data.get("access_token"):
         return None, "OAuth code exchange returned no access_token."
     return tok_data, None
