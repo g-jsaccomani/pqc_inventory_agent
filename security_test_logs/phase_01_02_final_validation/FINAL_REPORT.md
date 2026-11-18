@@ -8,8 +8,10 @@
   - `02b53e9da7590b67d9b3c1960a400cea04add49d` (`02b53e9`) — `security: complete PostgreSQL persistence and credential architecture`
   - `d43e17e594131a23a021b1afa68541851ff32307` (`d43e17e`) — `docs(security): add remediation specifications and execution checkpoint logs`
   - `bdcf69268843a141d2ebc3a68b0272791a0ec813` (`bdcf692`) — `security: close phase 1-2 acceptance gaps`
-  - **Pre-Hotfix Current `HEAD` SHA:** `686e4ffce765ed6d615daee10daa4fb5ee423267` (`686e4ff`) — `test(security): validate live Cloud SQL PostgreSQL 16 multi-instance integration`
-- **Final Safety Hotfix Commit SHA:** `35ef8455a4db9f32daf519aa4e6653e9f10d72a9` (`35ef845`) — `security: guard destructive postgres integration tests`
+  - `686e4ffce765ed6d615daee10daa4fb5ee423267` (`686e4ff`) — `test(security): validate live Cloud SQL PostgreSQL 16 multi-instance integration`
+  - `35ef8455a4db9f32daf519aa4e6653e9f10d72a9` (`35ef845`) — `security: guard destructive postgres integration tests`
+  - **Pre-Hotfix Current Baseline `HEAD` SHA:** `16181d5f4efa6b0aeb64ee80251b7ae84eb10c07` (`16181d5`) — `docs(security): record hotfix spec and final commit SHA`
+- **Final Safety Hotfix Commit (`HEAD`):** `security: guard destructive postgres integration tests` (parent `16181d5f4efa6b0aeb64ee80251b7ae84eb10c07`; resolve exact 40-char self-SHA via `git rev-parse HEAD`)
 
 ---
 
@@ -35,7 +37,7 @@
 - **Original Issue:** `test_phase2_live_postgresql_multi_instance_integration` (`tests/test_phase2_persistence_and_credentials.py`) executed `TRUNCATE TABLE ... CASCADE` whenever `PQC_TEST_POSTGRES_URL` was set, without enforcing an explicit destructive-test opt-in or disposable database naming policy prior to connecting.
 - **Corrective Fix:**
   - Implemented `validate_destructive_postgres_test_target()` and `_truncate_disposable_postgres_test_tables()` in `tests/test_phase2_persistence_and_credentials.py`, enforced **before** opening any database connection, running migrations, or executing `TRUNCATE`.
-  - Requires explicit `PQC_ALLOW_DESTRUCTIVE_TEST_DB=true`; parses the URL via SQLAlchemy `make_url()`; enforces `postgresql` backend only (rejecting `sqlite` and all other backends); requires database name matching `^pqc_test_[a-zA-Z0-9_]+$`; rejects any database containing `prod`, `production`, `live`, `customer`, or `primary`; rejects active production indicators (`K_SERVICE`, `PQC_PRODUCTION_MODE=true`, `PQC_ENV=production`); fails closed with `RuntimeError` (never silently skipping) and **zero SQL statements** on rejection; and prints an explicit `WARNING:` identifying the disposable database (with password redacted) prior to `TRUNCATE`.
+  - Requires explicit `PQC_ALLOW_DESTRUCTIVE_TEST_DB=true`; parses the URL via SQLAlchemy `make_url()`; enforces `postgresql` backend only (rejecting `sqlite` and all other backends); requires database name matching `^pqc_test_[a-zA-Z0-9_]+$`; rejects any database containing `prod`, `production`, `live`, `customer`, or `primary`; rejects active production indicators (`K_SERVICE`, `PQC_PRODUCTION_MODE=true`, `PQC_ENV=production`); fails closed with `RuntimeError` (verified both directly and via real `pytest` subprocess invocation to never silently skip) with **zero SQL statements** on rejection; and prints an explicit `WARNING:` identifying the disposable database (with password redacted) prior to `TRUNCATE`.
 
 ---
 
@@ -66,8 +68,8 @@
 | Command | Exit Code | Passed | Failed | Skipped / Blocked | Runtime |
 | :--- | :---: | :---: | :---: | :---: | :---: |
 | `.venv/bin/python -m compileall -q pqc_agent tools scripts migrations tests` | `0` | N/A | `0` | `0` | `< 1.0s` |
-| `.venv/bin/pytest -q tests/test_phase2_persistence_and_credentials.py` (offline w/ destructive-test guard regression suite) | `0` | **`8`** | **`0`** | **`1`** (live PG opt-in) | **`9.80s`** |
-| `.venv/bin/pytest -q tests/test_auth_hardening.py tests/test_phase1_distributed_auth.py` | `0` | **`40`** | **`0`** | **`0`** | **`4.24s`** |
+| `.venv/bin/pytest -q tests/test_phase2_persistence_and_credentials.py` (offline w/ destructive-test guard + subprocess non-skip suite) | `0` | **`8`** | **`0`** | **`1`** (live PG opt-in) | **`12.50s`** |
+| `.venv/bin/pytest -q tests/test_auth_hardening.py tests/test_phase1_distributed_auth.py` | `0` | **`40`** | **`0`** | **`0`** | **`4.38s`** |
 | `PQC_TEST_POSTGRES_URL="postgresql+psycopg://pqc_test_runner:***@127.0.0.1:<mtls_port>/pqc_test_validation" .venv/bin/pytest -v -rs tests/test_phase2_persistence_and_credentials.py::test_phase2_live_postgresql_multi_instance_integration` (recorded at `686e4ff`) | `0` | **`1`** | **`0`** | **`0`** | **`134.69s`** |
 | `PQC_TEST_POSTGRES_URL="postgresql+psycopg://pqc_test_runner:***@127.0.0.1:<mtls_port>/pqc_test_validation" .venv/bin/pytest -v -rs` (recorded at `686e4ff`) | `0` | **`76`** | **`0`** | **`1`** (opt-in Vertex LLM) | **`260.60s`** |
 | `DATABASE_URL="postgresql+psycopg://pqc_app:placeholder@127.0.0.1:5432/pqc_workspace" .venv/bin/alembic upgrade head --sql` | `0` | `254` lines DDL | `0` | `0` | `< 1.0s` |

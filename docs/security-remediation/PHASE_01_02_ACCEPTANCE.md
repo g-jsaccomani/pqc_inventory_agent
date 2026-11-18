@@ -57,7 +57,7 @@ Status Legend (per `PHASE1.md` Section 6):
 | Deployment Config, `Dockerfile`, `app.yaml`, `.env.example`, Lockfiles (`uv.lock`, `requirements.txt`) free of SQLite/FUSE & real secrets | **`PASS`** | Verified by `test_deployment_configuration_disables_simulation_and_keeps_persistence` and secret scan. |
 | Cloud SQL, Secret Manager, IAM, KMS Credential Justification, Migration & Rollback Documentation | **`PASS`** | [`docs/security-remediation/MIGRATION_AND_ROLLBACK.md`](./MIGRATION_AND_ROLLBACK.md), [`README.md`](../../README.md), [`docs/06-Agentic-PQC-Technical-Architecture-and-Consultant-Guide.md`](../06-Agentic-PQC-Technical-Architecture-and-Consultant-Guide.md). |
 | Mandatory Test Evidence Report & Acceptance Checklist | **`PASS`** | [`security_test_logs/phase_01_02_remediation/REPORT.md`](../../security_test_logs/phase_01_02_remediation/REPORT.md), [`security_test_logs/phase_01_02_final_validation/FINAL_REPORT.md`](../../security_test_logs/phase_01_02_final_validation/FINAL_REPORT.md) & this file. |
-| Remediation Commits Preserved (`no force-push`, `no deploy`, `no merge to main`, `no commit rewrite`) | **`PASS`** | `60ffaa2`, `02b53e9`, `d43e17e`, `bdcf692`, `686e4ff` + destructive-test guard hotfix commit on `security-hardening/phase-01-02`. |
+| Remediation Commits Preserved (`no force-push`, `no deploy`, `no merge to main`, `no commit rewrite`) | **`PASS`** | `60ffaa2`, `02b53e9`, `d43e17e`, `bdcf692`, `686e4ff`, `35ef845`, `16181d5` + final `HEAD` (`security: guard destructive postgres integration tests`) on `security-hardening/phase-01-02`. |
 
 ---
 

@@ -1478,17 +1478,42 @@ def test_phase2_destructive_postgres_safety_guard_and_zero_sql_on_rejection(tmp_
     assert "SELECT version()" in executed_sql[0]
     assert executed_sql[1].startswith("TRUNCATE TABLE ")
 
+    # Verify pytest runner itself never silently skips when PQC_TEST_POSTGRES_URL points to an unsafe target
+    sub_env = dict(os.environ)
+    sub_env.pop(DESTRUCTIVE_TEST_DB_OPT_IN_ENV, None)
+    sub_env["PQC_TEST_POSTGRES_URL"] = "postgresql+psycopg://pqc_tester:pw@127.0.0.1:5432/production"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            str(REPO_ROOT / "tests" / "test_phase2_persistence_and_credentials.py"),
+            "-k",
+            "test_phase2_live_postgresql_multi_instance_integration",
+        ],
+        cwd=str(REPO_ROOT),
+        env=sub_env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert proc.returncode != 0, f"Expected fail-closed non-zero exit code, got stdout={proc.stdout}\nstderr={proc.stderr}"
+    assert "1 failed" in proc.stdout
+    assert "skipped" not in proc.stdout.lower()
+
 
 @pytest.mark.skipif(
-    not os.getenv("PQC_TEST_POSTGRES_URL"),
+    not os.getenv("PQC_TEST_POSTGRES_URL") and not os.getenv("PQC_ALLOW_DESTRUCTIVE_TEST_DB"),
     reason=(
-        "BLOCKED: Live PostgreSQL 16 server (PQC_TEST_POSTGRES_URL) is not available on this workstation "
-        "(corporate macOS lacks postgres/initdb/docker/podman, and Google Santa blocks unsigned embedded initdb binaries with SIGKILL 9)."
+        "Live PostgreSQL 16 integration test requires disposable PQC_TEST_POSTGRES_URL and explicit "
+        "PQC_ALLOW_DESTRUCTIVE_TEST_DB=true opt-in."
     ),
 )
 def test_phase2_live_postgresql_multi_instance_integration(tmp_path, monkeypatch):
     """Step 4 PostgreSQL 16 Integration Validation across two independent application instances against a real PostgreSQL DB."""
-    pg_url = os.environ["PQC_TEST_POSTGRES_URL"]
+    pg_url = os.environ.get("PQC_TEST_POSTGRES_URL", "")
     # Mandatory safety guard BEFORE any database connection, migration, or destructive TRUNCATE operation:
     validate_destructive_postgres_test_target(pg_url)
 

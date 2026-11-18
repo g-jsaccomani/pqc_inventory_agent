@@ -9,8 +9,10 @@
   3. `02b53e9da7590b67d9b3c1960a400cea04add49d` (`02b53e9`) — `security: complete PostgreSQL persistence and credential architecture`
   4. `d43e17e594131a23a021b1afa68541851ff32307` (`d43e17e`) — `docs(security): add remediation specifications and execution checkpoint logs`
   5. `bdcf69268843a141d2ebc3a68b0272791a0ec813` (`bdcf692`) — `security: close phase 1-2 acceptance gaps`
-  6. `686e4ffce765ed6d615daee10daa4fb5ee423267` (`686e4ff`) — `test(security): validate live Cloud SQL PostgreSQL 16 multi-instance integration` (Pre-hotfix `HEAD` SHA)
+  6. `686e4ffce765ed6d615daee10daa4fb5ee423267` (`686e4ff`) — `test(security): validate live Cloud SQL PostgreSQL 16 multi-instance integration`
   7. `35ef8455a4db9f32daf519aa4e6653e9f10d72a9` (`35ef845`) — `security: guard destructive postgres integration tests`
+  8. `16181d5f4efa6b0aeb64ee80251b7ae84eb10c07` (`16181d5`) — `docs(security): record hotfix spec and final commit SHA` (Pre-hotfix baseline `HEAD` SHA)
+  9. **Final `HEAD`** (parent `16181d5f4efa6b0aeb64ee80251b7ae84eb10c07`, resolve exact 40-char SHA via `git rev-parse HEAD`) — `security: guard destructive postgres integration tests`
 - **Python Environment:** Python `3.12.13` managed by `uv` (`uv.lock` + `.venv/bin/pytest`). Never run bare `pip`; use `uv` or `.venv/bin/python`.
 
 ---
