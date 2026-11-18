@@ -27,10 +27,9 @@ LEGACY_CONSTANT_KEY = b"pqc-workspace-fallback-hmac-key-2026"
 
 @pytest.fixture(autouse=True)
 def _isolated_auth_state(tmp_path, monkeypatch):
-    """Fresh data dir + clean auth env + empty in-memory connection/token stores for every test."""
+    """Fresh data dir + isolated SQLite DB + clean auth/KMS env for every unit test."""
     from pqc_agent import auth_store
     from pqc_agent import workspace_server as ws
-    from tools import gcloud_bridge
 
     auth_store.clear_fallback_auth_stores()
     monkeypatch.setenv("PQC_DATA_DIR", str(tmp_path / "data"))
@@ -43,9 +42,12 @@ def _isolated_auth_state(tmp_path, monkeypatch):
         "DATABASE_URL",
         "PQC_CLOUD_SQL_CONNECTION_NAME",
         "PQC_DB_HOST",
+        "PQC_KMS_KEY_NAME",
+        "PQC_ALLOWED_IMPERSONATION_SERVICE_ACCOUNTS",
         "PQC_ALLOW_UNVERIFIED_SIGNIN",
         "PQC_ENABLE_ADK_API",
         "PQC_ENABLE_ADK_DEV_UI",
+        "PQC_ENABLE_GIS_JAVASCRIPT_CLIENT",
         "PQC_ALLOWED_ORIGINS",
         "PQC_OAUTH_REDIRECT_URIS",
         "PQC_OAUTH_STATE_TTL_SECONDS",
@@ -55,13 +57,12 @@ def _isolated_auth_state(tmp_path, monkeypatch):
         "PQC_AUTH_SECRET_PREVIOUS",
         "PQC_ADMIN_EMAILS",
         "PQC_GOOGLE_ID_TOKEN_AUDIENCES",
+        "PQC_GOOGLE_OAUTH_CLIENT_ID",
+        "PQC_GOOGLE_OAUTH_CLIENT_SECRET",
         "GOOGLE_OAUTH_CLIENT_ID",
         "GOOGLE_OAUTH_CLIENT_SECRET",
     ):
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.setattr(gcloud_bridge, "_USER_CONNECTIONS", {})
-    monkeypatch.setattr(gcloud_bridge, "_USER_ACCESS_TOKENS", {})
-    monkeypatch.setattr(gcloud_bridge, "_USER_CONNECTIONS_LOADED", False)
     monkeypatch.setattr(ws, "_AUTH_SECRET_CACHE", None)
     monkeypatch.setattr(ws, "_AUTH_SECRET_CACHE_KEY", None)
     yield
@@ -79,12 +80,23 @@ def _registry():
     )
 
 
+def _allow_unit_test_db_when_no_live_pg(monkeypatch):
+    """Allows route/cookie unit tests that toggle K_SERVICE to use tmp_path SQLite when PQC_TEST_POSTGRES_URL is unset."""
+    if os.getenv("PQC_TEST_POSTGRES_URL"):
+        return
+    from pqc_agent import auth_store
+
+    monkeypatch.setattr(auth_store, "validate_production_postgres_only", lambda _url: None)
+
+
 def _app(tmp_path):
     from pqc_agent.workspace_server import create_workspace_app
 
+    db_url = os.getenv("PQC_TEST_POSTGRES_URL") or f"sqlite:///{tmp_path / 'sessions.db'}"
+    bucket = "gs://test-unit-bucket" if os.getenv("K_SERVICE") else None
     return create_workspace_app(
-        session_db_url=f"sqlite:///{tmp_path / 'sessions.db'}",
-        artifact_bucket=None,  # local fallback: no GCS calls
+        session_db_url=db_url,
+        artifact_bucket=bucket,
         model_registry=_registry(),
         verify_models_on_startup=False,
     )
@@ -331,6 +343,7 @@ ADK_PROBES = [
 
 def test_s4_s5_adk_routes_and_dev_server_are_off_on_cloud_run(tmp_path, monkeypatch, signin):
     monkeypatch.setenv("K_SERVICE", "pqc-inventory-agent")
+    _allow_unit_test_db_when_no_live_pg(monkeypatch)
     app = _app(tmp_path)
     assert app.state.adk_dev_ui_enabled is False and app.state.adk_api_enabled is False
     paths = [str(getattr(r, "path", "")) for r in app.router.routes]
@@ -352,6 +365,7 @@ def test_s4_s5_adk_routes_and_dev_server_are_off_on_cloud_run(tmp_path, monkeypa
 def test_s4_enabled_adk_routes_require_identity_and_bind_user(tmp_path, monkeypatch, signin):
     monkeypatch.setenv("K_SERVICE", "pqc-inventory-agent")
     monkeypatch.setenv("PQC_ENABLE_ADK_API", "true")
+    _allow_unit_test_db_when_no_live_pg(monkeypatch)
     app = _app(tmp_path)
     assert app.state.adk_api_enabled is True and app.state.adk_dev_ui_enabled is False
     with TestClient(app) as client:
@@ -481,47 +495,70 @@ def test_s6_tokens_are_typed_and_bound_to_the_secret(monkeypatch):
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# S7 - OAuth access tokens are never persisted
+# S7 - Delegated OAuth credentials are envelope-encrypted in DB and never stored in plaintext
 # ---------------------------------------------------------------------------------------------------------------
-def test_s7_access_tokens_live_in_memory_only(tmp_path, signin):
+def test_s7_access_tokens_are_envelope_encrypted_and_never_stored_in_plaintext(tmp_path, signin):
+    from sqlalchemy import select
+    from pqc_agent import auth_store, credential_service
     from tools import gcloud_bridge as gb
 
     secret_token = "ya29.super-secret-delegated-token-123456"
     state = gb.set_gcp_connection_config(mode="access_token", access_token=secret_token, user_id="carol@google.com")
     assert state["has_access_token"] is True and secret_token not in json.dumps(state)
-    assert state["access_token_storage"] == "in_memory_only" and state["access_token_expires_at"]
+    assert state["access_token_storage"] == "encrypted_db_envelope" and state["access_token_expires_at"]
     assert gb.get_gcp_connection_config(mask_token=False, user_id="carol@google.com")["access_token_preview"] == secret_token
-    store = pathlib.Path(gb._get_user_connections_path()).read_text(encoding="utf-8")
-    assert secret_token not in store
-    assert '"access_token":' not in store  # no token field (the mode *value* "access_token" is fine)
-    assert json.loads(store)["carol@google.com"]["mode"] == "access_token"
 
-    gb._USER_ACCESS_TOKENS["dave@google.com"] = ("ya29.expired", time.time() - 1)
+    # Inspect raw database rows: neither pqc_user_connections nor pqc_delegated_credentials contains plaintext token!
+    store = auth_store.get_active_auth_store()
+    with store._session_factory() as db:
+        conn_row = db.get(auth_store.UserConnectionRecord, "carol@google.com")
+        assert conn_row is not None and conn_row.mode == "access_token"
+        cred_rows = db.scalars(
+            select(auth_store.DelegatedCredentialRecord).where(
+                auth_store.DelegatedCredentialRecord.user_id == "carol@google.com"
+            )
+        ).all()
+        assert len(cred_rows) == 1
+        assert secret_token not in cred_rows[0].ciphertext_b64
+        assert secret_token not in cred_rows[0].wrapped_dek_b64
+
+    # Expired credential fails closed and is automatically revoked/wiped on load
+    svc = credential_service.get_active_credential_service()
+    svc.store_delegated_token(user_id="dave@google.com", access_token="ya29.expired", expires_in=10.0)
+    assert svc.load_delegated_token(user_id="dave@google.com", now_override=time.time() + 60.0) is None
     assert gb.get_gcp_connection_config(user_id="dave@google.com")["has_access_token"] is False
-    assert "dave@google.com" not in gb._USER_ACCESS_TOKENS
 
     with TestClient(_app(tmp_path)) as client:
         signin(client, ALICE, use_token_for_gcp_connection=True)
         assert gb.get_gcp_connection_config(user_id=ALICE)["has_access_token"] is True
         alice = {"X-PQC-User-Token": client.cookies.get("pqc_session_token")}
         consent = client.post("/api/auth/tool-consent", headers=alice, json={"access_token": "ya29.consented-token-999"})
-        assert consent.status_code == 200 and consent.json()["token_storage"] == "in_memory_only"
+        assert consent.status_code == 200 and consent.json()["token_storage"] == "encrypted_db_envelope"
         for path in pathlib.Path(os.environ["PQC_DATA_DIR"]).rglob("*"):
             if path.is_file():
                 content = path.read_bytes()
                 assert b"ya29." not in content and b"valid:" not in content, path
+        db_bytes = (tmp_path / "sessions.db").read_bytes()
+        assert b"ya29.consented-token-999" not in db_bytes
         client.post("/api/auth/logout", headers=alice)
         assert gb.get_gcp_connection_config(user_id=ALICE)["has_access_token"] is False
 
 
-def test_s7_legacy_plaintext_tokens_are_purged_from_disk(monkeypatch):
-    from tools import gcloud_bridge as gb
+def test_s7_legacy_plaintext_tokens_are_stripped_during_migration(tmp_path):
+    from pqc_agent.migration_tool import migrate_legacy_persistence
 
-    store = pathlib.Path(gb._get_user_connections_path())
-    store.write_text(json.dumps({"legacy@google.com": {"mode": "access_token", "access_token": "ya29.legacy-plaintext"}}))
-    conn = gb.get_gcp_connection_config(user_id="legacy@google.com")
-    assert conn["mode"] == "access_token" and conn["has_access_token"] is False
-    assert "ya29.legacy-plaintext" not in store.read_text(encoding="utf-8")
+    legacy_dir = tmp_path / "legacy_data"
+    legacy_dir.mkdir()
+    legacy_file = legacy_dir / "pqc_user_connections.json"
+    legacy_file.write_text(
+        json.dumps({"legacy@google.com": {"mode": "access_token", "access_token": "ya29.legacy-plaintext"}}),
+        encoding="utf-8",
+    )
+    target_db = f"sqlite:///{tmp_path / 'migrated.db'}"
+    report = migrate_legacy_persistence(target_db_url=target_db, source_data_dir=str(legacy_dir))
+    assert report.status == "SUCCESS"
+    assert any(a["code"] == "LEGACY_PLAINTEXT_TOKEN_STRIPPED" for a in report.anomalies)
+    assert b"ya29.legacy-plaintext" not in (tmp_path / "migrated.db").read_bytes()
 
 
 def test_s7_session_state_never_returns_credentials():
@@ -755,13 +792,16 @@ def test_auto_signin_account_switcher_and_partitioned_tenant_storage(tmp_path, m
             json={"mode": "impersonation", "organization_id": "222222222", "impersonated_service_account": "emea@p.iam.gserviceaccount.com"},
         )
 
-        # Verify partitioned files exist under <tmp_path>/data/tenants/<uid>/
-        bob_dir = tmp_path / "data" / "tenants" / BOB
-        alice_dir = tmp_path / "data" / "tenants" / ALICE
-        assert (bob_dir / "profile.json").is_file()
-        assert (bob_dir / "connection.json").is_file()
-        assert (bob_dir / "sessions" / f"{bob_sess['session_id']}.json").is_file()
-        assert (alice_dir / "profile.json").is_file()
+        # Verify authoritative records live in transactional DB tables and zero JSON dual-writes occur on disk
+        from pqc_agent import auth_store
+
+        store = auth_store.get_active_auth_store()
+        assert store.get_tenant_user(BOB)["region"] == "EMEA"
+        assert store.get_tenant_user(ALICE)["region"] == "NorthAm"
+        assert store.get_user_connection(BOB)["organization_id"] == "222222222"
+        assert store.get_session_metadata(bob_sess["session_id"], user_id=BOB)["title"] == "EMEA Banking PQC"
+        assert store.get_session_metadata(bob_sess["session_id"], user_id=ALICE) is None
+        assert not (tmp_path / "data" / "tenants").exists()
 
         # 4. Passing bearer tokens in JSON to /api/auth/switch is rejected; switching uses HttpOnly pqc_account_jar + CSRF
         assert client.post("/api/auth/switch", json={"token": alice_token, "region": "LATAM"}).status_code == 400
@@ -958,6 +998,7 @@ def test_phase1_no_localstorage_session_token_exposure_and_cookie_flags(tmp_path
 
     # 2. Verify Secure, HttpOnly, SameSite=lax cookies on HTTPS / production requests
     monkeypatch.setenv("K_SERVICE", "pqc-inventory-agent")
+    _allow_unit_test_db_when_no_live_pg(monkeypatch)
     with TestClient(_app(tmp_path)) as client:
         resp = client.post(
             "/api/auth/google",
@@ -1045,6 +1086,7 @@ def test_phase1_production_fail_closed_hmac_secret_rotation_and_iap_audience_enf
 
     # 1. Production fails closed when PQC_AUTH_SECRET is missing or too short (< 32 chars)
     monkeypatch.setenv("K_SERVICE", "pqc-inventory-agent")
+    _allow_unit_test_db_when_no_live_pg(monkeypatch)
     monkeypatch.delenv("PQC_AUTH_SECRET", raising=False)
     monkeypatch.setattr(ws, "_AUTH_SECRET_CACHE", None)
     with pytest.raises(RuntimeError, match="PQC_AUTH_SECRET"):

@@ -391,8 +391,6 @@ def _slug(text: str, max_len: int = 60) -> str:
 
 
 def _default_output_dir() -> pathlib.Path:
-    if os.path.isdir("/data") and os.access("/data", os.W_OK):
-        return pathlib.Path("/data/exports")
     return pathlib.Path(os.getenv("PQC_EXPORT_DIR", "exports"))
 
 

@@ -1,6 +1,6 @@
 name: pqc-inventory-agent
 display_name: "PQC Enterprise Inventory & Application Compatibility Agent"
-version: "4.0.0"
+version: "4.1.0"
 description: >
   Expert AI Agent for Post-Quantum Cryptography (PQC) Readiness Assessment, 4-Vector Live
   Application-to-Key Dependency Mapping, PQC Application Compatibility Evaluation, Mosca's
@@ -12,20 +12,22 @@ description: >
 
 runtime:
   framework: google-adk
-  target_platform: vertex_ai_agent_engine
-  reasoning_engine_resource: "projects/110254026096/locations/us-central1/reasoningEngines/519268830350934016"
+  target_platform: google_cloud_run
+  optional_agent_engine_resource: "projects/110254026096/locations/us-central1/reasoningEngines/519268830350934016"
   cloud_run_url: "https://agentic-pqc-110254026096.us-central1.run.app/"
-  cloud_run_dev_ui_url: ""  # ADK dev UI is disabled on Cloud Run (PQC_ENABLE_ADK_DEV_UI=false); use it locally
+  cloud_run_dev_ui_url: ""  # ADK dev UI is disabled on Cloud Run (PQC_ENABLE_ADK_DEV_UI=false)
   python_version: "3.12"
   entrypoint: "main:app"
   adk_agent_module: "pqc_agent.agent:root_agent"
   persistence:
-    session_service: "DatabaseSessionService"
-    session_db_url: "sqlite:///data/pqc_sessions.db"
-    artifact_service: "GcsArtifactService"
+    transactional_database: "Cloud SQL for PostgreSQL 16"
+    cloud_sql_connection_name_placeholder: "<PROJECT_ID>:<REGION>:<CLOUD_SQL_INSTANCE>"
+    session_service: "DatabaseSessionService (postgresql+asyncpg)"
+    auth_and_metadata_store: "DistributedAuthStore (postgresql+psycopg)"
+    schema_migrations: "Alembic (migrations/versions/20261117_0001_initial_phase1_phase2_schema.py)"
+    credential_service: "EncryptedDatabaseCredentialService (Google Cloud KMS AES-256-GCM envelope encryption)"
+    artifact_service: "GcsArtifactService (object storage only; never mounted as transactional database FUSE)"
     artifact_bucket: "gs://pqc-inventory-agent-cd06-pqc-agent-staging"
-    cloud_run_volume: "name=pqc-data,type=cloud-storage,bucket=pqc-inventory-agent-cd06-pqc-agent-staging"
-    cloud_run_volume_mount: "volume=pqc-data,mount-path=/data"
 
 model:
   provider: "Vertex AI (Gemini only)"
@@ -61,17 +63,23 @@ tools:
     - export_cyclonedx_cbom
     - save_assessment_report
 
-
 security:
-  required_iam_roles:
+  required_inventory_iam_roles:
     - "roles/resourcemanager.organizationViewer"
     - "roles/cloudkms.viewer"
     - "roles/cloudasset.viewer"
     - "roles/aiplatform.user"
-  auth_mode: "oauth2_user_context_or_adc"
-  portal_sign_in: "verified Google credential only (ID token / OAuth access token / verified Cloud IAP JWT)"
+  required_portal_infrastructure_iam_roles:
+    - "roles/cloudsql.client"
+    - "roles/secretmanager.secretAccessor (scoped to PQC_AUTH_SECRET, PQC_DB_PASSWORD, PQC_GOOGLE_OAUTH_CLIENT_SECRET)"
+    - "roles/cloudkms.cryptoKeyEncrypterDecrypter (scoped exclusively to PQC_KMS_KEY_NAME portal DEK-wrapping key)"
+  auth_mode: "cloud_iap_or_oauth2_authorization_code_pkce"
+  credential_delegation_preferred: "service_account_impersonation_short_lived_read_only"
+  credential_delegation_alternative: "kms_envelope_encrypted_3lo_delegated_token"
+  portal_sign_in: "verified Cloud IAP JWT or OAuth 2.0 Authorization Code + PKCE S256 (HttpOnly SameSite=Lax Secure cookie + CSRF)"
 
 environment:
+  PQC_PRODUCTION_MODE: "true"
   GOOGLE_GENAI_USE_VERTEXAI: "TRUE"
   GOOGLE_CLOUD_PROJECT: "pqc-inventory-agent-cd06"
   GOOGLE_CLOUD_LOCATION: "global"
@@ -79,7 +87,13 @@ environment:
   GCP_ORGANIZATION_NAME: "jsaccomani.altostrat.com"
   PQC_SIMULATION_MODE: "FALSE"
   PQC_AGENT_MODEL: "gemini-3.1-pro-preview-customtools"
-  SESSION_DB_URL: "sqlite:///data/pqc_sessions.db"
+  PQC_CLOUD_SQL_CONNECTION_NAME: "<PROJECT_ID>:<REGION>:<CLOUD_SQL_INSTANCE>"
+  PQC_DB_NAME: "pqc_workspace"
+  PQC_DB_USER: "pqc_app"
+  # PQC_DB_PASSWORD, PQC_AUTH_SECRET, and PQC_GOOGLE_OAUTH_CLIENT_SECRET MUST be injected via Secret Manager (--set-secrets)
+  PQC_KMS_KEY_NAME: "projects/<PROJECT_ID>/locations/<REGION>/keyRings/<KEYRING>/cryptoKeys/<PORTAL_KEK>"
   PQC_ARTIFACT_BUCKET: "gs://pqc-inventory-agent-cd06-pqc-agent-staging"
-  PQC_CALIBRATION_STORE_PATH: "/data/calibration-history.jsonl"
-
+  PQC_ALLOW_UNVERIFIED_SIGNIN: "false"
+  PQC_ENABLE_ADK_DEV_UI: "false"
+  PQC_ENABLE_ADK_API: "false"
+  PQC_ENABLE_GIS_JAVASCRIPT_CLIENT: "false"

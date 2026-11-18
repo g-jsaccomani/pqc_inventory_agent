@@ -64,10 +64,14 @@ def _make_test_registry():
 
 
 def _make_app(tmp_path, registry=None):
+    from pqc_agent import auth_store
     from pqc_agent.workspace_server import create_workspace_app
 
+    db_url = f"sqlite:///{tmp_path / 'sessions.db'}"
+    os.environ["SESSION_DB_URL"] = db_url
+    auth_store.clear_fallback_auth_stores()
     return create_workspace_app(
-        session_db_url=f"sqlite:///{tmp_path / 'sessions.db'}",
+        session_db_url=db_url,
         artifact_bucket="gs://pqc-inventory-agent-cd06-pqc-agent-staging",
         model_registry=registry or _make_test_registry(),
         verify_models_on_startup=False,
@@ -605,16 +609,27 @@ def test_portal_ui_is_gemini_only_dynamic_and_transparent(tmp_path, monkeypatch)
 
 def test_deployment_configuration_disables_simulation_and_keeps_persistence():
     dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    app_yaml = (REPO_ROOT / "app.yaml").read_text(encoding="utf-8")
     deploy_cr = (REPO_ROOT / "scripts" / "deploy_cloud_run.sh").read_text(encoding="utf-8")
     deploy_vertex = (REPO_ROOT / "scripts" / "setup_and_deploy_vertex.sh").read_text(encoding="utf-8")
 
     assert "PQC_SIMULATION_MODE=FALSE" in dockerfile
     assert 'CMD ["uvicorn", "main:app"' in dockerfile
+    for cfg_text in (dockerfile, app_yaml, deploy_cr, deploy_vertex):
+        assert "sqlite:///data/pqc_sessions.db" not in cfg_text
+        assert "type=cloud-storage" not in cfg_text
+        assert "mount-path=/data" not in cfg_text
+        assert "calibration-history.jsonl" not in cfg_text
+    assert "Cloud SQL for PostgreSQL" in app_yaml
+    assert "EncryptedDatabaseCredentialService" in app_yaml
     for script in (deploy_cr, deploy_vertex):
         assert "PQC_SIMULATION_MODE=FALSE" in script
         assert "PQC_SIMULATION_MODE=AUTO" not in script
-        assert "name=pqc-data,type=cloud-storage,bucket=" in script
-        assert "volume=pqc-data,mount-path=/data" in script
+        assert "--add-cloudsql-instances=" in script
+        assert "PQC_CLOUD_SQL_CONNECTION_NAME=" in script
+        assert "PQC_KMS_KEY_NAME=" in script
+        assert "PQC_ARTIFACT_BUCKET=gs://" in script
+        assert "--set-secrets=" in script
         # Hardened auth on Cloud Run: verified sign-in only, ADK DevServer and ADK REST API off.
         assert "PQC_ALLOW_UNVERIFIED_SIGNIN=false" in script
         assert "PQC_ENABLE_ADK_DEV_UI=false" in script
