@@ -1,143 +1,278 @@
-# HOTFIX — PHASE 1–2 FINAL SAFETY FIX
+# PHASE 1–2 FINAL CORRECTIVE PASS — PQC INVENTORY AGENT
 
 Repository: `g-jsaccomani/pqc_inventory_agent`
 Branch: `security-hardening/phase-01-02`
 
 ## OBJECTIVE
 
-Implement ONLY two narrowly scoped fixes:
+Perform a narrowly scoped corrective pass against the existing Phase 1 and Phase 2 implementation.
 
-1. Protect the live PostgreSQL integration test from accidentally truncating a non-disposable database.
-2. Synchronize final validation documentation with the actual current Git HEAD.
+Do NOT redesign, rewrite, or reimplement completed functionality.
 
-Do not refactor existing architecture or reopen completed remediation work.
+Preserve all existing implementation work, commits, Markdown documentation, test suites, and migration artifacts.
 
-## STEP 1 — BASELINE
+Fix the two identified findings:
 
-- Confirm branch: `security-hardening/phase-01-02`.
-- Record current HEAD SHA.
-- Run `git status --short`.
-- Preserve all existing user changes.
-- Inspect:
-  - `tests/test_phase2_persistence_and_credentials.py`
-  - `security_test_logs/phase_01_02_final_validation/FINAL_REPORT.md`
-  - `security_test_logs/phase_01_02_final_validation/CHECKPOINT.md`
-  - `docs/security-remediation/PHASE_01_02_ACCEPTANCE.md`
+1. OAuth transaction TTL must never exceed 600 seconds.
+2. Production database schema initialization must be exclusively controlled by Alembic, not SQLAlchemy `metadata.create_all()`.
 
-## STEP 2 — PROTECT DESTRUCTIVE POSTGRESQL TEST
+Additionally, improve PostgreSQL integration verification and update the existing security evidence.
+
+Do not deploy, merge into `main`, modify production infrastructure, or start Phase 3.
+
+---
+
+## STEP 1 — BASELINE AND REPOSITORY SAFETY
+
+Before editing:
+
+1. Confirm the current branch is `security-hardening/phase-01-02`.
+2. Record the current HEAD SHA.
+3. Run `git status --short`.
+4. Confirm the working tree is clean. If it is not clean, inspect and preserve existing user changes. Never discard them.
+5. Inspect the existing implementation and documentation:
+   - `pqc_agent/auth_store.py`
+   - `pqc_agent/workspace_server.py`
+   - `tests/test_phase1_distributed_auth.py`
+   - `tests/test_phase2_persistence_and_credentials.py`
+   - `security_test_logs/phase_01_02_remediation/REPORT.md`
+   - `docs/security-remediation/PHASE_01_02_ACCEPTANCE.md`
+   - `docs/security-remediation/MIGRATION_AND_ROLLBACK.md`
+   - `migrations/versions/20261117_0001_initial_phase1_phase2_schema.py`
+
+Do not recreate existing Markdown files.
+
+Create a dedicated evidence directory:
+
+`security_test_logs/phase_01_02_final_validation/`
+
+Record baseline information in:
+
+`security_test_logs/phase_01_02_final_validation/BASELINE.md`
+
+---
+
+## STEP 2 — AUTH-02: ENFORCE STRICT 600-SECOND OAUTH TTL
+
+Inspect `DistributedAuthStore.create_oauth_transaction()`.
+
+Current implementation allows:
+
+`effective_ttl = max(1, min(int(ttl_seconds), 1800))`
+
+Correct the implementation so the maximum transaction TTL is exactly 600 seconds.
+
+Requirements:
+
+- Reject or safely clamp TTL values above 600 seconds.
+- Never allow zero or negative effective TTL.
+- Preserve cryptographically secure state, PKCE verifier, OIDC nonce, and browser binding behavior.
+- Preserve atomic single-use transaction consumption.
+- Do not expose the PKCE verifier in state, URL parameters, cookies, or browser-visible JSON.
+
+Add explicit regression tests for:
+
+1. Default TTL.
+2. TTL = 1.
+3. TTL = 600.
+4. TTL = 601.
+5. TTL = 1800.
+6. TTL = 0.
+7. Negative TTL.
+8. Expired transaction rejection.
+9. Concurrent callback single-use behavior.
+
+Verify that no transaction can remain valid beyond 600 seconds.
+
+---
+
+## STEP 3 — DB-01: MAKE ALEMBIC THE ONLY PRODUCTION SCHEMA AUTHORITY
+
+Inspect:
+
+- `DistributedAuthStore.__init__()`
+- `DistributedAuthStore.ensure_schema()`
+- `create_workspace_app()`
+- ADK `DatabaseSessionService` initialization.
+- Application startup and deployment scripts.
+- Alembic configuration and migration revision.
+
+The current implementation calls:
+
+`PqcPersistenceBase.metadata.create_all(self.engine)`
+
+This may create tables before Alembic applies its versioned migration.
+
+### Required behavior
+
+Production:
+
+- Alembic is the only authority for schema creation and version upgrades.
+- Production startup must NOT call `metadata.create_all()`.
+- Production startup must validate the expected Alembic revision.
+- Production startup must fail closed if the schema is missing, outdated, or inconsistent.
+- Never automatically downgrade or modify an existing production schema.
+- Never silently create missing production tables.
+
+Development and isolated unit tests:
+
+- Existing convenience initialization may remain available only through an explicit non-production configuration.
+- SQLite remains permitted for isolated local tests.
+- SQLite must remain prohibited in production.
+
+### Migration execution
+
+Create or update an explicit migration entry point.
+
+Requirements:
+
+1. Run `alembic upgrade head` as a separate, explicit migration operation.
+2. Verify the expected revision after migration.
+3. Start the application only after successful migration.
+4. Do not run migrations concurrently from multiple Cloud Run instances.
+5. Never run a production migration automatically during application startup.
+6. Preserve the current rollback runbook.
+
+If a deployment script is updated, ensure the migration step is explicit and requires a configured PostgreSQL target.
+
+Do not execute the migration against production.
+
+### Required regression tests
+
+- Production startup with missing schema must fail closed.
+- Production startup with outdated Alembic revision must fail closed.
+- Production startup must not invoke `metadata.create_all()`.
+- Explicit Alembic migration must create the expected schema.
+- Re-running migration must be safe.
+- SQLite production configuration must remain rejected.
+- Local development initialization must continue working.
+
+---
+
+## STEP 4 — POSTGRESQL 16 INTEGRATION VALIDATION
+
+Inspect the existing live PostgreSQL integration test.
 
 Target:
 
-`test_phase2_live_postgresql_multi_instance_integration`
+`tests/test_phase2_persistence_and_credentials.py::test_phase2_live_postgresql_multi_instance_integration`
 
-The test currently executes TRUNCATE against multiple application tables.
+Requirements:
 
-Implement a mandatory safety guard BEFORE any database connection or destructive SQL operation.
+- Use PostgreSQL 16 or compatible Cloud SQL PostgreSQL.
+- Use `PQC_TEST_POSTGRES_URL`.
+- Test two independent application instances against the same real PostgreSQL database.
+- Test OAuth transaction creation on instance A and consumption on instance B.
+- Test session creation, retrieval, and updates across instances.
+- Test session revocation across instances.
+- Test application restart and persistence.
+- Test concurrent OAuth callback consumption.
+- Test transactional rollback.
+- Test credential encryption, retrieval, expiration, and revocation.
+- Test tenant isolation.
 
-Required safeguards:
+If PostgreSQL is unavailable:
 
-1. Require explicit environment variable:
-   `PQC_ALLOW_DESTRUCTIVE_TEST_DB=true`
+- Mark the integration test as BLOCKED/SKIPPED.
+- Record the exact missing dependency or infrastructure requirement.
+- Never report SQLite tests as PostgreSQL integration tests.
+- Never fabricate PostgreSQL execution output.
 
-2. Parse the database URL using SQLAlchemy `make_url()`.
+Do not install unauthorized binaries or bypass corporate endpoint protection.
 
-3. Require the database name to match:
-   `^pqc_test_[a-zA-Z0-9_]+$`
+---
 
-4. Reject database names containing production-like terms:
-   `prod`, `production`, `live`, `customer`, `primary`.
-
-5. Reject execution if any production environment indicator is active:
-   - `K_SERVICE`
-   - `PQC_PRODUCTION_MODE=true`
-   - `PQC_ENV=production`
-
-6. Require PostgreSQL backend. Reject SQLite and all other backends.
-
-7. Fail closed with a clear error message if any condition is not met.
-
-8. Print a clear warning identifying the disposable database before executing TRUNCATE.
-
-9. Keep all existing integration test scenarios intact.
-
-10. Never silently skip the safety guard.
-
-### Add regression tests
-
-- Missing opt-in -> reject.
-- Opt-in false -> reject.
-- Valid opt-in + `pqc_test_validation` -> allow.
-- Database `production` -> reject.
-- Database `pqc_production_test` -> reject.
-- Database `pqc_test_customer_data` -> reject.
-- Database `pqc_workspace` -> reject.
-- SQLite URL -> reject.
-- `K_SERVICE` configured -> reject.
-- `PQC_PRODUCTION_MODE=true` -> reject.
-- `PQC_ENV=production` -> reject.
-- Verify rejected cases execute ZERO SQL statements, especially ZERO TRUNCATE statements.
-
-The safety guard must be independently testable without requiring a live PostgreSQL server.
-
-Do not change the PostgreSQL production configuration or application behavior.
-
-## STEP 3 — UPDATE FINAL DOCUMENTATION
-
-Update existing files; do not recreate them.
-
-In `security_test_logs/phase_01_02_final_validation/FINAL_REPORT.md`:
-
-- Record the actual current HEAD SHA.
-- Record this hotfix commit SHA after committing.
-- Add the destructive-test safety guard as a completed finding.
-- Include exact regression test results.
-- Preserve the existing PostgreSQL 16.15 integration results.
-- Do not claim Cloud KMS live validation.
-- Preserve Cloud Run / Cloud SQL / Cloud KMS deployment as an outstanding operational prerequisite.
-
-In `security_test_logs/phase_01_02_final_validation/CHECKPOINT.md`:
-
-- Record current branch and final HEAD SHA.
-- Record the two safeguards implemented.
-- Document the exact remaining production prerequisites.
-- Include the next recommended phase.
-
-In `docs/security-remediation/PHASE_01_02_ACCEPTANCE.md`:
-
-- Add the destructive-test isolation guard to the testing acceptance criteria.
-- Do not change unrelated acceptance statuses.
-
-## STEP 4 — TESTS
+## STEP 5 — FULL REGRESSION TESTING
 
 Run:
 
 ```bash
 .venv/bin/python -m compileall -q pqc_agent tools scripts migrations tests
-
-.venv/bin/pytest -q \
-  tests/test_phase2_persistence_and_credentials.py
-
-.venv/bin/pytest -q \
-  tests/test_auth_hardening.py \
-  tests/test_phase1_distributed_auth.py
-
+.venv/bin/pytest -v -rs
 git diff --check
 ```
 
-If a test fails, fix only regressions introduced by this hotfix.
+Run the PostgreSQL integration test separately when a valid test database is available:
 
-Do not rerun the live PostgreSQL destructive integration test unless:
-- `PQC_TEST_POSTGRES_URL` points to a disposable PostgreSQL database;
-- `PQC_ALLOW_DESTRUCTIVE_TEST_DB=true`;
-- all safety guards pass.
+```bash
+PQC_TEST_POSTGRES_URL="<DISPOSABLE_POSTGRESQL_16_TEST_DATABASE>" \
+.venv/bin/pytest -v -rs \
+tests/test_phase2_persistence_and_credentials.py::test_phase2_live_postgresql_multi_instance_integration
+```
 
-Do not use production credentials.
+Never use production database credentials.
 
-## STEP 5 — GIT
+Record:
 
-Create exactly one new commit:
+- Exact commands.
+- Exit codes.
+- Passed tests.
+- Failed tests.
+- Skipped tests.
+- Blocked tests.
+- Runtime.
+- PostgreSQL server version when available.
 
-`security: guard destructive postgres integration tests`
+---
+
+## STEP 6 — UPDATE EXISTING DOCUMENTATION
+
+Update, do not recreate:
+
+1. `security_test_logs/phase_01_02_remediation/REPORT.md`
+2. `docs/security-remediation/PHASE_01_02_ACCEPTANCE.md`
+3. `docs/security-remediation/MIGRATION_AND_ROLLBACK.md`
+
+Add a corrective-pass section containing:
+
+- Original finding.
+- Root cause.
+- Corrective implementation.
+- Files modified.
+- Regression tests added.
+- Actual test results.
+- Remaining blockers.
+- Final acceptance status.
+
+Use only these statuses:
+
+- PASS
+- FAIL
+- BLOCKED
+- NOT_IMPLEMENTED
+
+Do not change a previously BLOCKED item to PASS without actual new execution evidence.
+
+Create:
+
+`security_test_logs/phase_01_02_final_validation/FINAL_REPORT.md`
+
+The report must include:
+
+- Original baseline SHA.
+- Final commit SHA.
+- Changed files.
+- Security findings addressed.
+- Test execution evidence.
+- PostgreSQL integration status.
+- Remaining risks.
+- Final recommendation: GO or NO-GO.
+
+Also create:
+
+`security_test_logs/phase_01_02_final_validation/CHECKPOINT.md`
+
+Include enough technical context for another coding agent to continue without re-reading the entire repository.
+
+---
+
+## STEP 7 — GIT HYGIENE
+
+Do not amend or rewrite previous commits.
+
+Create one new commit only after all locally executable tests pass:
+
+`security: close phase 1-2 acceptance gaps`
 
 Before committing:
 
@@ -151,27 +286,40 @@ After committing:
 
 ```bash
 git status --short
-git log -4 --oneline
+git log -3 --oneline
 git rev-parse HEAD
 ```
 
-Update the final SHA in the documentation.
+Record the final SHA in `CHECKPOINT.md` and `FINAL_REPORT.md`.
 
-Do not amend previous commits.
-Do not force-push.
-Do not merge into main.
-Do not deploy.
-Do not implement Phase 3.
+If the PostgreSQL integration test is blocked, the commit may still be created if all locally executable tests pass, but the final acceptance status MUST remain BLOCKED / NO-GO for production.
+
+---
+
+## STRICT PROHIBITIONS
+
+- No deployment.
+- No production database access.
+- No merge into main.
+- No force-push.
+- No rewriting previous commits.
+- No Phase 3 implementation.
+- No unrelated refactoring.
+- No removal of existing tests or documentation.
+- No fake test results.
+- No weakening of security controls to make tests pass.
+- No silent fallback to SQLite in production.
 
 ## FINAL RESPONSE
 
-Return only:
+Return a concise technical summary containing:
 
-1. Commit SHA.
-2. Files changed.
-3. Regression test results.
-4. Confirmation that rejected database configurations execute zero SQL.
-5. Remaining production prerequisites.
-6. Final Phase 1–2 status.
+1. Baseline and final commit SHA.
+2. Findings fixed.
+3. Files modified.
+4. Test results.
+5. PostgreSQL integration status.
+6. Remaining blockers.
+7. GO / NO-GO decision.
 
-Stop immediately after the hotfix.
+Stop after this corrective pass.
