@@ -15,7 +15,6 @@ import argparse
 import asyncio
 import json
 import os
-import sys
 import threading
 from typing import Any, Dict, Optional
 
@@ -42,10 +41,9 @@ def get_workspace_app() -> Any:
         return _WORKSPACE_APP
     with _WORKSPACE_APP_LOCK:
         if _WORKSPACE_APP is None:
-            preloaded = "pqc_agent.workspace_server" in sys.modules
             from pqc_agent import workspace_server as _ws
 
-            _WORKSPACE_APP = _ws.create_workspace_app() if preloaded else _ws.app
+            _WORKSPACE_APP = _ws.app
         return _WORKSPACE_APP
 
 

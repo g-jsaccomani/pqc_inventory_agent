@@ -464,6 +464,75 @@ def test_pre_merge_02_server_startup_initializes_once_and_fails_closed_in_produc
     assert "Production persistence failure" in proc_serve_fail.stderr
 
 
+def test_pre_merge_02_workspace_server_first_import_order_reuses_singleton_app(tmp_path: Path) -> None:
+    """Verifies importing `pqc_agent.workspace_server` before `main` reuses `workspace_server.app` with zero duplicate init."""
+    local_db = tmp_path / "import_order_singleton.db"
+    import_order_script = textwrap.dedent(
+        """
+        import sys
+        import pqc_agent.auth_store as auth_store
+
+        store_init_calls = []
+        orig_store_init = auth_store.DistributedAuthStore.__init__
+        def spy_store_init(self, *a, **kw):
+            store_init_calls.append(1)
+            return orig_store_init(self, *a, **kw)
+        auth_store.DistributedAuthStore.__init__ = spy_store_init
+
+        assert "pqc_agent.workspace_server" not in sys.modules
+        assert "main" not in sys.modules
+
+        # 1. Import pqc_agent.workspace_server first.
+        import pqc_agent.workspace_server as workspace_server
+        assert len(store_init_calls) == 1, f"Expected 1 DistributedAuthStore init on workspace_server import, got {len(store_init_calls)}"
+
+        second_app_calls = []
+        orig_create_app = workspace_server.create_workspace_app
+        def spy_create_app(*a, **kw):
+            second_app_calls.append(1)
+            return orig_create_app(*a, **kw)
+        workspace_server.create_workspace_app = spy_create_app
+
+        # 2. Import main.
+        import main
+        assert main._WORKSPACE_APP is None
+        assert len(second_app_calls) == 0
+        assert len(store_init_calls) == 1
+
+        # 3. Call main.get_workspace_app().
+        returned_app = main.get_workspace_app()
+
+        # 4. Assert returned object is exactly workspace_server.app.
+        assert returned_app is workspace_server.app
+        assert main.app is workspace_server.app
+        assert main.session_service is workspace_server.session_service
+        assert main.artifact_service is workspace_server.artifact_service
+
+        # 5. Assert no second application or DistributedAuthStore initialization occurs.
+        assert len(second_app_calls) == 0, f"Expected 0 extra create_workspace_app() calls, got {len(second_app_calls)}"
+        assert len(store_init_calls) == 1, f"Expected 1 total DistributedAuthStore init, got {len(store_init_calls)}"
+        print("IMPORT_ORDER_SINGLETON_OK")
+        """
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", import_order_script],
+        cwd=str(REPO_ROOT),
+        env=_clean_subprocess_env(
+            PYTHONPATH=str(REPO_ROOT),
+            SESSION_DB_URL=f"sqlite:///{local_db}",
+            PQC_MODEL_VERIFICATION_ON_STARTUP="false",
+            PQC_ARTIFACT_BUCKET="",
+            PQC_DATA_DIR=str(tmp_path / "dev_data"),
+        ),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert proc.returncode == 0, f"stderr={proc.stderr}\nstdout={proc.stdout}"
+    assert "IMPORT_ORDER_SINGLETON_OK" in proc.stdout
+
+
 # ==============================================================================
 # PRE-MERGE-02: Deployment Script Sequencing & Fail-Fast Mock Execution
 # ==============================================================================

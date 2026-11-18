@@ -99,3 +99,51 @@
 - **Exit Code:** `0`
 - **Status:** **`PASS`**
 - **Runtime:** `< 0.05s`
+
+---
+
+## 3. Follow-Up Pre-Merge Correction — Duplicate Workspace App Initialization (`2026-11-18`)
+
+- **Prior Pre-Merge Hotfix Commit SHA (`HEAD` Baseline for Follow-Up):** `d24004489b0c83a4813361d8832f338d9e673e74`
+- **Original Pre-Hotfix Baseline SHA:** `5eff14fc0e676b335b695ea0813a6620af29c296`
+- **Follow-Up Commit Message (Direct Child of `d24004489b0c83a4813361d8832f338d9e673e74` on `security-hardening/phase-01-02`):** `fix(security): prevent duplicate workspace app initialization` *(exact self-SHA recorded via `git rev-parse HEAD` upon commit creation, as a single unamended Git commit cannot embed its own SHA-1 digest)*
+
+### Root Cause & Fix Summary
+- **Defect:** `main.get_workspace_app()` previously inspected `"pqc_agent.workspace_server" in sys.modules` (`preloaded`) and invoked `_ws.create_workspace_app()` when `workspace_server` had already been imported. Because `pqc_agent/workspace_server.py` constructs its module-level `app = create_workspace_app()` on import, importing `pqc_agent.workspace_server` before `main` and then calling `main.get_workspace_app()` created a duplicate FastAPI instance and a second `DistributedAuthStore` / SQLAlchemy engine pool.
+- **Fix (`main.py`):** Removed `preloaded` branching and unused `sys` import so `get_workspace_app()` lazily imports `pqc_agent.workspace_server` under `_WORKSPACE_APP_LOCK` and unconditionally reuses `_ws.app`, preserving thread-safe singleton initialization, PEP 562 lazy module attributes (`app`, `session_service`, `artifact_service`), CLI decoupling (`deploy`, `tools`, `cbom`, `--help`), and fail-closed production PostgreSQL checks.
+
+### Import-Order Regression Test Added
+- **Test:** `tests/test_pre_merge_hotfix.py::test_pre_merge_02_workspace_server_first_import_order_reuses_singleton_app`
+- **Verified Steps (Fresh Subprocess):**
+  1. Imports `pqc_agent.workspace_server` first (verifies `1` `DistributedAuthStore.__init__` call).
+  2. Imports `main` (verifies `main._WORKSPACE_APP is None` and `0` extra `create_workspace_app()` / `DistributedAuthStore.__init__` calls).
+  3. Calls `main.get_workspace_app()`.
+  4. Asserts returned object `is workspace_server.app` (and `main.app is workspace_server.app`, `main.session_service is workspace_server.session_service`, `main.artifact_service is workspace_server.artifact_service`).
+  5. Asserts `0` additional `create_workspace_app()` calls and `1` total `DistributedAuthStore.__init__` call across the entire process.
+- **Result:** **`PASS`**
+
+### Exact Regression Commands, Counts & Exit Codes
+
+| Command | Result Summary | Exit Code | Status | Runtime |
+| :--- | :--- | :---: | :---: | :---: |
+| `.venv/bin/python -m compileall -q pqc_agent tools scripts migrations tests` | Zero bytecode/syntax errors (also verified with `main.py` included) | `0` | **`PASS`** | `< 0.1s` |
+| `bash -n scripts/setup_and_deploy_vertex.sh` | Valid Bash syntax | `0` | **`PASS`** | `< 0.02s` |
+| `bash -n scripts/deploy_cloud_run.sh` | Valid Bash syntax | `0` | **`PASS`** | `< 0.02s` |
+| `.venv/bin/pytest -v -rs tests/test_pre_merge_hotfix.py` | **`6 passed, 0 failed, 1 skipped`** (`7` collected) | `0` | **`PASS`** | `26.84s` |
+| `.venv/bin/pytest -v -rs` | **`82 passed, 0 failed, 3 skipped`** (`85` collected) | `0` | **`PASS`** | `54.95s` |
+| `git diff --check` | Zero whitespace/conflict formatting defects | `0` | **`PASS`** | `< 0.05s` |
+
+### Docker Validation Status
+- **Status:** **`BLOCKED`**
+- **Details:**
+  - Local container CLIs/daemons (`docker`, `podman`, `nerdctl`, `colima`, `lima`, `finch`) are not installed on this workstation (`NOT_INSTALLED`).
+  - Checked repository and GitHub Actions configuration for an existing CI workflow capable of building `Dockerfile`: `.github/` does not exist (`NO_DOT_GITHUB_DIR`), and `gh workflow list -R g-jsaccomani/pqc_inventory_agent --all` lists only GitHub's built-in `Dependency Graph` (no CI runner workflow exists).
+  - Per instructions, no unrelated CI infrastructure was introduced and live Docker image build is NOT claimed. Staged `/app` filesystem replay and `python scripts/run_db_migrations.py --help` execution (`0755` permissions, zero `.env`/`.db`/secret artifacts) passed (`test_pre_merge_01_dockerfile_copies_migration_script_without_secrets_and_runs_staged_cli`).
+
+### PostgreSQL Validation Status
+- **Destructive Safety Guard (`validate_destructive_postgres_test_target`):** **`PASS`** (`tests/test_phase2_persistence_and_credentials.py::test_phase2_destructive_postgres_test_guard_rejects_unsafe_targets` passed; enforces `PQC_ALLOW_DESTRUCTIVE_TEST_DB=true`, `^pqc_test_[a-zA-Z0-9_]+$` DB name, zero production terms/env flags, PostgreSQL dialect only, and zero SQL statements on rejected targets).
+- **Live PostgreSQL 16 Multi-Instance Integration (`test_phase2_live_postgresql_multi_instance_integration`):** **`SKIPPED` / `BLOCKED` in current local run** — no local `postgres` daemon or `cloud-sql-proxy` is running (`NO_LOCAL_PG_OR_PROXY_RUNNING`; the disposable Cloud SQL PostgreSQL 16.15 instance validated in commit `686e4ff` was torn down after testing, and `PQC_TEST_POSTGRES_URL` / `PQC_ALLOW_DESTRUCTIVE_TEST_DB` are unset). Safety checks preserved untouched.
+
+### Remaining Blockers
+1. **Live Docker Image Build & Container Runtime Smoke (`PRE-MERGE-01`):** `BLOCKED` locally due to absent Docker daemon and absence of an existing GitHub Actions build workflow; must be executed via Docker in CI or via `gcloud builds submit` during `scripts/setup_and_deploy_vertex.sh`.
+2. **Live Cloud Run + Cloud SQL Staging/Production Rollout Verification:** `NOT EXECUTED` (requires operator execution of `scripts/setup_and_deploy_vertex.sh` in target GCP project with Cloud SQL PostgreSQL, Secret Manager, and Cloud KMS provisioned).
