@@ -19,22 +19,25 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 import hashlib
 import io
 import json
 import os
 import pathlib
+import re
 import sqlite3
 import subprocess
 import sys
 import time
-from typing import Any, Dict
+from typing import Any, Callable, Dict, Mapping, Optional
 from urllib.parse import parse_qs, urlparse
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import select, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.exc import OperationalError
 
 from pqc_agent import auth_guard, auth_store, credential_service
@@ -1158,25 +1161,117 @@ def test_phase2_safe_idempotent_data_migration_and_conflict_detection(tmp_path, 
         )
 
 
-@pytest.mark.skipif(
-    not os.getenv("PQC_TEST_POSTGRES_URL"),
-    reason=(
-        "BLOCKED: Live PostgreSQL 16 server (PQC_TEST_POSTGRES_URL) is not available on this workstation "
-        "(corporate macOS lacks postgres/initdb/docker/podman, and Google Santa blocks unsigned embedded initdb binaries with SIGKILL 9)."
-    ),
+DESTRUCTIVE_TEST_DB_OPT_IN_ENV = "PQC_ALLOW_DESTRUCTIVE_TEST_DB"
+DESTRUCTIVE_TEST_DB_NAME_PATTERN = re.compile(r"^pqc_test_[a-zA-Z0-9_]+$")
+FORBIDDEN_DESTRUCTIVE_DB_TERMS: tuple[str, ...] = (
+    "prod",
+    "production",
+    "live",
+    "customer",
+    "primary",
 )
-def test_phase2_live_postgresql_multi_instance_integration(tmp_path, monkeypatch):
-    """Step 4 PostgreSQL 16 Integration Validation across two independent application instances against a real PostgreSQL DB."""
-    from scripts import run_db_migrations
 
-    pg_url = os.environ["PQC_TEST_POSTGRES_URL"]
-    assert run_db_migrations.main(["--db-url", pg_url, "--require-postgres"]) == 0
 
-    pg_engine = auth_store.build_sync_sqlalchemy_engine(auth_store.normalize_sync_db_url(pg_url))
+@dataclass(frozen=True)
+class ValidatedDisposablePostgresTarget:
+    database_name: str
+    redacted_url: str
+
+
+def validate_destructive_postgres_test_target(
+    db_url: str,
+    *,
+    env: Optional[Mapping[str, str]] = None,
+) -> ValidatedDisposablePostgresTarget:
+    """Mandatory fail-closed guard enforced BEFORE any database connection or destructive SQL in live PG tests."""
+    active_env: Mapping[str, str] = os.environ if env is None else env
+
+    opt_in = str(active_env.get(DESTRUCTIVE_TEST_DB_OPT_IN_ENV, "")).strip()
+    if opt_in.lower() != "true":
+        raise RuntimeError(
+            f"Destructive PostgreSQL integration test rejected: {DESTRUCTIVE_TEST_DB_OPT_IN_ENV}=true "
+            "must be explicitly configured before opening any database connection or executing TRUNCATE."
+        )
+
+    k_service = str(active_env.get("K_SERVICE", "")).strip()
+    if k_service:
+        raise RuntimeError(
+            f"Destructive PostgreSQL integration test rejected: production indicator K_SERVICE='{k_service}' is active."
+        )
+    prod_mode = str(active_env.get("PQC_PRODUCTION_MODE", "")).strip().lower()
+    if prod_mode not in {"", "0", "false", "no", "off"}:
+        raise RuntimeError(
+            "Destructive PostgreSQL integration test rejected: PQC_PRODUCTION_MODE=true is active."
+        )
+    pqc_env = str(active_env.get("PQC_ENV", "")).strip().lower()
+    if pqc_env in {"prod", "production"}:
+        raise RuntimeError(
+            f"Destructive PostgreSQL integration test rejected: PQC_ENV='{pqc_env}' indicates production."
+        )
+
+    raw_url = str(db_url or "").strip()
+    if not raw_url:
+        raise RuntimeError("Destructive PostgreSQL integration test rejected: database URL is empty.")
+    try:
+        parsed_url = make_url(raw_url)
+    except Exception as exc:
+        raise RuntimeError(
+            "Destructive PostgreSQL integration test rejected: failed to parse database URL with SQLAlchemy make_url()."
+        ) from exc
+
+    backend_name = (parsed_url.get_backend_name() or "").strip().lower()
+    if backend_name != "postgresql":
+        raise RuntimeError(
+            f"Destructive PostgreSQL integration test rejected: backend '{backend_name or 'unknown'}' is not permitted; "
+            "only PostgreSQL ('postgresql') disposable test databases are allowed."
+        )
+
+    db_name = (parsed_url.database or "").strip()
+    if not db_name:
+        raise RuntimeError(
+            "Destructive PostgreSQL integration test rejected: PostgreSQL URL must include a disposable database name."
+        )
+
+    db_name_lower = db_name.lower()
+    matched_forbidden = [term for term in FORBIDDEN_DESTRUCTIVE_DB_TERMS if term in db_name_lower]
+    if matched_forbidden:
+        raise RuntimeError(
+            f"Destructive PostgreSQL integration test rejected: database name '{db_name}' contains forbidden "
+            f"production-like term(s): {', '.join(matched_forbidden)}."
+        )
+
+    if not DESTRUCTIVE_TEST_DB_NAME_PATTERN.fullmatch(db_name):
+        raise RuntimeError(
+            f"Destructive PostgreSQL integration test rejected: database name '{db_name}' does not match mandatory "
+            "disposable test database pattern '^pqc_test_[a-zA-Z0-9_]+$'."
+        )
+
+    return ValidatedDisposablePostgresTarget(
+        database_name=db_name,
+        redacted_url=parsed_url.render_as_string(hide_password=True),
+    )
+
+
+def _truncate_disposable_postgres_test_tables(
+    db_url: str,
+    *,
+    env: Optional[Mapping[str, str]] = None,
+    engine_factory: Optional[Callable[[str], Any]] = None,
+) -> ValidatedDisposablePostgresTarget:
+    """Validates disposable PostgreSQL target BEFORE opening any DB connection, warns clearly, then executes TRUNCATE."""
+    validated_target = validate_destructive_postgres_test_target(db_url, env=env)
+    build_engine = engine_factory or auth_store.build_sync_sqlalchemy_engine
+    pg_engine = build_engine(auth_store.normalize_sync_db_url(db_url))
     try:
         with pg_engine.begin() as conn:
             pg_version = str(conn.execute(text("SELECT version()")).scalar() or "")
             assert "PostgreSQL" in pg_version
+            print(
+                f"WARNING: Executing destructive TRUNCATE on verified disposable PostgreSQL test database "
+                f"'{validated_target.database_name}' ({validated_target.redacted_url}).",
+                file=sys.stderr,
+                flush=True,
+            )
             conn.execute(
                 text(
                     "TRUNCATE TABLE "
@@ -1189,6 +1284,218 @@ def test_phase2_live_postgresql_multi_instance_integration(tmp_path, monkeypatch
             )
     finally:
         pg_engine.dispose()
+    return validated_target
+
+
+def test_phase2_destructive_postgres_safety_guard_and_zero_sql_on_rejection(tmp_path, monkeypatch, capsys):
+    """Verifies mandatory disposable-DB safety guard offline and proves rejected configs execute ZERO SQL/TRUNCATE."""
+    import sqlalchemy
+    from scripts import run_db_migrations
+
+    valid_url = "postgresql+psycopg://pqc_tester:ephemeral-secret-pw@127.0.0.1:5432/pqc_test_validation"
+
+    executed_sql: list[str] = []
+    engine_connections: list[str] = []
+    migration_invocations: list[list[str]] = []
+
+    class _SpyScalarResult:
+        def __init__(self, value: str) -> None:
+            self._value = value
+
+        def scalar(self) -> str:
+            return self._value
+
+    class _SpyConn:
+        def __enter__(self) -> "_SpyConn":
+            return self
+
+        def __exit__(self, *exc: Any) -> bool:
+            return False
+
+        def execute(self, stmt: Any, *args: Any, **kwargs: Any) -> _SpyScalarResult:
+            sql_text = str(stmt)
+            executed_sql.append(sql_text)
+            return _SpyScalarResult("PostgreSQL 16.15 (mocked offline verification)")
+
+    class _SpyEngine:
+        def begin(self) -> _SpyConn:
+            return _SpyConn()
+
+        def connect(self) -> _SpyConn:
+            return _SpyConn()
+
+        def dispose(self) -> None:
+            return None
+
+    def _spy_engine_factory(url: str, *args: Any, **kwargs: Any) -> _SpyEngine:
+        engine_connections.append(str(url))
+        return _SpyEngine()
+
+    def _spy_run_migrations(argv: Optional[list[str]] = None) -> int:
+        migration_invocations.append(list(argv or []))
+        executed_sql.append("ALEMBIC_MIGRATION_SQL")
+        return 0
+
+    monkeypatch.setattr(auth_store, "build_sync_sqlalchemy_engine", _spy_engine_factory)
+    monkeypatch.setattr(sqlalchemy, "create_engine", _spy_engine_factory)
+    monkeypatch.setattr(run_db_migrations, "main", _spy_run_migrations)
+
+    rejected_cases: list[tuple[str, str, Dict[str, Optional[str]], str]] = [
+        (
+            "missing_opt_in",
+            valid_url,
+            {DESTRUCTIVE_TEST_DB_OPT_IN_ENV: None},
+            "PQC_ALLOW_DESTRUCTIVE_TEST_DB=true",
+        ),
+        (
+            "opt_in_false",
+            valid_url,
+            {DESTRUCTIVE_TEST_DB_OPT_IN_ENV: "false"},
+            "PQC_ALLOW_DESTRUCTIVE_TEST_DB=true",
+        ),
+        (
+            "db_production",
+            "postgresql+psycopg://pqc_tester:pw@127.0.0.1:5432/production",
+            {DESTRUCTIVE_TEST_DB_OPT_IN_ENV: "true"},
+            "forbidden production-like term",
+        ),
+        (
+            "db_pqc_production_test",
+            "postgresql+psycopg://pqc_tester:pw@127.0.0.1:5432/pqc_production_test",
+            {DESTRUCTIVE_TEST_DB_OPT_IN_ENV: "true"},
+            "forbidden production-like term",
+        ),
+        (
+            "db_pqc_test_customer_data",
+            "postgresql+psycopg://pqc_tester:pw@127.0.0.1:5432/pqc_test_customer_data",
+            {DESTRUCTIVE_TEST_DB_OPT_IN_ENV: "true"},
+            "customer",
+        ),
+        (
+            "db_pqc_test_live_mirror",
+            "postgresql+psycopg://pqc_tester:pw@127.0.0.1:5432/pqc_test_live_mirror",
+            {DESTRUCTIVE_TEST_DB_OPT_IN_ENV: "true"},
+            "live",
+        ),
+        (
+            "db_pqc_test_primary_node",
+            "postgresql+psycopg://pqc_tester:pw@127.0.0.1:5432/pqc_test_primary_node",
+            {DESTRUCTIVE_TEST_DB_OPT_IN_ENV: "true"},
+            "primary",
+        ),
+        (
+            "db_pqc_test_prod_clone",
+            "postgresql+psycopg://pqc_tester:pw@127.0.0.1:5432/pqc_test_prod_clone",
+            {DESTRUCTIVE_TEST_DB_OPT_IN_ENV: "true"},
+            "prod",
+        ),
+        (
+            "db_pqc_workspace",
+            "postgresql+psycopg://pqc_tester:pw@127.0.0.1:5432/pqc_workspace",
+            {DESTRUCTIVE_TEST_DB_OPT_IN_ENV: "true"},
+            "^pqc_test_[a-zA-Z0-9_]+$",
+        ),
+        (
+            "sqlite_backend",
+            f"sqlite:///{tmp_path / 'pqc_test_validation.db'}",
+            {DESTRUCTIVE_TEST_DB_OPT_IN_ENV: "true"},
+            "backend 'sqlite' is not permitted",
+        ),
+        (
+            "non_postgres_mysql_backend",
+            "mysql+pymysql://pqc_tester:pw@127.0.0.1:3306/pqc_test_validation",
+            {DESTRUCTIVE_TEST_DB_OPT_IN_ENV: "true"},
+            "backend 'mysql' is not permitted",
+        ),
+        (
+            "k_service_configured",
+            valid_url,
+            {DESTRUCTIVE_TEST_DB_OPT_IN_ENV: "true", "K_SERVICE": "pqc-inventory-agent"},
+            "K_SERVICE",
+        ),
+        (
+            "pqc_production_mode_true",
+            valid_url,
+            {DESTRUCTIVE_TEST_DB_OPT_IN_ENV: "true", "PQC_PRODUCTION_MODE": "true"},
+            "PQC_PRODUCTION_MODE",
+        ),
+        (
+            "pqc_env_production",
+            valid_url,
+            {DESTRUCTIVE_TEST_DB_OPT_IN_ENV: "true", "PQC_ENV": "production"},
+            "PQC_ENV",
+        ),
+    ]
+
+    for case_name, target_url, env_overrides, expected_msg in rejected_cases:
+        with monkeypatch.context() as mp:
+            for env_key in (
+                DESTRUCTIVE_TEST_DB_OPT_IN_ENV,
+                "K_SERVICE",
+                "PQC_PRODUCTION_MODE",
+                "PQC_ENV",
+            ):
+                mp.delenv(env_key, raising=False)
+            mp.setenv("PQC_TEST_POSTGRES_URL", target_url)
+            for k, v in env_overrides.items():
+                if v is None:
+                    mp.delenv(k, raising=False)
+                else:
+                    mp.setenv(k, v)
+
+            with pytest.raises(RuntimeError) as exc_direct:
+                _truncate_disposable_postgres_test_tables(target_url, engine_factory=_spy_engine_factory)
+            assert expected_msg in str(exc_direct.value), f"{case_name}: unexpected error {exc_direct.value}"
+
+            # Also verify the live integration test entrypoint itself fails closed (never skips) with ZERO SQL
+            with pytest.raises(RuntimeError) as exc_live_fn:
+                test_phase2_live_postgresql_multi_instance_integration(tmp_path, mp)
+            assert expected_msg in str(exc_live_fn.value), f"{case_name}: unexpected error {exc_live_fn.value}"
+
+            assert executed_sql == [], f"{case_name}: expected ZERO SQL statements, got {executed_sql}"
+            assert not any("TRUNCATE" in s.upper() for s in executed_sql), f"{case_name}: TRUNCATE executed!"
+            assert engine_connections == [], f"{case_name}: expected ZERO DB connections, got {engine_connections}"
+            assert migration_invocations == [], f"{case_name}: expected ZERO migrations, got {migration_invocations}"
+
+    # Verify valid opt-in + pqc_test_validation succeeds, redacts password, and prints disposable-DB warning before TRUNCATE
+    capsys.readouterr()
+    clean_env = {"PQC_ALLOW_DESTRUCTIVE_TEST_DB": "true"}
+    validated = validate_destructive_postgres_test_target(valid_url, env=clean_env)
+    assert validated.database_name == "pqc_test_validation"
+    assert "ephemeral-secret-pw" not in validated.redacted_url
+
+    reset_target = _truncate_disposable_postgres_test_tables(
+        valid_url,
+        env=clean_env,
+        engine_factory=_spy_engine_factory,
+    )
+    captured = capsys.readouterr()
+    assert reset_target.database_name == "pqc_test_validation"
+    assert "WARNING:" in captured.err
+    assert "'pqc_test_validation'" in captured.err
+    assert "ephemeral-secret-pw" not in captured.err
+    assert len(executed_sql) == 2
+    assert "SELECT version()" in executed_sql[0]
+    assert executed_sql[1].startswith("TRUNCATE TABLE ")
+
+
+@pytest.mark.skipif(
+    not os.getenv("PQC_TEST_POSTGRES_URL"),
+    reason=(
+        "BLOCKED: Live PostgreSQL 16 server (PQC_TEST_POSTGRES_URL) is not available on this workstation "
+        "(corporate macOS lacks postgres/initdb/docker/podman, and Google Santa blocks unsigned embedded initdb binaries with SIGKILL 9)."
+    ),
+)
+def test_phase2_live_postgresql_multi_instance_integration(tmp_path, monkeypatch):
+    """Step 4 PostgreSQL 16 Integration Validation across two independent application instances against a real PostgreSQL DB."""
+    pg_url = os.environ["PQC_TEST_POSTGRES_URL"]
+    # Mandatory safety guard BEFORE any database connection, migration, or destructive TRUNCATE operation:
+    validate_destructive_postgres_test_target(pg_url)
+
+    from scripts import run_db_migrations
+
+    assert run_db_migrations.main(["--db-url", pg_url, "--require-postgres"]) == 0
+    _truncate_disposable_postgres_test_tables(pg_url)
 
     # 1. Multi-instance 11-step workflow (OAuth tx A->B, session CRUD across A/B, revocation across A/B, full restart)
     _run_11_step_multi_instance_workflow(pg_url, tmp_path, monkeypatch)

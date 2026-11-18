@@ -44,8 +44,9 @@ Status Legend (per `PHASE1.md` Section 6):
 | **Concurrent OAuth Callbacks & Concurrent Multi-Instance DB Writes** | **`PASS`** | `tests/test_phase2_persistence_and_credentials.py::test_phase2_concurrent_oauth_callbacks_and_concurrent_multi_instance_db_writes` (`1 x 200`, `7 x 400`; 12 concurrent writers verified). |
 | **Database Interruption (Fail-Closed), Atomic Transaction Rollback & Database Recovery** | **`PASS`** | `tests/test_phase2_persistence_and_credentials.py::test_phase2_database_interruption_fail_closed_rollback_and_recovery`. |
 | **Credential Expiration, Revocation, Cross-User Session Isolation & Cross-Tenant Credential AAD Isolation** | **`PASS`** | `tests/test_phase2_persistence_and_credentials.py::test_phase2_kms_envelope_encryption_refresh_expiry_revocation_and_cross_tenant_isolation` & `tests/test_pqc_inventory.py::test_multi_tenant_google_auth_*`. |
+| **Destructive PostgreSQL Test Isolation Guard (`PQC_ALLOW_DESTRUCTIVE_TEST_DB=true` & `^pqc_test_[a-zA-Z0-9_]+$`)** | **`PASS`** | `tests/test_phase2_persistence_and_credentials.py::test_phase2_destructive_postgres_safety_guard_and_zero_sql_on_rejection` — Enforces explicit opt-in, SQLAlchemy `make_url()`, `postgresql`-only backend, disposable `^pqc_test_...$` naming, forbidden term & prod-env rejection, pre-`TRUNCATE` warning, and **zero SQL executed** on rejected configs. |
 | **Live PostgreSQL Server Execution (`PQC_TEST_POSTGRES_URL`)** | **`PASS`** | `tests/test_phase2_persistence_and_credentials.py::test_phase2_live_postgresql_multi_instance_integration` — Executed over Cloud SQL mTLS 1.3 (`port 3307`) against `fnlab-ai-data-8fa913:us-central1:pqc-pg16-validation` (`PostgreSQL 16.15 on x86_64-pc-linux-gnu`, disposable DB `pqc_test_validation`): **`1 passed in 134.69s`** standalone and **`76 passed, 0 failed, 1 skipped in 260.60s`** across the full suite. |
-| **Cloud Run / Cloud SQL / Cloud KMS Live Deployment Verification** | **`BLOCKED`** | Production/Cloud Run service deployment intentionally not executed per `PHASE1.md` rules (`no deployment` in this phase). |
+| **Cloud Run / Cloud SQL / Cloud KMS Live Deployment Verification** | **`BLOCKED`** | Production/Cloud Run service deployment and live Cloud KMS API invocation intentionally not executed per `PHASE1.md` rules (`no deployment` in this phase). |
 
 ---
 
@@ -56,7 +57,7 @@ Status Legend (per `PHASE1.md` Section 6):
 | Deployment Config, `Dockerfile`, `app.yaml`, `.env.example`, Lockfiles (`uv.lock`, `requirements.txt`) free of SQLite/FUSE & real secrets | **`PASS`** | Verified by `test_deployment_configuration_disables_simulation_and_keeps_persistence` and secret scan. |
 | Cloud SQL, Secret Manager, IAM, KMS Credential Justification, Migration & Rollback Documentation | **`PASS`** | [`docs/security-remediation/MIGRATION_AND_ROLLBACK.md`](./MIGRATION_AND_ROLLBACK.md), [`README.md`](../../README.md), [`docs/06-Agentic-PQC-Technical-Architecture-and-Consultant-Guide.md`](../06-Agentic-PQC-Technical-Architecture-and-Consultant-Guide.md). |
 | Mandatory Test Evidence Report & Acceptance Checklist | **`PASS`** | [`security_test_logs/phase_01_02_remediation/REPORT.md`](../../security_test_logs/phase_01_02_remediation/REPORT.md), [`security_test_logs/phase_01_02_final_validation/FINAL_REPORT.md`](../../security_test_logs/phase_01_02_final_validation/FINAL_REPORT.md) & this file. |
-| Remediation Commits Preserved (`no force-push`, `no deploy`, `no merge to main`, `no commit rewrite`) | **`PASS`** | `60ffaa2`, `02b53e9`, `d43e17e`, `bdcf692` + PostgreSQL 16 live validation commit on `security-hardening/phase-01-02`. |
+| Remediation Commits Preserved (`no force-push`, `no deploy`, `no merge to main`, `no commit rewrite`) | **`PASS`** | `60ffaa2`, `02b53e9`, `d43e17e`, `bdcf692`, `686e4ff` + destructive-test guard hotfix commit on `security-hardening/phase-01-02`. |
 
 ---
 

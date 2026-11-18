@@ -4,16 +4,18 @@
 - **Repository:** `g-jsaccomani/pqc_inventory_agent`
 - **Active Branch:** `security-hardening/phase-01-02`
 - **Commit Lineage on Branch:**
-  1. `1d112f6` (`main`) — `security: remediate oauth and session authentication vulnerabilities`
-  2. `60ffaa2` — `security: complete OAuth and distributed authentication remediation`
-  3. `02b53e9` — `security: complete PostgreSQL persistence and credential architecture`
-  4. `d43e17e594131a23a021b1afa68541851ff32307` (`d43e17e`) — `docs(security): add remediation specifications and execution checkpoint logs` (Pre-corrective-pass baseline)
-  5. `HEAD` (`git rev-parse HEAD`, parent `d43e17e594131a23a021b1afa68541851ff32307`) — `security: close phase 1-2 acceptance gaps`
+  1. `1d112f65c5b917f7fdcd00bb00b8e8a772d18cc0` (`1d112f6`, `main`) — `security: remediate oauth and session authentication vulnerabilities`
+  2. `60ffaa21adfadda135ba5dd65d628f699e48425f` (`60ffaa2`) — `security: complete OAuth and distributed authentication remediation`
+  3. `02b53e9da7590b67d9b3c1960a400cea04add49d` (`02b53e9`) — `security: complete PostgreSQL persistence and credential architecture`
+  4. `d43e17e594131a23a021b1afa68541851ff32307` (`d43e17e`) — `docs(security): add remediation specifications and execution checkpoint logs`
+  5. `bdcf69268843a141d2ebc3a68b0272791a0ec813` (`bdcf692`) — `security: close phase 1-2 acceptance gaps`
+  6. `686e4ffce765ed6d615daee10daa4fb5ee423267` (`686e4ff`) — `test(security): validate live Cloud SQL PostgreSQL 16 multi-instance integration` (Pre-hotfix `HEAD` SHA)
+  7. **Final `HEAD`** (parent `686e4ffce765ed6d615daee10daa4fb5ee423267`, resolve exact 40-char SHA via `git rev-parse HEAD`) — `security: guard destructive postgres integration tests`
 - **Python Environment:** Python `3.12.13` managed by `uv` (`uv.lock` + `.venv/bin/pytest`). Never run bare `pip`; use `uv` or `.venv/bin/python`.
 
 ---
 
-## 2. Architecture State After Phase 1–2 Final Corrective Pass
+## 2. Architecture State After Phase 1–2 Final Corrective & Safety Hotfix Pass
 
 ### 2.1 Authentication & OAuth 2.0 + PKCE (`pqc_agent/auth_guard.py`, `pqc_agent/auth_store.py`, `pqc_agent/workspace_server.py`, `pqc_agent/portal_ui.py`)
 - **OAuth 2.0 Authorization Code + PKCE (`S256`) Only (`AUTH-01`):** Implicit flow (`response_type=token`, URL `#access_token` fragments, and GIS `initTokenClient`) is disabled and rejected across public and confidential clients.
@@ -34,17 +36,25 @@
     - `DistributedAuthStore` and `ManagedSchemaDatabaseSessionService` **never** call `metadata.create_all()`; startup calls read-only `verify_alembic_schema_on_engine()` and fails closed if `alembic_version != '20261117_0002'` or any table is missing.
   - Explicit migration entry point: `scripts/run_db_migrations.py` (`--require-postgres`, `--verify-only`, PostgreSQL advisory lock `7081632026`), invoked as a single-task Cloud Run Job (`--tasks=1 --max-retries=0`) in `scripts/deploy_cloud_run.sh` before Cloud Run service deployment.
 - **Delegated Credentials (`pqc_agent/credential_service.py`, `tools/gcloud_bridge.py`, `ID-01`):**
-  - `EncryptedDatabaseCredentialService` wraps per-record 256-bit DEKs via Google Cloud KMS (`PQC_KMS_KEY_NAME`, mandatory in production) with canonical AAD `app_name|tenant_domain|user_id|credential_key`. No `InMemoryCredentialService` or disk `mkstemp` token files remain in runtime paths.
+  - `EncryptedDatabaseCredentialService` wraps per-record 256-bit DEKs via Google Cloud KMS (`PQC_KMS_KEY_NAME`, mandatory in production) with canonical AAD `app_name|tenant_domain|user_id|credential_key` (tested with deterministic local KMS stub `_DeterministicCloudKmsStub`; live Cloud KMS API validation remains a staging prerequisite). No `InMemoryCredentialService` or disk `mkstemp` token files remain in runtime paths.
 - **Legacy Data Migration (`pqc_agent/migration_tool.py`, `scripts/migrate_sqlite_to_postgres.py`, `DB-04`):**
   - Idempotent, read-only source migration with `--dry-run`, SHA-256 source immutability verification, orphan/conflict detection, and legacy plaintext token stripping.
 
+### 2.3 Final Safety Hotfix Safeguards Implemented
+1. **Mandatory Destructive-Test Database Isolation Guard (`tests/test_phase2_persistence_and_credentials.py`):**
+   - `validate_destructive_postgres_test_target()` and `_truncate_disposable_postgres_test_tables()` execute **before** any database connection, Alembic migration, or `TRUNCATE` in `test_phase2_live_postgresql_multi_instance_integration`.
+   - Enforces explicit `PQC_ALLOW_DESTRUCTIVE_TEST_DB=true`, SQLAlchemy `make_url()` parsing, `postgresql`-only backend, `^pqc_test_[a-zA-Z0-9_]+$` database naming, rejection of `prod`/`production`/`live`/`customer`/`primary`, rejection of `K_SERVICE` / `PQC_PRODUCTION_MODE=true` / `PQC_ENV=production`, fail-closed `RuntimeError` with **zero SQL executed** on rejection, and a clear pre-`TRUNCATE` warning identifying the disposable database.
+2. **Documentation & Commit Lineage Synchronization:**
+   - Synchronized `FINAL_REPORT.md`, `CHECKPOINT.md`, and `PHASE_01_02_ACCEPTANCE.md` with the exact Git lineage (`bdcf692`, `686e4ff`, and final `HEAD`), added offline zero-SQL guard regression results (`8 passed, 1 skipped` in Phase 2 suite; `40 passed` in Auth/Phase 1 suites), preserved `PostgreSQL 16.15` integration evidence, and explicitly noted that live Cloud KMS API validation was not performed.
+
 ---
 
-## 3. Live PostgreSQL 16.15 Validation Completed (`PASS` / `GO` for Phase 3)
+## 3. Remaining Production Prerequisites & Next Recommended Phase
 
-1. **Validated Against Real Cloud SQL for PostgreSQL 16 (`PASS`):**
-   - Instance: `fnlab-ai-data-8fa913:us-central1:pqc-pg16-validation` (`Functional Lab - AI and Data`, `PostgreSQL 16.15 on x86_64-pc-linux-gnu`, disposable DB `pqc_test_validation`, connected via ephemeral Cloud SQL mTLS 1.3 port `3307`).
-   - Standalone `test_phase2_live_postgresql_multi_instance_integration`: **`1 passed in 134.69s`** (exit `0`).
-   - Full regression suite with `PQC_TEST_POSTGRES_URL` active: **`76 passed, 0 failed, 1 skipped in 260.60s`** (exit `0`).
-2. **Next Engineering Steps (Phase 3 / Staging Rollout):**
-   - Proceed to Phase 3 security remediation items (`SSRF`/egress hardening, Vertex AI circuit-breaker resilience, scorecard denominator adjustments, non-root container user, upload size/magic-byte limits), or provision staging Secret Manager + Cloud KMS (`PQC_KMS_KEY_NAME`) and execute `scripts/deploy_cloud_run.sh` in staging.
+1. **Remaining Production Prerequisites (Before Production Cutover):**
+   - Provision dedicated production Cloud SQL for PostgreSQL 16 HA instance (`--availability-type=REGIONAL`) and least-privilege database user.
+   - Provision Secret Manager secrets (`pqc-session-secret`, `pqc-db-password`, `pqc-oauth-client-secret`) and bind runtime Service Account IAM (`roles/cloudsql.client`, `roles/secretmanager.secretAccessor`).
+   - Provision a live Google Cloud KMS symmetric key (`PQC_KMS_KEY_NAME`) with `roles/cloudkms.cryptoKeyEncrypterDecrypter` and validate live KMS `encrypt`/`decrypt` envelope wrapping in staging.
+   - Execute serialized schema migration job (`scripts/run_db_migrations.py --require-postgres`, `--tasks=1 --max-retries=0`) and validate multi-instance (`>= 2` instances) Cloud Run + IAP staging deployment before production traffic cutover.
+2. **Next Recommended Engineering Phase — Phase 3 (Runtime Security, Resilience & Input Hardening):**
+   - Proceed to **Phase 3** remediation items: outbound SSRF/egress controls, Vertex AI model call timeouts/circuit-breaker resilience, PQC scorecard denominator & edge-case hardening, non-root container execution in `Dockerfile`, and strict multimodal upload size/magic-byte validation.
