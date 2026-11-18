@@ -131,8 +131,12 @@ gcloud sql backups create \
 DATABASE_URL="postgresql+psycopg://pqc_app:placeholder@127.0.0.1:5432/pqc_workspace" \
   .venv/bin/alembic upgrade head --sql > "${BACKUP_DIR}/planned_schema_upgrade.sql"
 
-# Apply online against target PostgreSQL database:
-DATABASE_URL="${TARGET_POSTGRES_URL}" .venv/bin/alembic upgrade head
+# Apply online against target PostgreSQL database via the explicit single-runner migration entry point
+# (enforces PostgreSQL backend, acquires pg_try_advisory_lock, upgrades to head 20261117_0002, and verifies schema):
+DATABASE_URL="${TARGET_POSTGRES_URL}" .venv/bin/python scripts/run_db_migrations.py --require-postgres
+
+# Optional read-only verification gate prior to starting Cloud Run revisions:
+DATABASE_URL="${TARGET_POSTGRES_URL}" .venv/bin/python scripts/run_db_migrations.py --require-postgres --verify-only
 ```
 
 ### 4.3 Step 3 — Dry-Run Data Migration & Anomaly Inspection
@@ -146,10 +150,10 @@ DATABASE_URL="${TARGET_POSTGRES_URL}" .venv/bin/alembic upgrade head
   --report-md "${BACKUP_DIR}/dry_run_report.md"
 ```
 Verify in `dry_run_report.md`:
-- `Status: DRY_RUN_OK`
+- `Status: DRY_RUN_VALIDATED`
 - `Source Files Untouched (SHA-256 Verified): True`
 - `Orphan Session Metadata Rows: 0` and `Orphan ADK Event Rows: 0`
-- Review any `DUPLICATE_SESSION_ID_CROSS_USER_CONFLICT` or `LEGACY_PLAINTEXT_TOKEN_STRIPPED` warnings.
+- Review any `CROSS_USER_SESSION_ID_CONFLICT` or `PLAINTEXT_TOKEN_STRIPPED` warnings.
 
 ### 4.4 Step 4 — Execute Idempotent Migration & Verify Counts
 ```bash
@@ -191,3 +195,14 @@ If a post-deployment health check (`/api/health`), authentication check, or data
 3. **Emergency Credential & Session Revocation (if compromise is suspected):**
    - Rotate `pqc-session-secret` in Secret Manager to invalidate all signed cookies across every Cloud Run instance simultaneously.
    - Disable or rotate the Cloud KMS key version on `PQC_KMS_KEY_NAME` to immediately render all wrapped DEKs in `pqc_delegated_credentials` undecryptable (fail-closed).
+
+---
+
+## 6. Corrective Pass Update — Exclusive Alembic Production Schema Authority (`DB-01`)
+
+- **Original Finding & Root Cause:** Application startup previously called SQLAlchemy `metadata.create_all()` via `DistributedAuthStore.ensure_schema()` and Google ADK `DatabaseSessionService.prepare_tables()`, risking unversioned table creation ahead of Alembic.
+- **Corrective Implementation:**
+  1. Added Alembic revision `20261117_0002_add_adk_v1_session_schema.py` (revising `20261117_0001`) so all 10 `pqc_*` tables and all 5 ADK `v1` session tables (`adk_internal_metadata`, `sessions`, `events`, `app_states`, `user_states`) are owned exclusively by Alembic (`EXPECTED_ALEMBIC_REVISION = "20261117_0002"`).
+  2. Prohibited `metadata.create_all()` in production across `DistributedAuthStore`, `ManagedSchemaDatabaseSessionService`, and `migration_tool.py`; production startup performs read-only `verify_alembic_schema_on_engine()` and fails closed if `alembic_version` is missing, outdated, or inconsistent.
+  3. Added `scripts/run_db_migrations.py` and wired a serialized single-task Cloud Run Job (`--tasks=1 --max-retries=0` + PostgreSQL advisory lock `7081632026`) in `scripts/deploy_cloud_run.sh` so schema upgrades run explicitly before application containers start and never execute concurrently across Cloud Run instances.
+- **Verification Status:** Automated schema-authority regression suite (`test_phase2_alembic_sole_production_schema_authority_and_migration_cli`): **`PASS`** | Live PostgreSQL 16 staging execution (`PQC_TEST_POSTGRES_URL`): **`BLOCKED`** (`NO-GO` for production cutover until executed in CI/staging).

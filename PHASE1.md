@@ -1,447 +1,325 @@
-# CRITICAL REMEDIATION — PHASE 1 AND PHASE 2 COMPLETION
+# PHASE 1–2 FINAL CORRECTIVE PASS — PQC INVENTORY AGENT
 
-You are operating as a Principal Application Security Engineer, Senior OAuth Architect and Google Cloud Infrastructure Engineer.
+Repository: `g-jsaccomani/pqc_inventory_agent`
+Branch: `security-hardening/phase-01-02`
 
-Repository: https://github.com/g-jsaccomani/pqc_inventory_agent
+## OBJECTIVE
 
-Your mission is to COMPLETE the previously implemented Phase 1 (OAuth and Authentication) and Phase 2 (Persistence and Distributed Identity).
+Perform a narrowly scoped corrective pass against the existing Phase 1 and Phase 2 implementation.
 
-**This is an implementation task, NOT another assessment exercise.**
+Do NOT redesign, rewrite, or reimplement completed functionality.
 
-The previous implementation was reviewed and found incomplete. You must correct the findings below in the actual source code, configuration, tests and deployment documentation.
+Preserve all existing implementation work, commits, Markdown documentation, test suites, and migration artifacts.
 
-Do not proceed to Phase 3.
+Fix the two identified findings:
 
----
+1. OAuth transaction TTL must never exceed 600 seconds.
+2. Production database schema initialization must be exclusively controlled by Alembic, not SQLAlchemy `metadata.create_all()`.
 
-## 1. EXECUTION RULES
+Additionally, improve PostgreSQL integration verification and update the existing security evidence.
 
-1. Inspect the current branch, Git status, recent commits and existing implementation.
-2. Preserve all valid existing work.
-3. Do not reset, overwrite or discard user changes.
-4. Do not create duplicate implementations when an existing component can be properly corrected.
-5. Do not weaken security controls to make tests pass.
-6. Do not introduce mock-only solutions as substitutes for production architecture.
-7. Do not deploy or modify production infrastructure.
-8. Never expose or commit credentials, tokens, secrets or sensitive user data.
-9. Do not declare a requirement complete without implementation and corresponding test evidence.
-10. Keep changes strictly within Phase 1 and Phase 2.
-
-If a requirement cannot be implemented safely, explain the technical blocker and do not simulate success.
-
-## 2. PHASE 1 — OAUTH AND AUTHENTICATION
-
-### AUTH-01 — Eliminate OAuth Implicit Flow
-
-Remove every remaining OAuth implicit flow.
-
-Mandatory requirements:
-
-- Use Authorization Code Flow with PKCE.
-- Support both confidential and public OAuth clients.
-- Never fall back to `response_type=token`.
-- Never return access tokens through browser redirects.
-- Perform token exchange server-side whenever the existing architecture supports it.
-- Validate state, nonce, issuer, audience, signature and expiration.
-- Enforce exact redirect URI allowlists.
-- Prevent authorization response replay.
-
-Search the entire repository for:
-- `response_type=token`
-- Implicit OAuth implementations.
-- Token-bearing redirects.
-- Alternative or legacy OAuth callbacks.
-
-No production authentication path may retain implicit flow.
-
-### AUTH-02 — Correct PKCE Verifier Storage
-
-The previous implementation exposed the PKCE `code_verifier` inside the signed OAuth `state` payload.
-
-Fix this.
-
-Requirements:
-
-- Generate a cryptographically secure random verifier.
-- Store the verifier server-side in a temporary OAuth transaction record.
-- Keep `state` opaque and random.
-- Never place the verifier or reusable credentials inside state.
-- Associate each transaction with the initiating session.
-- Apply strict expiration.
-- Enforce single-use consumption.
-- Prevent concurrent callback races.
-- Reject replayed or expired transactions.
-- Ensure transaction state is shared between application instances.
-
-Do not confuse signing with encryption.
-
-### AUTH-03 — Remove Session Tokens From JSON
-
-Remove all reusable session bearer tokens from authentication API responses.
-
-Requirements:
-
-- Session authentication must use appropriately configured Secure, HttpOnly cookies.
-- No reusable session token may be exposed through JSON, browser storage or URLs.
-- Verify all login, refresh, callback and logout response paths.
-- Maintain CSRF protection.
-- Preserve legitimate multi-tab behavior.
-- Ensure cookies have appropriate SameSite and Path attributes.
-- Ensure production HTTPS behavior.
-
-Search for all occurrences of session tokens in API response serialization.
-
-Do not claim completion based only on removal from localStorage.
-
-### AUTH-04 — Distributed Nonce and Session Revocation
-
-Eliminate process-local authoritative storage for:
-
-- OAuth nonce records.
-- OAuth transaction consumption.
-- Session revocation.
-- Any authentication state requiring consistency between instances.
-
-Use the shared transactional PostgreSQL persistence layer implemented in Phase 2.
-
-Requirements:
-
-- Atomic state transitions.
-- Single-use nonce and OAuth transactions.
-- Cross-instance revocation.
-- Session expiration.
-- Replay protection.
-- Consistent behavior after application restarts.
-
-Do not rely on Python dictionaries, local caches or in-process locks as authoritative state.
-
-### AUTH-05 — Authentication Regression Tests
-
-Create tests for:
-
-1. Public OAuth client using Authorization Code + PKCE.
-2. Confidential OAuth client using Authorization Code + PKCE.
-3. Rejection of implicit flow.
-4. PKCE verifier never appearing in state.
-5. Opaque state validation.
-6. Invalid state rejection.
-7. Nonce replay rejection.
-8. OAuth transaction expiration.
-9. OAuth transaction single-use enforcement.
-10. Session token absent from JSON responses.
-11. Session token absent from localStorage.
-12. Secure and HttpOnly cookie behavior.
-13. CSRF enforcement.
-14. Session revocation across independent instances.
-15. Application restart.
-16. Concurrent callback handling.
-
-Use synthetic credentials and isolated test identities.
+Do not deploy, merge into `main`, modify production infrastructure, or start Phase 3.
 
 ---
 
-## 3. PHASE 2 — POSTGRESQL AND DISTRIBUTED PERSISTENCE
+## STEP 1 — BASELINE AND REPOSITORY SAFETY
 
-### DB-01 — Implement PostgreSQL as Production Persistence
+Before editing:
 
-The current implementation still contains SQLite-based session persistence.
+1. Confirm the current branch is `security-hardening/phase-01-02`.
+2. Record the current HEAD SHA.
+3. Run `git status --short`.
+4. Confirm the working tree is clean. If it is not clean, inspect and preserve existing user changes. Never discard them.
+5. Inspect the existing implementation and documentation:
+   - `pqc_agent/auth_store.py`
+   - `pqc_agent/workspace_server.py`
+   - `tests/test_phase1_distributed_auth.py`
+   - `tests/test_phase2_persistence_and_credentials.py`
+   - `security_test_logs/phase_01_02_remediation/REPORT.md`
+   - `docs/security-remediation/PHASE_01_02_ACCEPTANCE.md`
+   - `docs/security-remediation/MIGRATION_AND_ROLLBACK.md`
+   - `migrations/versions/20261117_0001_initial_phase1_phase2_schema.py`
 
-Replace it with PostgreSQL for production.
+Do not recreate existing Markdown files.
+
+Create a dedicated evidence directory:
+
+`security_test_logs/phase_01_02_final_validation/`
+
+Record baseline information in:
+
+`security_test_logs/phase_01_02_final_validation/BASELINE.md`
+
+---
+
+## STEP 2 — AUTH-02: ENFORCE STRICT 600-SECOND OAUTH TTL
+
+Inspect `DistributedAuthStore.create_oauth_transaction()`.
+
+Current implementation allows:
+
+`effective_ttl = max(1, min(int(ttl_seconds), 1800))`
+
+Correct the implementation so the maximum transaction TTL is exactly 600 seconds.
 
 Requirements:
 
-- Use Cloud SQL PostgreSQL as the supported production architecture.
-- Use a PostgreSQL-compatible ADK DatabaseSessionService configuration.
-- Verify compatibility against the exact installed Google ADK version.
-- Inspect and implement the actual supported SQLAlchemy integration.
-- Add the required PostgreSQL driver.
-- Configure Cloud Run to Cloud SQL connectivity.
-- Implement appropriate connection pooling and timeouts.
-- Implement transaction management.
-- Add database migrations and schema versioning.
+- Reject or safely clamp TTL values above 600 seconds.
+- Never allow zero or negative effective TTL.
+- Preserve cryptographically secure state, PKCE verifier, OIDC nonce, and browser binding behavior.
+- Preserve atomic single-use transaction consumption.
+- Do not expose the PKCE verifier in state, URL parameters, cookies, or browser-visible JSON.
 
-Production must fail closed if PostgreSQL is unavailable or incorrectly configured.
+Add explicit regression tests for:
 
-SQLite may remain exclusively for explicitly configured local development and isolated unit tests.
+1. Default TTL.
+2. TTL = 1.
+3. TTL = 600.
+4. TTL = 601.
+5. TTL = 1800.
+6. TTL = 0.
+7. Negative TTL.
+8. Expired transaction rejection.
+9. Concurrent callback single-use behavior.
 
-Do not silently fall back from PostgreSQL to SQLite in production.
+Verify that no transaction can remain valid beyond 600 seconds.
 
-### DB-02 — Eliminate SQLite on GCS FUSE
+---
 
-Remove every production configuration that places SQLite database files on Cloud Storage FUSE.
+## STEP 3 — DB-01: MAKE ALEMBIC THE ONLY PRODUCTION SCHEMA AUTHORITY
 
 Inspect:
 
-- `app.yaml`
-- Dockerfile
-- Database initialization
-- Session service configuration
-- Environment variables
-- Volume mounts
-- Deployment documentation
+- `DistributedAuthStore.__init__()`
+- `DistributedAuthStore.ensure_schema()`
+- `create_workspace_app()`
+- ADK `DatabaseSessionService` initialization.
+- Application startup and deployment scripts.
+- Alembic configuration and migration revision.
+
+The current implementation calls:
+
+`PqcPersistenceBase.metadata.create_all(self.engine)`
+
+This may create tables before Alembic applies its versioned migration.
+
+### Required behavior
+
+Production:
+
+- Alembic is the only authority for schema creation and version upgrades.
+- Production startup must NOT call `metadata.create_all()`.
+- Production startup must validate the expected Alembic revision.
+- Production startup must fail closed if the schema is missing, outdated, or inconsistent.
+- Never automatically downgrade or modify an existing production schema.
+- Never silently create missing production tables.
+
+Development and isolated unit tests:
+
+- Existing convenience initialization may remain available only through an explicit non-production configuration.
+- SQLite remains permitted for isolated local tests.
+- SQLite must remain prohibited in production.
+
+### Migration execution
+
+Create or update an explicit migration entry point.
 
 Requirements:
 
-- PostgreSQL handles transactional data.
-- GCS is reserved for appropriate object storage.
-- Never use GCS FUSE as a substitute for a transactional database.
-- Eliminate WAL and SQLite locking workarounds from production configuration.
+1. Run `alembic upgrade head` as a separate, explicit migration operation.
+2. Verify the expected revision after migration.
+3. Start the application only after successful migration.
+4. Do not run migrations concurrently from multiple Cloud Run instances.
+5. Never run a production migration automatically during application startup.
+6. Preserve the current rollback runbook.
 
-Search the complete repository for SQLite production references.
+If a deployment script is updated, ensure the migration step is explicit and requires a configured PostgreSQL target.
 
-### DB-03 — Eliminate JSON as Authoritative Production Storage
+Do not execute the migration against production.
 
-Move authoritative user metadata, session metadata and other shared transactional records to PostgreSQL.
+### Required regression tests
+
+- Production startup with missing schema must fail closed.
+- Production startup with outdated Alembic revision must fail closed.
+- Production startup must not invoke `metadata.create_all()`.
+- Explicit Alembic migration must create the expected schema.
+- Re-running migration must be safe.
+- SQLite production configuration must remain rejected.
+- Local development initialization must continue working.
+
+---
+
+## STEP 4 — POSTGRESQL 16 INTEGRATION VALIDATION
+
+Inspect the existing live PostgreSQL integration test.
+
+Target:
+
+`tests/test_phase2_persistence_and_credentials.py::test_phase2_live_postgresql_multi_instance_integration`
 
 Requirements:
 
-- Define a consistent schema.
-- Enforce user ownership.
-- Enforce tenant isolation.
-- Use atomic updates.
-- Apply appropriate unique constraints.
-- Preserve timestamps and relationships.
-- Avoid inconsistent JSON/database dual writes.
-- Eliminate production filesystem fallback.
+- Use PostgreSQL 16 or compatible Cloud SQL PostgreSQL.
+- Use `PQC_TEST_POSTGRES_URL`.
+- Test two independent application instances against the same real PostgreSQL database.
+- Test OAuth transaction creation on instance A and consumption on instance B.
+- Test session creation, retrieval, and updates across instances.
+- Test session revocation across instances.
+- Test application restart and persistence.
+- Test concurrent OAuth callback consumption.
+- Test transactional rollback.
+- Test credential encryption, retrieval, expiration, and revocation.
+- Test tenant isolation.
 
-JSON may remain as an export or backup format, not as authoritative shared storage.
+If PostgreSQL is unavailable:
 
-### ID-01 — Replace InMemoryCredentialService
+- Mark the integration test as BLOCKED/SKIPPED.
+- Record the exact missing dependency or infrastructure requirement.
+- Never report SQLite tests as PostgreSQL integration tests.
+- Never fabricate PostgreSQL execution output.
 
-The previous implementation still uses process-local credential storage.
-
-Replace `InMemoryCredentialService` as the authoritative production credential provider.
-
-Evaluate the following identity approaches:
-
-**Preferred:** service account impersonation with short-lived credentials and least-privilege IAM, when compatible with the intended user access model.
-
-**Alternative:** securely persisted delegated user refresh tokens when user-specific authorization is genuinely required.
-
-For delegated credentials:
-
-- Store encrypted credentials in a protected persistent service.
-- Use envelope encryption backed by Google Cloud KMS.
-- Enforce user and tenant ownership.
-- Implement expiration and revocation.
-- Never expose refresh tokens to the frontend.
-- Never log credentials.
-- Ensure credentials remain available across Cloud Run instances.
-
-Do not use process memory, temporary files or plain JSON files as authoritative credential storage.
-
-Document the selected design and justify it.
-
-### DB-04 — Implement Safe Data Migration
-
-Implement a migration procedure from existing SQLite and JSON persistence to PostgreSQL.
-
-Requirements:
-
-- Idempotent migration.
-- Preserve user identities.
-- Preserve session identifiers.
-- Preserve ownership relationships.
-- Preserve relevant timestamps.
-- Validate record counts.
-- Validate referential integrity.
-- Detect duplicates and inconsistent records.
-- Generate a migration report.
-- Document backup and rollback.
-- Never delete original data automatically.
-
-The migration must be tested against disposable test data.
-
-Do not execute migrations against production.
+Do not install unauthorized binaries or bypass corporate endpoint protection.
 
 ---
 
-## 4. MULTI-INSTANCE INTEGRATION TESTING
+## STEP 5 — FULL REGRESSION TESTING
 
-This is mandatory.
+Run:
 
-Simulate at least two independent application instances.
+```bash
+.venv/bin/python -m compileall -q pqc_agent tools scripts migrations tests
+.venv/bin/pytest -v -rs
+git diff --check
+```
 
-Execute the following workflow:
+Run the PostgreSQL integration test separately when a valid test database is available:
 
-1. Authenticate a synthetic user through instance A.
-2. Create an OAuth transaction.
-3. Complete the transaction through instance B.
-4. Create a session.
-5. Retrieve the session from instance B.
-6. Update the session from instance B.
-7. Retrieve the update from instance A.
-8. Revoke the session from instance A.
-9. Attempt to access it through instance B.
-10. Restart the application instances.
-11. Verify that revocation and session state remain consistent.
+```bash
+PQC_TEST_POSTGRES_URL="<DISPOSABLE_POSTGRESQL_16_TEST_DATABASE>" \
+.venv/bin/pytest -v -rs \
+tests/test_phase2_persistence_and_credentials.py::test_phase2_live_postgresql_multi_instance_integration
+```
 
-Also test:
+Never use production database credentials.
 
-- Concurrent OAuth callbacks.
-- Concurrent database writes.
-- Database interruption.
-- Transaction rollback.
-- Database recovery.
-- Credential expiration.
-- Credential revocation.
-- Unauthorized cross-user session access.
-- Unauthorized cross-tenant credential access.
+Record:
 
-Use a real isolated PostgreSQL instance for integration tests whenever available.
-
-Mocks alone do not satisfy this requirement.
-
-If Cloud SQL infrastructure is unavailable, test against disposable PostgreSQL and explicitly mark Cloud Run/Cloud SQL deployment verification as BLOCKED.
-
-Never report blocked tests as passed.
+- Exact commands.
+- Exit codes.
+- Passed tests.
+- Failed tests.
+- Skipped tests.
+- Blocked tests.
+- Runtime.
+- PostgreSQL server version when available.
 
 ---
 
-## 5. CONFIGURATION AND DOCUMENTATION
+## STEP 6 — UPDATE EXISTING DOCUMENTATION
 
-Update all relevant files.
+Update, do not recreate:
 
-Include:
+1. `security_test_logs/phase_01_02_remediation/REPORT.md`
+2. `docs/security-remediation/PHASE_01_02_ACCEPTANCE.md`
+3. `docs/security-remediation/MIGRATION_AND_ROLLBACK.md`
 
-- `app.yaml` or equivalent deployment configuration.
-- `requirements.txt` and dependency lockfiles.
-- Dockerfile.
-- Database configuration.
-- Environment variable templates.
-- Secret Manager integration.
-- Cloud SQL connectivity instructions.
-- Service account IAM requirements.
-- Credential architecture.
-- Migration instructions.
-- Rollback instructions.
+Add a corrective-pass section containing:
 
-Production configuration must not contain SQLite/GCS FUSE persistence or process-local authentication dependencies.
-
-Never place real secrets in configuration templates.
-
----
-
-## 6. MANDATORY TEST EVIDENCE
-
-Create or update:
-
-`security_test_logs/phase_01_02_remediation/REPORT.md`
-
-Include:
-
-- Root cause of each previously identified finding.
+- Original finding.
+- Root cause.
+- Corrective implementation.
 - Files modified.
-- Before/after architecture.
-- Implementation details.
-- Authentication test results.
-- PostgreSQL integration test results.
-- Multi-instance test results.
-- Credential isolation tests.
-- Migration validation.
-- Commands actually executed.
-- Passed, failed, skipped and blocked tests.
+- Regression tests added.
+- Actual test results.
+- Remaining blockers.
+- Final acceptance status.
+
+Use only these statuses:
+
+- PASS
+- FAIL
+- BLOCKED
+- NOT_IMPLEMENTED
+
+Do not change a previously BLOCKED item to PASS without actual new execution evidence.
+
+Create:
+
+`security_test_logs/phase_01_02_final_validation/FINAL_REPORT.md`
+
+The report must include:
+
+- Original baseline SHA.
+- Final commit SHA.
+- Changed files.
+- Security findings addressed.
+- Test execution evidence.
+- PostgreSQL integration status.
 - Remaining risks.
-- Infrastructure prerequisites.
-- Redacted logs and supporting evidence.
+- Final recommendation: GO or NO-GO.
 
-Every test must have a real execution result.
+Also create:
 
-Do not fabricate successful test outcomes.
+`security_test_logs/phase_01_02_final_validation/CHECKPOINT.md`
 
-Create a separate remediation checklist:
-
-`docs/security-remediation/PHASE_01_02_ACCEPTANCE.md`
-
-Each requirement must be marked:
-
-- PASS — implementation and tests verified.
-- FAIL — implementation or tests failed.
-- BLOCKED — environment or dependency unavailable.
-- NOT_IMPLEMENTED — not completed.
-
-Include links or references to supporting test evidence.
+Include enough technical context for another coding agent to continue without re-reading the entire repository.
 
 ---
 
-## 7. GIT AND CHANGE MANAGEMENT
+## STEP 7 — GIT HYGIENE
 
-Work on the current remediation branch.
+Do not amend or rewrite previous commits.
 
-Preserve all existing commits.
+Create one new commit only after all locally executable tests pass:
 
-Create two logically separated commits:
+`security: close phase 1-2 acceptance gaps`
 
-First commit:
+Before committing:
 
-`security: complete OAuth and distributed authentication remediation`
+```bash
+git status --short
+git diff --check
+git diff --stat
+```
 
-Second commit:
+After committing:
 
-`security: complete PostgreSQL persistence and credential architecture`
+```bash
+git status --short
+git log -3 --oneline
+git rev-parse HEAD
+```
 
-Before each commit:
+Record the final SHA in `CHECKPOINT.md` and `FINAL_REPORT.md`.
 
-- Run relevant tests.
-- Inspect `git diff`.
-- Run `git diff --check`.
-- Verify no secrets were added.
-- Verify no unrelated changes were introduced.
-
-Do not force-push.
-
-Do not deploy.
-
-Do not merge into main.
+If the PostgreSQL integration test is blocked, the commit may still be created if all locally executable tests pass, but the final acceptance status MUST remain BLOCKED / NO-GO for production.
 
 ---
 
-## 8. FINAL ACCEPTANCE GATE
+## STRICT PROHIBITIONS
 
-The task is complete only when the following conditions are satisfied:
+- No deployment.
+- No production database access.
+- No merge into main.
+- No force-push.
+- No rewriting previous commits.
+- No Phase 3 implementation.
+- No unrelated refactoring.
+- No removal of existing tests or documentation.
+- No fake test results.
+- No weakening of security controls to make tests pass.
+- No silent fallback to SQLite in production.
 
-### Phase 1
+## FINAL RESPONSE
 
-- No implicit OAuth flow remains.
-- PKCE verifier is stored server-side, not inside state.
-- State and nonce are validated and single-use.
-- No reusable session bearer token is returned in JSON.
-- Secure cookie authentication is implemented.
-- Session revocation works across independent instances.
-- Authentication regression tests pass.
+Return a concise technical summary containing:
 
-### Phase 2
-
-- Production persistence uses PostgreSQL.
-- SQLite/GCS FUSE production dependency is removed.
-- JSON is no longer authoritative shared persistence.
-- Credential storage is distributed and protected.
-- Migration is documented and tested.
-- Multi-instance consistency tests pass.
-- Database recovery behavior is verified.
-
-### Final Rules
-
-If any critical acceptance criterion fails:
-
-- Do not mark the phase completed.
-- Do not proceed to Phase 3.
-- Document the remaining issue.
-- Report the actual blocker.
-
-Provide a concise final execution report with:
-
-1. Corrected vulnerabilities.
-2. Architecture changes.
+1. Baseline and final commit SHA.
+2. Findings fixed.
 3. Files modified.
 4. Test results.
-5. Blocked tests.
-6. Remaining limitations.
-7. Two commit SHAs.
-8. Production infrastructure prerequisites.
-9. Final Phase 1 status.
-10. Final Phase 2 status.
+5. PostgreSQL integration status.
+6. Remaining blockers.
+7. GO / NO-GO decision.
 
-**Do not claim success based on code changes alone. The implementation, tests and evidence must agree.**
-
-STOP after completing these corrective remediations.
+Stop after this corrective pass.

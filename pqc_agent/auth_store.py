@@ -47,6 +47,7 @@ from sqlalchemy import (
     UniqueConstraint,
     create_engine,
     delete,
+    inspect as sa_inspect,
     or_,
     select,
     text,
@@ -60,7 +61,19 @@ from pqc_agent import auth_guard
 
 logger = logging.getLogger(__name__)
 
-CURRENT_SCHEMA_VERSION = "20261117_0001"
+CURRENT_SCHEMA_VERSION = "20261117_0002"
+EXPECTED_ALEMBIC_REVISION = CURRENT_SCHEMA_VERSION
+MIN_OAUTH_TRANSACTION_TTL_SECONDS = 1
+MAX_OAUTH_TRANSACTION_TTL_SECONDS = 600
+REQUIRED_ADK_V1_TABLES: frozenset[str] = frozenset(
+    {
+        "adk_internal_metadata",
+        "app_states",
+        "user_states",
+        "sessions",
+        "events",
+    }
+)
 
 
 def extract_tenant_domain(user_id_or_email: Optional[str]) -> str:
@@ -590,6 +603,60 @@ def build_async_engine_kwargs(raw_url: str) -> Dict[str, Any]:
     }
 
 
+def verify_alembic_schema_on_engine(
+    engine: Engine,
+    *,
+    expected_revision: str = EXPECTED_ALEMBIC_REVISION,
+) -> str:
+    """Read-only verification that Alembic has applied ``expected_revision`` and all required tables exist."""
+    with engine.connect() as conn:
+        existing_tables = set(sa_inspect(conn).get_table_names())
+        if "alembic_version" not in existing_tables:
+            raise RuntimeError(
+                "Production schema verification failed: 'alembic_version' table is missing. "
+                "Database schema must be initialized exclusively via Alembic ('alembic upgrade head')."
+            )
+        revs = [
+            str(r[0])
+            for r in conn.execute(text("SELECT version_num FROM alembic_version")).fetchall()
+            if r and r[0] is not None
+        ]
+        if len(revs) != 1 or revs[0] != expected_revision:
+            raise RuntimeError(
+                f"Production schema verification failed: expected Alembic revision {expected_revision!r}, "
+                f"found {revs!r}. Run 'python scripts/run_db_migrations.py' before starting the application."
+            )
+
+        required_tables = set(PqcPersistenceBase.metadata.tables.keys()) | set(REQUIRED_ADK_V1_TABLES)
+        missing_tables = sorted(required_tables - existing_tables)
+        if missing_tables:
+            raise RuntimeError(
+                "Production schema verification failed: inconsistent database schema; "
+                f"missing required tables: {', '.join(missing_tables)}."
+            )
+
+        pqc_ver = conn.execute(
+            text("SELECT value FROM pqc_schema_metadata WHERE key = :k"),
+            {"k": "schema_version"},
+        ).scalar_one_or_none()
+        if pqc_ver != expected_revision:
+            raise RuntimeError(
+                f"Production schema verification failed: pqc_schema_metadata 'schema_version' is {pqc_ver!r} "
+                f"(expected {expected_revision!r})."
+            )
+
+        adk_ver = conn.execute(
+            text("SELECT value FROM adk_internal_metadata WHERE key = :k"),
+            {"k": "schema_version"},
+        ).scalar_one_or_none()
+        if str(adk_ver or "") != "1":
+            raise RuntimeError(
+                f"Production schema verification failed: adk_internal_metadata 'schema_version' is {adk_ver!r} "
+                "(expected '1')."
+            )
+    return expected_revision
+
+
 class DistributedAuthStore:
     """Transactional database store for auth, sessions, user/session metadata, connections, calibration & credentials."""
 
@@ -598,10 +665,18 @@ class DistributedAuthStore:
         db_url: str,
         *,
         engine: Optional[Engine] = None,
-        create_schema: bool = True,
+        create_schema: Optional[bool] = None,
         verify_connectivity: Optional[bool] = None,
+        verify_schema: Optional[bool] = None,
     ) -> None:
         validate_production_postgres_only(db_url)
+        in_prod = auth_guard.is_production_environment()
+        if in_prod and create_schema is True:
+            raise RuntimeError(
+                "Production schema failure: SQLAlchemy metadata.create_all() is prohibited in production; "
+                "schema creation and upgrades are controlled exclusively by Alembic."
+            )
+
         self.db_url = normalize_sync_db_url(db_url)
         self.backend = make_url(self.db_url).get_backend_name()
         self._owns_engine = engine is None
@@ -609,7 +684,7 @@ class DistributedAuthStore:
         self._session_factory = sessionmaker(bind=self.engine, expire_on_commit=False, future=True)
 
         must_ping = (
-            (auth_guard.is_production_environment() or self.backend == "postgresql")
+            (in_prod or self.backend == "postgresql")
             if verify_connectivity is None
             else bool(verify_connectivity)
         )
@@ -623,10 +698,36 @@ class DistributedAuthStore:
                     f"Database connectivity verification failed for '{redact_db_url(self.db_url)}': {exc}"
                 ) from exc
 
-        if create_schema:
-            self.ensure_schema()
+        try:
+            if in_prod:
+                self.verify_production_schema()
+            else:
+                dev_auto = os.getenv("PQC_DEV_AUTO_CREATE_SCHEMA", "true").strip().lower() not in (
+                    "0",
+                    "false",
+                    "no",
+                )
+                should_create = dev_auto if create_schema is None else bool(create_schema)
+                if should_create:
+                    self.ensure_schema()
+                elif verify_schema:
+                    self.verify_production_schema()
+        except Exception:
+            if self._owns_engine:
+                self.engine.dispose()
+            raise
+
+    def verify_production_schema(self, *, expected_revision: str = EXPECTED_ALEMBIC_REVISION) -> str:
+        """Validates that the database schema matches ``expected_revision`` without creating or altering tables."""
+        return verify_alembic_schema_on_engine(self.engine, expected_revision=expected_revision)
 
     def ensure_schema(self) -> None:
+        """Convenience schema initializer strictly restricted to non-production local development and unit tests."""
+        if auth_guard.is_production_environment():
+            raise RuntimeError(
+                "Production schema failure: SQLAlchemy metadata.create_all() is prohibited in production; "
+                "schema creation and upgrades are controlled exclusively by Alembic."
+            )
         PqcPersistenceBase.metadata.create_all(self.engine)
         now_iso = _utc_now_iso()
         with self._session_factory.begin() as db:
@@ -666,11 +767,14 @@ class DistributedAuthStore:
         target_scope: Optional[str] = None,
         region: str = "",
         timezone: str = "",
-        ttl_seconds: int = 600,
+        ttl_seconds: int = MAX_OAUTH_TRANSACTION_TTL_SECONDS,
     ) -> OAuthTransactionData:
         """Creates an opaque ``state`` and stores the PKCE ``code_verifier`` and OIDC ``nonce`` server-side only."""
         now = time.time()
-        effective_ttl = max(1, min(int(ttl_seconds), 1800))
+        effective_ttl = max(
+            MIN_OAUTH_TRANSACTION_TTL_SECONDS,
+            min(int(ttl_seconds), MAX_OAUTH_TRANSACTION_TTL_SECONDS),
+        )
         state_id = secrets.token_urlsafe(32)
         code_verifier = secrets.token_urlsafe(64)
         oidc_nonce = secrets.token_urlsafe(32)
@@ -749,6 +853,7 @@ class DistributedAuthStore:
 
         binding_hash = sha256_hex(clean_binding)
         now = float(now_override if now_override is not None else time.time())
+        min_valid_created_at = now - float(MAX_OAUTH_TRANSACTION_TTL_SECONDS)
 
         with self._session_factory.begin() as db:
             stmt = (
@@ -757,6 +862,7 @@ class DistributedAuthStore:
                     OAuthTransactionRecord.state_id == clean_state,
                     OAuthTransactionRecord.consumed_at.is_(None),
                     OAuthTransactionRecord.expires_at > now,
+                    OAuthTransactionRecord.created_at > min_valid_created_at,
                     OAuthTransactionRecord.browser_binding_hash == binding_hash,
                     OAuthTransactionRecord.redirect_uri == expected_redirect_uri,
                 )

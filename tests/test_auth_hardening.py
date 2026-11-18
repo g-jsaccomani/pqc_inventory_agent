@@ -90,9 +90,12 @@ def _allow_unit_test_db_when_no_live_pg(monkeypatch):
 
 
 def _app(tmp_path):
+    from pqc_agent.migration_tool import run_alembic_upgrade_head
     from pqc_agent.workspace_server import create_workspace_app
 
     db_url = os.getenv("PQC_TEST_POSTGRES_URL") or f"sqlite:///{tmp_path / 'sessions.db'}"
+    if os.getenv("K_SERVICE"):
+        run_alembic_upgrade_head(db_url)
     bucket = "gs://test-unit-bucket" if os.getenv("K_SERVICE") else None
     return create_workspace_app(
         session_db_url=db_url,
@@ -1083,6 +1086,9 @@ def test_phase1_csrf_protection_session_fixation_rotation_and_logout_revocation(
 def test_phase1_production_fail_closed_hmac_secret_rotation_and_iap_audience_enforcement(tmp_path, monkeypatch):
     from pqc_agent import auth_guard
     from pqc_agent import workspace_server as ws
+    from pqc_agent.migration_tool import run_alembic_upgrade_head
+
+    run_alembic_upgrade_head(os.environ["SESSION_DB_URL"])
 
     # 1. Production fails closed when PQC_AUTH_SECRET is missing or too short (< 32 chars)
     monkeypatch.setenv("K_SERVICE", "pqc-inventory-agent")

@@ -172,6 +172,35 @@ if [[ "${PQC_ENABLE_CLOUD_IAP:-true}" == "false" ]]; then
   IAP_FLAGS=("--allow-unauthenticated" "--no-iap")
 fi
 
+MIGRATION_JOB_NAME="${SERVICE_NAME}-db-migrate"
+
+echo "=================================================================="
+echo "🗄️  Running Explicit Single-Task Alembic Schema Migration (${MIGRATION_JOB_NAME})"
+echo "   Target Cloud SQL : ${CLOUD_SQL_INSTANCE} (DB=${DB_NAME}, user=${DB_USER})"
+echo "   Concurrency      : tasks=1, max-retries=0 (PostgreSQL advisory lock enforced)"
+echo "=================================================================="
+
+gcloud beta run jobs deploy "${MIGRATION_JOB_NAME}" \
+  --source . \
+  --account="${ARGOLIS_ACCOUNT}" \
+  --project="${PROJECT_ID}" \
+  --region="${LOCATION}" \
+  --execution-environment=gen2 \
+  --tasks=1 \
+  --max-retries=0 \
+  --task-timeout=300s \
+  --set-cloudsql-instances="${CLOUD_SQL_INSTANCE}" \
+  --set-secrets="${SECRET_MAPPINGS}" \
+  --set-env-vars="PQC_PRODUCTION_MODE=true,PQC_CLOUD_SQL_CONNECTION_NAME=${CLOUD_SQL_INSTANCE},PQC_DB_NAME=${DB_NAME},PQC_DB_USER=${DB_USER}" \
+  --command="python" \
+  --args="scripts/run_db_migrations.py,--require-postgres"
+
+gcloud beta run jobs execute "${MIGRATION_JOB_NAME}" \
+  --account="${ARGOLIS_ACCOUNT}" \
+  --project="${PROJECT_ID}" \
+  --region="${LOCATION}" \
+  --wait
+
 echo "=================================================================="
 echo "🚀 Deploying ${SERVICE_NAME} to Cloud Run (${LOCATION})"
 echo "   Project       : ${PROJECT_ID}"

@@ -165,31 +165,70 @@ def _collect_source_checksums(sqlite_path: Optional[str], data_dir: Optional[str
     return checksums
 
 
-def run_alembic_upgrade_head(target_db_url: str) -> None:
-    """Applies Alembic migrations up to ``head`` against ``target_db_url`` (idempotent on pre-initialized schemas)."""
+ALEMBIC_MIGRATION_ADVISORY_LOCK_ID = 7081632026
+
+
+def run_alembic_upgrade_head(
+    target_db_url: str,
+    *,
+    require_postgres: bool = False,
+) -> str:
+    """Explicitly executes ``alembic upgrade head`` and verifies the resulting schema revision.
+
+    - Never invokes ``metadata.create_all()``.
+    - Acquires a PostgreSQL session advisory lock when targeting PostgreSQL so concurrent migration runs fail fast.
+    - Verifies ``EXPECTED_ALEMBIC_REVISION`` and all required PQC + ADK v1 tables after migration completes.
+    """
+    sync_url = auth_store.normalize_sync_db_url(target_db_url)
+    auth_store.validate_production_postgres_only(sync_url)
+    backend = auth_store.make_url(sync_url).get_backend_name()
+    if require_postgres and backend != "postgresql":
+        raise RuntimeError(
+            f"Explicit PostgreSQL target is required for schema migration; rejected backend '{backend}'."
+        )
+
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     ini_path = os.path.join(repo_root, "alembic.ini")
-    sync_url = auth_store.normalize_sync_db_url(target_db_url)
     cfg = AlembicConfig(ini_path if os.path.isfile(ini_path) else None)
     cfg.set_main_option("script_location", os.path.join(repo_root, "migrations"))
     cfg.set_main_option("sqlalchemy.url", sync_url)
 
-    engine = auth_store.build_sync_sqlalchemy_engine(sync_url)
+    lock_engine = auth_store.build_sync_sqlalchemy_engine(sync_url) if backend == "postgresql" else None
+    lock_conn = None
     try:
-        with engine.connect() as conn:
-            existing_tables = set(sa_inspect(conn).get_table_names())
-            has_alembic_rev = False
-            if "alembic_version" in existing_tables:
-                rev = conn.execute(text("SELECT version_num FROM alembic_version LIMIT 1")).scalar_one_or_none()
-                has_alembic_rev = bool(rev)
-    finally:
-        engine.dispose()
-
-    required_tables = set(auth_store.PqcPersistenceBase.metadata.tables.keys())
-    if not has_alembic_rev and required_tables.issubset(existing_tables):
-        alembic_command.stamp(cfg, "head")
-    else:
+        if lock_engine is not None:
+            lock_conn = lock_engine.connect()
+            acquired = bool(
+                lock_conn.execute(
+                    text("SELECT pg_try_advisory_lock(:lock_id)"),
+                    {"lock_id": ALEMBIC_MIGRATION_ADVISORY_LOCK_ID},
+                ).scalar()
+            )
+            if not acquired:
+                raise RuntimeError(
+                    "Concurrent Alembic migration detected (PostgreSQL advisory lock is already held). "
+                    "Run database migrations from a single migration job only."
+                )
         alembic_command.upgrade(cfg, "head")
+    finally:
+        if lock_conn is not None:
+            try:
+                lock_conn.execute(
+                    text("SELECT pg_advisory_unlock(:lock_id)"),
+                    {"lock_id": ALEMBIC_MIGRATION_ADVISORY_LOCK_ID},
+                )
+            except Exception:
+                pass
+            lock_conn.close()
+        if lock_engine is not None:
+            lock_engine.dispose()
+
+    verify_engine = auth_store.build_sync_sqlalchemy_engine(sync_url)
+    try:
+        verified_rev = auth_store.verify_alembic_schema_on_engine(verify_engine)
+    finally:
+        verify_engine.dispose()
+    return verified_rev
 
 
 def _load_json_file_safe(path: str, anomalies: List[Dict[str, Any]]) -> Any:
@@ -297,12 +336,15 @@ def migrate_legacy_persistence(
         if target_sqlite_file == abs_src_sqlite:
             raise ValueError("Target database URL must not point to the same file as source_sqlite_path.")
 
-    # Initialize schema on target (unless dry_run against an empty non-existent DB? Even in dry_run on a disposable DB
-    # we can create schema if not present, or run inside a rolled-back transaction).
-    if not dry_run:
-        run_alembic_upgrade_head(sync_target_url)
+    # Initialize schema exclusively via Alembic (never metadata.create_all).
+    run_alembic_upgrade_head(sync_target_url, require_postgres=auth_guard.is_production_environment())
 
-    store = auth_store.DistributedAuthStore(sync_target_url, create_schema=True, verify_connectivity=True)
+    store = auth_store.DistributedAuthStore(
+        sync_target_url,
+        create_schema=False,
+        verify_connectivity=True,
+        verify_schema=True,
+    )
     cred_svc = credential_service.EncryptedDatabaseCredentialService(store=store)
 
     counts: Dict[str, EntityCountSummary] = {
@@ -764,14 +806,11 @@ def migrate_legacy_persistence(
         counts["adk_sessions"].valid_unique_source = len(sqlite_adk_sessions)
         counts["adk_events"].valid_unique_source = len(sqlite_adk_events)
 
-        # Ensure ADK v1 tables exist on target if migrating ADK rows
+        # ADK v1 tables are created by Alembic revision 20261117_0002 via run_alembic_upgrade_head above.
         has_adk_source = bool(
             sqlite_adk_app_states or sqlite_adk_user_states or sqlite_adk_sessions or sqlite_adk_events
         )
         from google.adk.sessions.schemas import v1 as adk_schema_v1
-
-        if has_adk_source:
-            adk_schema_v1.Base.metadata.create_all(store.engine)
 
         # ------------------------------------------------------------------
         # Step 3: Execute Transactional Upserts (Committed or Rolled Back on dry_run)

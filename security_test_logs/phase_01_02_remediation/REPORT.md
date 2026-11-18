@@ -148,4 +148,33 @@ Per Section 1, Section 4, and Section 8 of `PHASE1.md`, blocked infrastructure t
 2. **Google Secret Manager Secrets:** Create `pqc-session-secret` (`>= 32` random bytes -> `PQC_AUTH_SECRET`), `pqc-db-password` (`-> PQC_DB_PASSWORD`), and `pqc-oauth-client-secret` (`-> PQC_GOOGLE_OAUTH_CLIENT_SECRET`), granting secret-scoped `roles/secretmanager.secretAccessor` to the runtime SA.
 3. **Google Cloud KMS Symmetric CryptoKey (`PQC_KMS_KEY_NAME`):** Create dedicated HSM-backed key `projects/<PROJECT>/locations/<REGION>/keyRings/pqc-portal-kr/cryptoKeys/pqc-cred-kek` with 90-day rotation and grant key-scoped `roles/cloudkms.cryptoKeyEncrypterDecrypter` ONLY on this key to the runtime SA.
 4. **Cloud IAP Audience (`PQC_IAP_AUDIENCE`):** Set exact `/projects/<NUMBER>/locations/<REGION>/services/<SERVICE>` string on Cloud Run.
-5. **Schema & Data Migration:** Follow [`docs/security-remediation/MIGRATION_AND_ROLLBACK.md`](../../docs/security-remediation/MIGRATION_AND_ROLLBACK.md) (`alembic upgrade head` + `--dry-run` + idempotent `scripts/migrate_sqlite_to_postgres.py`).
+5. **Schema & Data Migration:** Follow [`docs/security-remediation/MIGRATION_AND_ROLLBACK.md`](../../docs/security-remediation/MIGRATION_AND_ROLLBACK.md) (`python scripts/run_db_migrations.py --require-postgres` + `--dry-run` + idempotent `scripts/migrate_sqlite_to_postgres.py`).
+
+---
+
+## 7. Phase 1–2 Final Corrective Pass (`AUTH-02` & `DB-01` Acceptance Gap Closure)
+
+### 7.1 Original Findings & Root Causes
+1. **`AUTH-02` (OAuth Transaction TTL Upper Bound Exceeded 600s):**
+   - **Original Finding:** `DistributedAuthStore.create_oauth_transaction()` allowed `ttl_seconds` up to `1800` seconds.
+   - **Root Cause:** `effective_ttl = max(1, min(int(ttl_seconds), 1800))` in `pqc_agent/auth_store.py` and `_oauth_ttl_seconds()` in `pqc_agent/workspace_server.py` clamped the upper bound at `1800` instead of `600`.
+2. **`DB-01` (Production Database Schema Authority):**
+   - **Original Finding:** Production startup invoked SQLAlchemy `PqcPersistenceBase.metadata.create_all(self.engine)` (and ADK `DatabaseSessionService.prepare_tables()` invoked `BaseV1.metadata.create_all()`), creating tables outside Alembic's versioned migration history.
+   - **Root Cause:** `DistributedAuthStore.__init__()` defaulted `create_schema=True` unconditionally across all environments and lacked a read-only startup check enforcing the expected Alembic revision.
+
+### 7.2 Corrective Implementation & Modified Files
+- **`pqc_agent/auth_store.py`:** Set `MIN_OAUTH_TRANSACTION_TTL_SECONDS = 1` and `MAX_OAUTH_TRANSACTION_TTL_SECONDS = 600` in `create_oauth_transaction()`, enforced `OAuthTransactionRecord.created_at > (now - 600.0)` in `consume_oauth_transaction()`, prohibited `metadata.create_all()` / `create_schema=True` / `ensure_schema()` in production, and added read-only `verify_alembic_schema_on_engine()` / `verify_production_schema()` enforcing `EXPECTED_ALEMBIC_REVISION = "20261117_0002"` across all 10 `pqc_*` tables and 5 ADK `v1` tables.
+- **`pqc_agent/workspace_server.py`:** Clamped `_oauth_ttl_seconds()` and `_set_oauth_nonce_cookie()` `Max-Age` strictly to `[1, 600]`; added `ManagedSchemaDatabaseSessionService(DatabaseSessionService)` so production ADK session operations verify schema read-only and never call `BaseV1.metadata.create_all()`.
+- **`migrations/versions/20261117_0002_add_adk_v1_session_schema.py`:** Added Alembic revision `20261117_0002` (revising `20261117_0001`) bringing ADK `v1` tables (`adk_internal_metadata`, `sessions`, `events`, `app_states`, `user_states`) under Alembic authority.
+- **`scripts/run_db_migrations.py`, `pqc_agent/migration_tool.py`, `scripts/deploy_cloud_run.sh`:** Added dedicated explicit migration entry point with PostgreSQL session advisory locking (`pg_try_advisory_lock(7081632026)`), post-upgrade revision verification, `--require-postgres` / `--verify-only` modes, and serialized single-task Cloud Run Job execution (`--tasks=1 --max-retries=0`) prior to service deployment; removed `adk_schema_v1.Base.metadata.create_all()` from `migration_tool.py`.
+- **Tests Modified:** `tests/test_auth_hardening.py`, `tests/test_phase1_distributed_auth.py`, `tests/test_phase2_persistence_and_credentials.py`.
+
+### 7.3 Regression Tests Added & Actual Execution Results
+- **`tests/test_phase1_distributed_auth.py::test_auth02_strict_600s_oauth_ttl_bounds_and_concurrent_single_use` (`PASS`):** Verifies default TTL (`600s`), `TTL=1`, `TTL=600`, `TTL=601` (clamped to `600s`), `TTL=1800` (clamped to `600s` in store, env var, cookie `Max-Age=600`, and tampered DB row defense), `TTL=0` (`1s`), negative TTL (`1s`), expired callback rejection (`HTTP 400`), zero `code_verifier` leakage, and concurrent callback single-use (`1 x 200`, `5 x 400`).
+- **`tests/test_phase2_persistence_and_credentials.py::test_phase2_alembic_sole_production_schema_authority_and_migration_cli` (`PASS`):** Verifies fail-closed startup on missing schema (`0` tables created), fail-closed startup on outdated revision (`20261117_0001`) or missing table, spy assertion proving `0` calls to `PqcPersistenceBase.metadata.create_all` and `ADK BaseV1.metadata.create_all` in production, explicit `scripts/run_db_migrations.py` upgrade + idempotent re-run, `--require-postgres` SQLite rejection, and local-dev convenience preservation.
+- **`tests/test_phase2_persistence_and_credentials.py::test_phase2_live_postgresql_multi_instance_integration` (`BLOCKED`):** Expanded to verify PostgreSQL server version (`SELECT version()`), explicit Alembic migration, 11-step multi-instance workflow + restart, 8-way concurrent callback race, transactional rollback, KMS credential lifecycle, and cross-tenant isolation when `PQC_TEST_POSTGRES_URL` is supplied.
+- **Full Suite Execution:** `.venv/bin/python -m compileall -q pqc_agent tools scripts migrations tests` (exit `0`), `.venv/bin/pytest -v -rs` -> **`75 passed, 0 failed, 2 skipped in 22.18s`** (exit `0`), `git diff --check` (exit `0`).
+
+### 7.4 Remaining Blockers & Final Acceptance Status
+- **Remaining Blocker:** `test_phase2_live_postgresql_multi_instance_integration` remains **`BLOCKED`** on this workstation (`PQC_TEST_POSTGRES_URL` unavailable; corporate macOS lacks `postgres`/`docker`/`podman` and Google Santa blocks unsigned `initdb` binaries with `SIGKILL 9`).
+- **Final Acceptance Status:** Code & local regression controls: **`PASS`** | Live PostgreSQL 16 integration & production deployment readiness: **`BLOCKED` (`NO-GO` for production until `PQC_TEST_POSTGRES_URL` passes in CI/staging)**.

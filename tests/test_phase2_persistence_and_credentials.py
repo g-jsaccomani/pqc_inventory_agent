@@ -731,6 +731,11 @@ def test_phase2_production_postgres_fail_closed_url_normalization_and_alembic_dd
         "CREATE TABLE pqc_oauth_client_configs",
         "CREATE TABLE pqc_calibration_events",
         "CREATE TABLE pqc_delegated_credentials",
+        "CREATE TABLE adk_internal_metadata",
+        "CREATE TABLE sessions",
+        "CREATE TABLE events",
+        "CREATE TABLE app_states",
+        "CREATE TABLE user_states",
         "FOREIGN KEY(user_id) REFERENCES pqc_tenant_users (user_id) ON DELETE CASCADE",
     ):
         assert expected_table in ddl, expected_table
@@ -744,6 +749,162 @@ def test_phase2_production_postgres_fail_closed_url_normalization_and_alembic_dd
             text=True,
             check=True,
         )
+
+
+def test_phase2_alembic_sole_production_schema_authority_and_migration_cli(tmp_path, monkeypatch):
+    """Explicit regression suite for Step 3 (DB-01: Alembic as sole production schema authority):
+    1. Production startup with missing schema fails closed without creating tables.
+    2. Production startup with outdated Alembic revision (20261117_0001) or missing table fails closed.
+    3. Production startup and ADK session operations NEVER invoke metadata.create_all().
+    4. Explicit migration CLI (scripts/run_db_migrations.py) creates expected revision (20261117_0002).
+    5. Re-running migration CLI is safe and idempotent.
+    6. SQLite production configuration remains rejected by both startup and --require-postgres migration CLI.
+    7. Local development convenience initialization continues working when production flags are unset.
+    """
+    import asyncio
+    from google.adk.sessions.schemas import v1 as adk_schema_v1
+    from scripts import run_db_migrations
+
+    alembic_bin = str(REPO_ROOT / ".venv" / "bin" / "alembic")
+
+    # 6. SQLite remains rejected in production (before testing schema checks with mock validate_production_postgres_only)
+    sqlite_prod_reject = f"sqlite:///{tmp_path / 'rejected_prod.db'}"
+    assert run_db_migrations.main(["--db-url", sqlite_prod_reject, "--require-postgres"]) == 2
+    monkeypatch.setenv("PQC_PRODUCTION_MODE", "true")
+    monkeypatch.setenv("PQC_AUTH_SECRET", "prod-alembic-test-secret-with-at-least-36-bytes!!")
+    monkeypatch.setenv("PQC_KMS_KEY_NAME", "projects/p/locations/us-central1/keyRings/kr/cryptoKeys/kek")
+    with pytest.raises(RuntimeError, match="database backend 'sqlite' is prohibited in production"):
+        ws.create_workspace_app(
+            session_db_url=sqlite_prod_reject,
+            artifact_bucket="gs://test-bucket",
+            model_registry=_make_registry(),
+            verify_models_on_startup=False,
+            kms_client=_DeterministicCloudKmsStub(),
+        )
+
+    # Allow disposable local SQLAlchemy engine ONLY to exercise production schema-authority logic offline
+    monkeypatch.setattr(auth_store, "validate_production_postgres_only", lambda _url: None)
+    monkeypatch.setattr(
+        ws.ResilientGcsArtifactService,
+        "__init__",
+        lambda self, bucket_name, **kw: (
+            setattr(self, "_local_fallback_store", {})
+            or setattr(self, "_gcs_online", False)
+            or setattr(self, "bucket_name", bucket_name)
+        ),
+    )
+
+    # Spy on BOTH PqcPersistenceBase.metadata.create_all AND ADK BaseV1.metadata.create_all!
+    create_all_calls: List[str] = []
+
+    def _forbid_pqc_create_all(*args, **kwargs):
+        create_all_calls.append("pqc_create_all")
+        raise AssertionError("PqcPersistenceBase.metadata.create_all() must NEVER be called in production!")
+
+    def _forbid_adk_create_all(*args, **kwargs):
+        create_all_calls.append("adk_create_all")
+        raise AssertionError("ADK BaseV1.metadata.create_all() must NEVER be called in production!")
+
+    monkeypatch.setattr(auth_store.PqcPersistenceBase.metadata, "create_all", _forbid_pqc_create_all)
+    monkeypatch.setattr(adk_schema_v1.Base.metadata, "create_all", _forbid_adk_create_all)
+
+    # 1. Production startup with missing schema fails closed and creates ZERO tables
+    empty_db_path = tmp_path / "empty_unmigrated.db"
+    empty_db_url = f"sqlite:///{empty_db_path}"
+    with pytest.raises(RuntimeError, match="alembic_version"):
+        auth_store.DistributedAuthStore(empty_db_url)
+    with pytest.raises(RuntimeError, match="alembic_version"):
+        ws.create_workspace_app(
+            session_db_url=empty_db_url,
+            artifact_bucket="gs://test-bucket",
+            model_registry=_make_registry(),
+            verify_models_on_startup=False,
+            kms_client=_DeterministicCloudKmsStub(),
+        )
+    with pytest.raises(RuntimeError, match="prohibited in production"):
+        auth_store.DistributedAuthStore(empty_db_url, create_schema=True)
+
+    check_eng = auth_store.build_sync_sqlalchemy_engine(empty_db_url)
+    try:
+        with check_eng.connect() as conn:
+            assert auth_store.sa_inspect(conn).get_table_names() == []
+    finally:
+        check_eng.dispose()
+    assert create_all_calls == []
+
+    # 2. Production startup with outdated Alembic revision (20261117_0001 instead of 20261117_0002) fails closed
+    outdated_db_url = f"sqlite:///{tmp_path / 'outdated_rev.db'}"
+    subprocess.run(
+        [alembic_bin, "-x", f"db_url={outdated_db_url}", "upgrade", "20261117_0001"],
+        cwd=str(REPO_ROOT),
+        env={k: v for k, v in os.environ.items() if k != "PQC_PRODUCTION_MODE"},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    with pytest.raises(RuntimeError, match="expected Alembic revision '20261117_0002'"):
+        auth_store.DistributedAuthStore(outdated_db_url)
+    with pytest.raises(RuntimeError, match="expected Alembic revision '20261117_0002'"):
+        ws.create_workspace_app(
+            session_db_url=outdated_db_url,
+            artifact_bucket="gs://test-bucket",
+            model_registry=_make_registry(),
+            verify_models_on_startup=False,
+            kms_client=_DeterministicCloudKmsStub(),
+        )
+    assert create_all_calls == []
+
+    # 4 & 5. Explicit Alembic migration creates expected schema (20261117_0002) and re-running is safe & idempotent
+    monkeypatch.delenv("PQC_PRODUCTION_MODE", raising=False)
+    migrated_db_url = f"sqlite:///{tmp_path / 'explicit_migrated.db'}"
+    assert run_db_migrations.main(["--db-url", migrated_db_url]) == 0
+    assert run_db_migrations.main(["--db-url", migrated_db_url]) == 0
+    assert run_db_migrations.main(["--db-url", migrated_db_url, "--verify-only"]) == 0
+    assert create_all_calls == []
+
+    # 3. Booting production app + running ADK session creation after explicit migration succeeds with ZERO create_all calls!
+    monkeypatch.setenv("PQC_PRODUCTION_MODE", "true")
+    prod_app = ws.create_workspace_app(
+        session_db_url=migrated_db_url,
+        artifact_bucket="gs://test-bucket",
+        model_registry=_make_registry(),
+        verify_models_on_startup=False,
+        kms_client=_DeterministicCloudKmsStub(),
+    )
+    with pytest.raises(RuntimeError, match="prohibited in production"):
+        prod_app.state.auth_store.ensure_schema()
+
+    created_adk_sess = asyncio.run(
+        prod_app.state.session_service.create_session(
+            app_name=ws.APP_NAME,
+            user_id=ALICE,
+            state={"title": "Alembic Managed Session"},
+        )
+    )
+    assert created_adk_sess.id
+    assert create_all_calls == []
+    prod_app.state.auth_store.close()
+
+    # Inconsistent schema (missing required table despite head revision) fails closed
+    drop_eng = auth_store.build_sync_sqlalchemy_engine(migrated_db_url)
+    try:
+        with drop_eng.begin() as conn:
+            conn.execute(text("DROP TABLE pqc_calibration_events"))
+    finally:
+        drop_eng.dispose()
+    with pytest.raises(RuntimeError, match="missing required tables: pqc_calibration_events"):
+        auth_store.DistributedAuthStore(migrated_db_url)
+
+    # 7. Local development convenience initialization continues working when production flags are unset
+    monkeypatch.undo()
+    monkeypatch.setenv("PQC_AUTH_SECRET", "dev-alembic-test-secret-with-at-least-36-bytes!!")
+    dev_db_url = f"sqlite:///{tmp_path / 'local_dev_convenience.db'}"
+    dev_app = _create_independent_instance(dev_db_url, tmp_path / "dev_exports")
+    with TestClient(dev_app) as dev_client:
+        h = dev_client.get("/api/health")
+        assert h.status_code == 200
+        assert h.json()["database_healthy"] is True
+    dev_app.state.auth_store.close()
 
 
 def test_phase2_safe_idempotent_data_migration_and_conflict_detection(tmp_path, monkeypatch):
@@ -1000,14 +1161,90 @@ def test_phase2_safe_idempotent_data_migration_and_conflict_detection(tmp_path, 
 @pytest.mark.skipif(
     not os.getenv("PQC_TEST_POSTGRES_URL"),
     reason=(
-        "BLOCKED: Live PostgreSQL daemon (PQC_TEST_POSTGRES_URL) is not available on this workstation "
-        "(corporate macOS Santa blocks unsigned local postgres/initdb binaries, and Docker/Cloud SQL are absent)."
+        "BLOCKED: Live PostgreSQL 16 server (PQC_TEST_POSTGRES_URL) is not available on this workstation "
+        "(corporate macOS lacks postgres/initdb/docker/podman, and Google Santa blocks unsigned embedded initdb binaries with SIGKILL 9)."
     ),
 )
 def test_phase2_live_postgresql_multi_instance_integration(tmp_path, monkeypatch):
-    """Executes the full 11-step multi-instance workflow + Alembic migrations against a live PostgreSQL instance."""
-    pg_url = os.environ["PQC_TEST_POSTGRES_URL"]
-    from pqc_agent.migration_tool import run_alembic_upgrade_head
+    """Step 4 PostgreSQL 16 Integration Validation across two independent application instances against a real PostgreSQL DB."""
+    from scripts import run_db_migrations
 
-    run_alembic_upgrade_head(pg_url)
+    pg_url = os.environ["PQC_TEST_POSTGRES_URL"]
+    assert run_db_migrations.main(["--db-url", pg_url, "--require-postgres"]) == 0
+
+    pg_engine = auth_store.build_sync_sqlalchemy_engine(auth_store.normalize_sync_db_url(pg_url))
+    try:
+        with pg_engine.connect() as conn:
+            pg_version = str(conn.execute(text("SELECT version()")).scalar() or "")
+            assert "PostgreSQL" in pg_version
+    finally:
+        pg_engine.dispose()
+
+    # 1. Multi-instance 11-step workflow (OAuth tx A->B, session CRUD across A/B, revocation across A/B, full restart)
     _run_11_step_multi_instance_workflow(pg_url, tmp_path, monkeypatch)
+
+    # 2. Concurrent OAuth callback consumption across independent PostgreSQL-backed instances
+    store_a = auth_store.DistributedAuthStore(pg_url, create_schema=False, verify_schema=True)
+    store_b = auth_store.DistributedAuthStore(pg_url, create_schema=False, verify_schema=True)
+    try:
+        cb_uri = "https://portal.example.test/api/auth/oauth/callback"
+        race_tx = store_a.create_oauth_transaction(flow_mode="signin", redirect_uri=cb_uri, ttl_seconds=600)
+        assert (race_tx.expires_at - race_tx.created_at) <= 600.0
+
+        def _consume_pg(idx: int) -> bool:
+            target = store_a if idx % 2 == 0 else store_b
+            res = target.consume_oauth_transaction(
+                state_id=race_tx.state_id,
+                browser_binding_token=race_tx.browser_binding_token,
+                expected_redirect_uri=cb_uri,
+            )
+            return res is not None
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            winners = list(pool.map(_consume_pg, range(8)))
+        assert winners.count(True) == 1
+        assert winners.count(False) == 7
+
+        # 3. Transactional rollback on PostgreSQL
+        rb_uid = f"pg-rollback-{int(time.time())}@google.com"
+        with pytest.raises(RuntimeError, match="abort-pg-tx"):
+            with store_a._session_factory.begin() as db:
+                db.add(
+                    auth_store.TenantUserRecord(
+                        user_id=rb_uid,
+                        email=rb_uid,
+                        tenant_domain="google.com",
+                        name="Rolled Back PG User",
+                        region="NorthAm",
+                        timezone="UTC",
+                        auth_method="oauth",
+                        picture="",
+                        created_at="2026-11-17T00:00:00+00:00",
+                        last_login_at="2026-11-17T00:00:00+00:00",
+                    )
+                )
+                db.flush()
+                raise RuntimeError("abort-pg-tx")
+        assert store_b.get_tenant_user(rb_uid) is None
+
+        # 4. Credential envelope encryption, retrieval, expiration, revocation & cross-tenant AAD isolation on PostgreSQL
+        kms_mock = _DeterministicCloudKmsStub()
+        monkeypatch.setenv("PQC_KMS_KEY_NAME", "projects/p/locations/us-central1/keyRings/kr/cryptoKeys/pg-kek")
+        cred_a = credential_service.EncryptedDatabaseCredentialService(store=store_a, kms_client=kms_mock)
+        cred_b = credential_service.EncryptedDatabaseCredentialService(store=store_b, kms_client=kms_mock)
+        cred_a.save_delegated_token(user_id=ALICE, access_token="ya29.pg-live-secret-token", expires_in_seconds=300)
+        assert cred_b.load_delegated_token(user_id=ALICE) == "ya29.pg-live-secret-token"
+        with pytest.raises(PermissionError):
+            cred_b.load_delegated_token(user_id=BOB, requested_owner_id=ALICE)
+        with pytest.raises(PermissionError):
+            cred_b.load_delegated_token(user_id=EXT_TENANT_USER, requested_owner_id=ALICE)
+
+        cred_a.save_delegated_token(user_id=BOB, access_token="ya29.pg-expiring", expires_in_seconds=1)
+        time.sleep(1.15)
+        assert cred_b.load_delegated_token(user_id=BOB) is None
+
+        assert cred_a.revoke_user_credentials(ALICE) >= 1
+        assert cred_b.load_delegated_token(user_id=ALICE) is None
+    finally:
+        store_a.close()
+        store_b.close()

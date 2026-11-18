@@ -106,6 +106,46 @@ DEFAULT_STAGING_BUCKET = os.getenv(
 MAX_TELEMETRY_CALLS_RETURNED = 60
 
 
+class ManagedSchemaDatabaseSessionService(DatabaseSessionService):
+    """Subclass of ADK ``DatabaseSessionService`` that prohibits ``metadata.create_all()`` in production.
+
+    In production, Alembic is the sole schema authority: ``prepare_tables()`` performs a strictly read-only
+    check that the Alembic-managed ADK v1 tables and schema metadata exist, failing closed if missing or outdated.
+    In non-production local development and isolated unit tests, ADK's standard table setup remains available.
+    """
+
+    async def prepare_tables(self) -> None:
+        if not auth_guard.is_production_environment():
+            await super().prepare_tables()
+            return
+        if self._tables_created:
+            return
+        async with self._table_creation_lock:
+            if self._tables_created:
+                return
+            from google.adk.sessions.migration import _schema_check_utils
+
+            def _verify_adk_schema_readonly(sync_conn: Any) -> str:
+                existing = set(auth_store.sa_inspect(sync_conn).get_table_names())
+                missing = sorted(set(auth_store.REQUIRED_ADK_V1_TABLES) - existing)
+                if missing:
+                    raise RuntimeError(
+                        "Production ADK session schema verification failed: missing tables "
+                        f"{', '.join(missing)}. Run 'alembic upgrade head' before starting."
+                    )
+                ver = _schema_check_utils.get_db_schema_version_from_connection(sync_conn)
+                if ver != _schema_check_utils.LATEST_SCHEMA_VERSION:
+                    raise RuntimeError(
+                        f"Production ADK session schema verification failed: expected schema_version "
+                        f"{_schema_check_utils.LATEST_SCHEMA_VERSION!r}, found {ver!r}."
+                    )
+                return ver
+
+            async with self.db_engine.connect() as conn:
+                self._db_schema_version = await conn.run_sync(_verify_adk_schema_readonly)
+            self._tables_created = True
+
+
 class ResilientGcsArtifactService(GcsArtifactService):
     """Subclass of ADK's ``GcsArtifactService`` backed by Cloud Storage object storage in production,
     with isolated non-production memory fallback exclusively for offline local development and unit tests.
@@ -1546,7 +1586,7 @@ def create_workspace_app(
         kms_client=kms_client,
     )
     engine_kwargs = auth_store.build_async_engine_kwargs(resolved_db_url)
-    session_service = DatabaseSessionService(db_url=resolved_db_url, **engine_kwargs)
+    session_service = ManagedSchemaDatabaseSessionService(db_url=resolved_db_url, **engine_kwargs)
     artifact_service = ResilientGcsArtifactService(bucket_name=resolved_bucket)
     registry_obj = model_registry or ModelRegistry()
 
@@ -1808,7 +1848,7 @@ def create_workspace_app(
         resp.set_cookie(
             key=OAUTH_NONCE_COOKIE_NAME,
             value=binding_token,
-            max_age=OAUTH_STATE_TTL_SECONDS,
+            max_age=_oauth_ttl_seconds(),
             httponly=True,
             samesite="lax",
             secure=_is_https(request),
@@ -1849,7 +1889,13 @@ def create_workspace_app(
 
     def _oauth_ttl_seconds() -> int:
         try:
-            return max(1, min(int(os.getenv("PQC_OAUTH_STATE_TTL_SECONDS", str(OAUTH_STATE_TTL_SECONDS))), 1800))
+            return max(
+                auth_store.MIN_OAUTH_TRANSACTION_TTL_SECONDS,
+                min(
+                    int(os.getenv("PQC_OAUTH_STATE_TTL_SECONDS", str(OAUTH_STATE_TTL_SECONDS))),
+                    auth_store.MAX_OAUTH_TRANSACTION_TTL_SECONDS,
+                ),
+            )
         except ValueError:
             return OAUTH_STATE_TTL_SECONDS
 

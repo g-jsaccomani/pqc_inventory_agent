@@ -975,3 +975,203 @@ def test_auth05_unregistered_session_fail_closed_and_3lo_account_binding(
         mismatch_cb = client.get("/api/auth/oauth/callback", params={"code": "3lo-mismatch-code", "state": state_3lo})
         assert mismatch_cb.status_code == 403
         assert "USER_MISMATCH" in mismatch_cb.text
+
+
+def test_auth02_strict_600s_oauth_ttl_bounds_and_concurrent_single_use(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Explicit regression suite for AUTH-02 strict 600-second OAuth TTL bounds:
+    1. Default TTL (600s)
+    2. TTL = 1
+    3. TTL = 600
+    4. TTL = 601 (clamped to 600s)
+    5. TTL = 1800 (clamped to 600s in both store and PQC_OAUTH_STATE_TTL_SECONDS)
+    6. TTL = 0 (clamped to 1s; never zero)
+    7. Negative TTL (clamped to 1s; never negative)
+    8. Expired transaction rejection (at boundary and beyond 600s even if DB expires_at is tampered)
+    9. Concurrent callback single-use behavior + zero PKCE code_verifier exposure
+    """
+    db_path = tmp_path / "oauth_ttl_bounds.db"
+    cb_uri = "https://portal.example.test/api/auth/oauth/callback"
+    store = auth_store.DistributedAuthStore(f"sqlite:///{db_path}")
+
+    # 1. Default TTL -> exactly 600s
+    tx_default = store.create_oauth_transaction(flow_mode="signin", redirect_uri=cb_uri)
+    assert pytest.approx(tx_default.expires_at - tx_default.created_at, abs=1e-6) == 600.0
+    assert "." not in tx_default.state_id and tx_default.code_verifier not in tx_default.state_id
+
+    # 2. TTL = 1 -> exactly 1s (valid at +0.5s, expired at +1.0s)
+    tx_one = store.create_oauth_transaction(flow_mode="signin", redirect_uri=cb_uri, ttl_seconds=1)
+    assert pytest.approx(tx_one.expires_at - tx_one.created_at, abs=1e-6) == 1.0
+    assert (
+        store.consume_oauth_transaction(
+            state_id=tx_one.state_id,
+            browser_binding_token=tx_one.browser_binding_token,
+            expected_redirect_uri=cb_uri,
+            now_override=tx_one.created_at + 1.0,
+        )
+        is None
+    )
+    tx_one_ok = store.create_oauth_transaction(flow_mode="signin", redirect_uri=cb_uri, ttl_seconds=1)
+    assert (
+        store.consume_oauth_transaction(
+            state_id=tx_one_ok.state_id,
+            browser_binding_token=tx_one_ok.browser_binding_token,
+            expected_redirect_uri=cb_uri,
+            now_override=tx_one_ok.created_at + 0.5,
+        )
+        is not None
+    )
+
+    # 3. TTL = 600 -> exactly 600s (valid at +599.9s, expired at +600.0s)
+    tx_600 = store.create_oauth_transaction(flow_mode="signin", redirect_uri=cb_uri, ttl_seconds=600)
+    assert pytest.approx(tx_600.expires_at - tx_600.created_at, abs=1e-6) == 600.0
+    assert (
+        store.consume_oauth_transaction(
+            state_id=tx_600.state_id,
+            browser_binding_token=tx_600.browser_binding_token,
+            expected_redirect_uri=cb_uri,
+            now_override=tx_600.created_at + 600.0,
+        )
+        is None
+    )
+    tx_600_ok = store.create_oauth_transaction(flow_mode="signin", redirect_uri=cb_uri, ttl_seconds=600)
+    assert (
+        store.consume_oauth_transaction(
+            state_id=tx_600_ok.state_id,
+            browser_binding_token=tx_600_ok.browser_binding_token,
+            expected_redirect_uri=cb_uri,
+            now_override=tx_600_ok.created_at + 599.9,
+        )
+        is not None
+    )
+
+    # 4. TTL = 601 -> clamped to 600s; never valid at +600.1s
+    tx_601 = store.create_oauth_transaction(flow_mode="signin", redirect_uri=cb_uri, ttl_seconds=601)
+    assert pytest.approx(tx_601.expires_at - tx_601.created_at, abs=1e-6) == 600.0
+    assert (
+        store.consume_oauth_transaction(
+            state_id=tx_601.state_id,
+            browser_binding_token=tx_601.browser_binding_token,
+            expected_redirect_uri=cb_uri,
+            now_override=tx_601.created_at + 600.1,
+        )
+        is None
+    )
+
+    # 5. TTL = 1800 -> clamped to 600s; even if DB expires_at were tampered to +1800s, >600s is rejected!
+    tx_1800 = store.create_oauth_transaction(flow_mode="signin", redirect_uri=cb_uri, ttl_seconds=1800)
+    assert pytest.approx(tx_1800.expires_at - tx_1800.created_at, abs=1e-6) == 600.0
+    with store._session_factory.begin() as db:
+        row = db.get(auth_store.OAuthTransactionRecord, tx_1800.state_id)
+        assert row is not None
+        row.expires_at = row.created_at + 1800.0
+    assert (
+        store.consume_oauth_transaction(
+            state_id=tx_1800.state_id,
+            browser_binding_token=tx_1800.browser_binding_token,
+            expected_redirect_uri=cb_uri,
+            now_override=tx_1800.created_at + 600.1,
+        )
+        is None
+    )
+
+    # 6. TTL = 0 -> clamped to 1s (never zero or negative)
+    tx_zero = store.create_oauth_transaction(flow_mode="signin", redirect_uri=cb_uri, ttl_seconds=0)
+    assert (tx_zero.expires_at - tx_zero.created_at) == pytest.approx(1.0, abs=1e-6)
+    assert tx_zero.expires_at > tx_zero.created_at
+
+    # 7. Negative TTL -> clamped to 1s (never negative)
+    for neg_ttl in (-1, -60, -3600):
+        tx_neg = store.create_oauth_transaction(flow_mode="signin", redirect_uri=cb_uri, ttl_seconds=neg_ttl)
+        assert (tx_neg.expires_at - tx_neg.created_at) == pytest.approx(1.0, abs=1e-6)
+        assert tx_neg.expires_at > tx_neg.created_at
+    store.close()
+
+    # 8 & 9. HTTP-level PQC_OAUTH_STATE_TTL_SECONDS clamping (1800 -> 600, -10 -> 1), expired rejection,
+    # non-exposure of code_verifier, and concurrent callback single-use race!
+    monkeypatch.setenv("PQC_GOOGLE_OAUTH_CLIENT_ID", "ttl-bound-client.apps.googleusercontent.com")
+    monkeypatch.setenv("PQC_OAUTH_STATE_TTL_SECONDS", "1800")
+    priv_key, kid, cert_pem = _generate_ephemeral_oidc_signer()
+
+    class _CertResp:
+        status = 200
+        data = json.dumps({kid: cert_pem}).encode("utf-8")
+
+    monkeypatch.setattr(auth_guard, "_iap_transport", lambda: (lambda *a, **kw: _CertResp()))
+
+    app_a = _build_instance(tmp_path, db_path, monkeypatch, "ttl_a")
+    app_b = _build_instance(tmp_path, db_path, monkeypatch, "ttl_b")
+    with TestClient(app_a, base_url="https://portal.example.test") as client_a:
+        start_resp = client_a.get("/api/auth/oauth/signin", follow_redirects=False)
+        assert start_resp.status_code == 302
+        set_cookie_hdr = start_resp.headers.get("set-cookie", "")
+        assert "Max-Age=600" in set_cookie_hdr and "Max-Age=1800" not in set_cookie_hdr
+        binding_cookie = start_resp.cookies.get(ws.OAUTH_NONCE_COOKIE_NAME)
+        assert binding_cookie
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(start_resp.headers["location"]).query)
+        state_val = qs["state"][0]
+        nonce_val = qs["nonce"][0]
+
+        with app_a.state.auth_store._session_factory() as db:
+            tx_row = db.get(auth_store.OAuthTransactionRecord, state_val)
+            assert tx_row is not None
+            assert (tx_row.expires_at - tx_row.created_at) <= 600.0
+            # Verify PKCE code_verifier is never in state, redirect URL, or Set-Cookie
+            assert tx_row.code_verifier not in state_val
+            assert tx_row.code_verifier not in start_resp.headers["location"]
+            assert tx_row.code_verifier not in set_cookie_hdr
+
+        # Concurrent callback race -> exactly 1 succeeds (200), 5 fail (400)
+        now_ts = int(time.time())
+        valid_jwt = _mint_rs256_id_token(
+            priv_key,
+            kid,
+            {
+                "iss": "https://accounts.google.com",
+                "aud": "ttl-bound-client.apps.googleusercontent.com",
+                "sub": "sub-ttl-user",
+                "email": "ttl.user@google.com",
+                "email_verified": True,
+                "nonce": nonce_val,
+                "iat": now_ts - 5,
+                "exp": now_ts + 600,
+            },
+        )
+        monkeypatch.setattr(
+            ws,
+            "_exchange_oauth_code",
+            lambda code, cb: ({"access_token": "ya29.ttl", "id_token": valid_jwt, "expires_in": 3600}, None),
+        )
+
+    barrier = threading.Barrier(6)
+
+    def _race_cb(idx: int) -> int:
+        target = app_a if idx % 2 == 0 else app_b
+        with TestClient(target, base_url="https://portal.example.test") as tc:
+            tc.cookies.set(ws.OAUTH_NONCE_COOKIE_NAME, binding_cookie, path="/api/auth")
+            barrier.wait(timeout=10.0)
+            return tc.get("/api/auth/oauth/callback", params={"code": "ttl-race-code", "state": state_val}).status_code
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        outcomes = list(pool.map(_race_cb, range(6)))
+    assert outcomes.count(200) == 1
+    assert outcomes.count(400) == 5
+
+    # Expired callback over HTTP returns 400
+    monkeypatch.setenv("PQC_OAUTH_STATE_TTL_SECONDS", "-25")
+    with TestClient(app_a, base_url="https://portal.example.test") as client_exp:
+        exp_start = client_exp.get("/api/auth/oauth/signin", follow_redirects=False)
+        assert "Max-Age=1" in exp_start.headers.get("set-cookie", "")
+        exp_binding = exp_start.cookies.get(ws.OAUTH_NONCE_COOKIE_NAME)
+        exp_state = urllib.parse.parse_qs(urllib.parse.urlparse(exp_start.headers["location"]).query)["state"][0]
+        with app_a.state.auth_store._session_factory.begin() as db:
+            erow = db.get(auth_store.OAuthTransactionRecord, exp_state)
+            assert erow is not None
+            erow.created_at = time.time() - 605.0
+            erow.expires_at = time.time() - 5.0
+        client_exp.cookies.set(ws.OAUTH_NONCE_COOKIE_NAME, exp_binding, path="/api/auth")
+        assert client_exp.get("/api/auth/oauth/callback", params={"code": "expired-code", "state": exp_state}).status_code == 400
+
+    app_a.state.auth_store.close()
+    app_b.state.auth_store.close()
