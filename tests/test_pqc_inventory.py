@@ -615,12 +615,14 @@ def test_deployment_configuration_disables_simulation_and_keeps_persistence():
 
     assert "PQC_SIMULATION_MODE=FALSE" in dockerfile
     assert 'CMD ["uvicorn", "main:app"' in dockerfile
+    assert "COPY scripts/run_db_migrations.py ./scripts/run_db_migrations.py" in dockerfile
     for cfg_text in (dockerfile, app_yaml, deploy_cr, deploy_vertex):
         assert "sqlite:///data/pqc_sessions.db" not in cfg_text
         assert "type=cloud-storage" not in cfg_text
         assert "mount-path=/data" not in cfg_text
         assert "calibration-history.jsonl" not in cfg_text
     assert "Cloud SQL for PostgreSQL" in app_yaml
+    assert "20261117_0002" in app_yaml
     assert "EncryptedDatabaseCredentialService" in app_yaml
     for script in (deploy_cr, deploy_vertex):
         assert "PQC_SIMULATION_MODE=FALSE" in script
@@ -630,6 +632,9 @@ def test_deployment_configuration_disables_simulation_and_keeps_persistence():
         assert "PQC_KMS_KEY_NAME=" in script
         assert "PQC_ARTIFACT_BUCKET=gs://" in script
         assert "--set-secrets=" in script
+        assert "scripts/run_db_migrations.py,--require-postgres" in script
+        assert "--tasks=1" in script
+        assert "--max-retries=0" in script
         # Hardened auth on Cloud Run: verified sign-in only, ADK DevServer and ADK REST API off.
         assert "PQC_ALLOW_UNVERIFIED_SIGNIN=false" in script
         assert "PQC_ENABLE_ADK_DEV_UI=false" in script

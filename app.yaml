@@ -24,7 +24,7 @@ runtime:
     cloud_sql_connection_name_placeholder: "<PROJECT_ID>:<REGION>:<CLOUD_SQL_INSTANCE>"
     session_service: "DatabaseSessionService (postgresql+asyncpg)"
     auth_and_metadata_store: "DistributedAuthStore (postgresql+psycopg)"
-    schema_migrations: "Alembic (migrations/versions/20261117_0001_initial_phase1_phase2_schema.py)"
+    schema_migrations: "Alembic (head revision 20261117_0002: 20261117_0001_initial_phase1_phase2_schema.py -> 20261117_0002_add_adk_v1_session_schema.py)"
     credential_service: "EncryptedDatabaseCredentialService (Google Cloud KMS AES-256-GCM envelope encryption)"
     artifact_service: "GcsArtifactService (object storage only; never mounted as transactional database FUSE)"
     artifact_bucket: "gs://pqc-inventory-agent-cd06-pqc-agent-staging"

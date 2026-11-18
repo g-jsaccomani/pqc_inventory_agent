@@ -8,7 +8,7 @@ All process-local caches (`InMemoryCredentialService`, `_SESSION_METADATA_CACHE`
 
 | Table | Engine / Driver | Purpose & Ownership Enforcement |
 | :--- | :--- | :--- |
-| `alembic_version` & `pqc_schema_metadata` | `postgresql+psycopg` | Tracks applied Alembic schema revisions (`20261117_0001`). |
+| `alembic_version` & `pqc_schema_metadata` | `postgresql+psycopg` | Tracks applied Alembic schema revisions (head revision `20261117_0002`). |
 | `pqc_oauth_transactions` | `postgresql+psycopg` | Ephemeral server-side OAuth 2.0 + PKCE (`code_verifier`), OIDC `nonce`, browser binding SHA-256 hash, redirect URI, and atomic single-use `consumed_at` guard. |
 | `pqc_consumed_nonces` | `postgresql+psycopg` | Primary-key-enforced single-use replay prevention for OIDC `nonce` claims and authorization codes. |
 | `pqc_auth_sessions` | `postgresql+psycopg` | Server-side session allowlist & immediate cross-instance revocation registry keyed by `jti` and `token_sha256`. |
@@ -150,7 +150,7 @@ DATABASE_URL="${TARGET_POSTGRES_URL}" .venv/bin/python scripts/run_db_migrations
   --report-md "${BACKUP_DIR}/dry_run_report.md"
 ```
 Verify in `dry_run_report.md`:
-- `Status: DRY_RUN_VALIDATED`
+- `Status: DRY_RUN_OK`
 - `Source Files Untouched (SHA-256 Verified): True`
 - `Orphan Session Metadata Rows: 0` and `Orphan ADK Event Rows: 0`
 - Review any `CROSS_USER_SESSION_ID_CONFLICT` or `PLAINTEXT_TOKEN_STRIPPED` warnings.

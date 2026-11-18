@@ -46,8 +46,10 @@ COPY alembic.ini .
 COPY migrations ./migrations
 COPY pqc_agent ./pqc_agent
 COPY tools ./tools
+COPY scripts/run_db_migrations.py ./scripts/run_db_migrations.py
 COPY scripts/migrate_sqlite_to_postgres.py ./scripts/migrate_sqlite_to_postgres.py
 COPY main.py .
+RUN chmod 0755 /app/scripts/run_db_migrations.py /app/scripts/migrate_sqlite_to_postgres.py
 
 EXPOSE 8080
 
