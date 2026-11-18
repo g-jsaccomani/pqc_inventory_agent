@@ -14,21 +14,31 @@ import tempfile
 _TMP_DIR = tempfile.mkdtemp(prefix="pqc-tests-")
 os.environ["PQC_MODEL_VERIFICATION_ON_STARTUP"] = "false"
 os.environ["PQC_SIMULATION_MODE"] = "FALSE"
-os.environ["PQC_CALIBRATION_STORE_PATH"] = os.path.join(_TMP_DIR, "calibration-history.jsonl")
+os.environ["SESSION_DB_URL"] = f"sqlite:///{os.path.join(_TMP_DIR, 'pqc_conftest.db')}"
 os.environ["PQC_EXPORT_DIR"] = os.path.join(_TMP_DIR, "exports")
 os.environ["PQC_ARTIFACT_BUCKET"] = ""
 os.environ["PQC_DATA_DIR"] = os.path.join(_TMP_DIR, "data")
 for _auth_env in (
     "K_SERVICE",
+    "PQC_PRODUCTION_MODE",
+    "PQC_ENV",
+    "DATABASE_URL",
+    "PQC_CLOUD_SQL_CONNECTION_NAME",
+    "PQC_DB_HOST",
+    "PQC_KMS_KEY_NAME",
+    "PQC_ALLOWED_IMPERSONATION_SERVICE_ACCOUNTS",
     "PQC_ALLOW_UNVERIFIED_SIGNIN",
     "PQC_ENABLE_ADK_API",
     "PQC_ENABLE_ADK_DEV_UI",
+    "PQC_ENABLE_GIS_JAVASCRIPT_CLIENT",
     "PQC_ALLOWED_ORIGINS",
     "PQC_IAP_AUDIENCE",
     "PQC_AUTH_SECRET",
     "PQC_ADMIN_EMAILS",
     "PQC_GOOGLE_ID_TOKEN_AUDIENCES",
     "PQC_USER_ACCESS_TOKEN",
+    "PQC_GOOGLE_OAUTH_CLIENT_ID",
+    "PQC_GOOGLE_OAUTH_CLIENT_SECRET",
     "GOOGLE_OAUTH_CLIENT_ID",
     "GOOGLE_OAUTH_CLIENT_SECRET",
 ):
@@ -113,13 +123,25 @@ def google_verifier(monkeypatch):
     return calls
 
 
+@pytest.fixture(autouse=True)
+def _dispose_fallback_auth_stores():
+    yield
+    from pqc_agent import auth_store
+
+    auth_store.clear_fallback_auth_stores()
+
+
 @pytest.fixture
 def signin(google_verifier):
-    """`signin(client, email, **extra) -> session token` through POST /api/auth/google with a verified token."""
+    """`signin(client, email, **extra) -> session cookie value` through POST /api/auth/google with a verified token."""
 
     def _signin(client, email, **extra):
         resp = client.post("/api/auth/google", json={"google_access_token": f"valid:{email}", **extra})
         assert resp.status_code == 200, resp.text
-        return resp.json()["token"]
+        body = resp.json()
+        assert "token" not in body, "Session bearer token must never be serialized in JSON responses"
+        cookie_tok = resp.cookies.get("pqc_session_token") or client.cookies.get("pqc_session_token")
+        assert cookie_tok, "Expected HttpOnly pqc_session_token cookie to be set"
+        return cookie_tok
 
     return _signin

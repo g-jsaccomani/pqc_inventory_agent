@@ -64,10 +64,14 @@ def _make_test_registry():
 
 
 def _make_app(tmp_path, registry=None):
+    from pqc_agent import auth_store
     from pqc_agent.workspace_server import create_workspace_app
 
+    db_url = f"sqlite:///{tmp_path / 'sessions.db'}"
+    os.environ["SESSION_DB_URL"] = db_url
+    auth_store.clear_fallback_auth_stores()
     return create_workspace_app(
-        session_db_url=f"sqlite:///{tmp_path / 'sessions.db'}",
+        session_db_url=db_url,
         artifact_bucket="gs://pqc-inventory-agent-cd06-pqc-agent-staging",
         model_registry=registry or _make_test_registry(),
         verify_models_on_startup=False,
@@ -605,16 +609,32 @@ def test_portal_ui_is_gemini_only_dynamic_and_transparent(tmp_path, monkeypatch)
 
 def test_deployment_configuration_disables_simulation_and_keeps_persistence():
     dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    app_yaml = (REPO_ROOT / "app.yaml").read_text(encoding="utf-8")
     deploy_cr = (REPO_ROOT / "scripts" / "deploy_cloud_run.sh").read_text(encoding="utf-8")
     deploy_vertex = (REPO_ROOT / "scripts" / "setup_and_deploy_vertex.sh").read_text(encoding="utf-8")
 
     assert "PQC_SIMULATION_MODE=FALSE" in dockerfile
     assert 'CMD ["uvicorn", "main:app"' in dockerfile
+    assert "COPY scripts/run_db_migrations.py ./scripts/run_db_migrations.py" in dockerfile
+    for cfg_text in (dockerfile, app_yaml, deploy_cr, deploy_vertex):
+        assert "sqlite:///data/pqc_sessions.db" not in cfg_text
+        assert "type=cloud-storage" not in cfg_text
+        assert "mount-path=/data" not in cfg_text
+        assert "calibration-history.jsonl" not in cfg_text
+    assert "Cloud SQL for PostgreSQL" in app_yaml
+    assert "20261117_0002" in app_yaml
+    assert "EncryptedDatabaseCredentialService" in app_yaml
     for script in (deploy_cr, deploy_vertex):
         assert "PQC_SIMULATION_MODE=FALSE" in script
         assert "PQC_SIMULATION_MODE=AUTO" not in script
-        assert "name=pqc-data,type=cloud-storage,bucket=" in script
-        assert "volume=pqc-data,mount-path=/data" in script
+        assert "--add-cloudsql-instances=" in script
+        assert "PQC_CLOUD_SQL_CONNECTION_NAME=" in script
+        assert "PQC_KMS_KEY_NAME=" in script
+        assert "PQC_ARTIFACT_BUCKET=gs://" in script
+        assert "--set-secrets=" in script
+        assert "scripts/run_db_migrations.py,--require-postgres" in script
+        assert "--tasks=1" in script
+        assert "--max-retries=0" in script
         # Hardened auth on Cloud Run: verified sign-in only, ADK DevServer and ADK REST API off.
         assert "PQC_ALLOW_UNVERIFIED_SIGNIN=false" in script
         assert "PQC_ENABLE_ADK_DEV_UI=false" in script
@@ -656,7 +676,9 @@ def test_multi_tenant_google_auth_regional_sessions_and_isolated_connections(tmp
         assert alice_data["authenticated"] is True
         assert alice_data["user"]["email"] == "alice@google.com"
         assert alice_data["user"]["region"] == "NorthAm"
-        alice_token = alice_data["token"]
+        assert "token" not in alice_data
+        alice_token = alice_login.cookies.get("pqc_session_token")
+        assert alice_token
 
         rahul_login = client.post(
             "/api/auth/google",
@@ -665,7 +687,9 @@ def test_multi_tenant_google_auth_regional_sessions_and_isolated_connections(tmp
         assert rahul_login.status_code == 200
         rahul_data = rahul_login.json()
         assert rahul_data["user"]["region"] == "India"
-        rahul_token = rahul_data["token"]
+        assert "token" not in rahul_data
+        rahul_token = rahul_login.cookies.get("pqc_session_token")
+        assert rahul_token
 
         anna_login = client.post(
             "/api/auth/google",
@@ -673,7 +697,9 @@ def test_multi_tenant_google_auth_regional_sessions_and_isolated_connections(tmp
         )
         assert anna_login.status_code == 200
         assert anna_login.json()["user"]["region"] == "EMEA"
-        anna_token = anna_login.json()["token"]
+        assert "token" not in anna_login.json()
+        anna_token = anna_login.cookies.get("pqc_session_token")
+        assert anna_token
 
         kenji_login = client.post(
             "/api/auth/google",
@@ -681,7 +707,9 @@ def test_multi_tenant_google_auth_regional_sessions_and_isolated_connections(tmp
         )
         assert kenji_login.status_code == 200
         assert kenji_login.json()["user"]["region"] == "APAC"
-        kenji_token = kenji_login.json()["token"]
+        assert "token" not in kenji_login.json()
+        kenji_token = kenji_login.cookies.get("pqc_session_token")
+        assert kenji_token
 
         # 3. Isolated GCP Connection Config per @google.com user
         client.post(
@@ -976,7 +1004,9 @@ def test_all_five_phases_and_connection_modes_through_chat_api(tmp_path, monkeyp
             json={"email": "jsaccomani@google.com", "name": "Joabson Saccomani", "region": "LATAM"},
         )
         assert auth_resp.status_code == 200
-        token = auth_resp.json()["token"]
+        assert "token" not in auth_resp.json()
+        token = auth_resp.cookies.get("pqc_session_token")
+        assert token
 
         for idx, mode in enumerate(["adc", "access_token", "impersonation", "adc", "access_token"]):
             sess = client.post(

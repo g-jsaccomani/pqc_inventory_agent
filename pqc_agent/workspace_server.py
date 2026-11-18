@@ -45,7 +45,6 @@ from google.adk.auth import (
     OAuth2Auth,
     OpenIdConnectWithConfig,
 )
-from google.adk.auth.credential_service.in_memory_credential_service import InMemoryCredentialService
 from google.adk.cli.fast_api import get_fast_api_app
 from google.adk.cli.service_registry import get_service_registry
 from google.adk.plugins.base_plugin import BasePlugin
@@ -56,7 +55,7 @@ from google.adk.tools.tool_context import ToolContext
 from google.genai import types
 from pydantic import BaseModel
 
-from pqc_agent import auth_guard
+from pqc_agent import auth_guard, auth_store, credential_service
 from pqc_agent.agent import create_pqc_agent
 from pqc_agent.model_registry import ModelRegistry
 from pqc_agent.portal_ui import PORTAL_HTML
@@ -104,89 +103,74 @@ DEFAULT_STAGING_BUCKET = os.getenv(
     "PQC_ARTIFACT_BUCKET",
     os.getenv("PQC_EXPORT_GCS_BUCKET", "gs://pqc-inventory-agent-cd06-pqc-agent-staging"),
 )
-DEFAULT_SESSION_DB_URL = os.getenv("SESSION_DB_URL", "sqlite:///data/pqc_sessions.db")
 MAX_TELEMETRY_CALLS_RETURNED = 60
 
-# Patch DatabaseSessionService.__init__ so `sqlite:///...` automatically upgrades to `sqlite+aiosqlite:///...`
-# and creates the SQLite parent directory before SQLAlchemy opens the connection.
-_ORIG_DB_SESSION_INIT = DatabaseSessionService.__init__
 
+class ManagedSchemaDatabaseSessionService(DatabaseSessionService):
+    """Subclass of ADK ``DatabaseSessionService`` that prohibits ``metadata.create_all()`` in production.
 
-def _normalize_sqlite_db_url(raw_url: str) -> str:
-    """Normalizes a SQLite URL for SQLAlchemy async engine (`sqlite+aiosqlite://`) and ensures parent directories exist."""
-    url = (raw_url or DEFAULT_SESSION_DB_URL).strip()
-    if url.startswith("sqlite://") and not url.startswith("sqlite+aiosqlite://"):
-        url = "sqlite+aiosqlite://" + url[len("sqlite://") :]
+    In production, Alembic is the sole schema authority: ``prepare_tables()`` performs a strictly read-only
+    check that the Alembic-managed ADK v1 tables and schema metadata exist, failing closed if missing or outdated.
+    In non-production local development and isolated unit tests, ADK's standard table setup remains available.
+    """
 
-    # If the URL references `data/pqc_sessions.db` and Cloud Run `/data` volume mount is writable,
-    # ensure relative `data` or `/data` resolves to a writable path.
-    if url.startswith("sqlite+aiosqlite:///"):
-        raw_path = url[len("sqlite+aiosqlite:///") :]
-        if raw_path and raw_path != ":memory:":
-            # If `/data` is mounted at root and writable, map `data/...` to `/data/...`
-            if raw_path.startswith("data/") and os.path.isdir("/data") and os.access("/data", os.W_OK):
-                abs_target = "/" + raw_path
-                url = f"sqlite+aiosqlite:///{abs_target}"
-                parent_dir = os.path.dirname(abs_target)
-            elif raw_path.startswith("/data/") and not (os.path.isdir("/data") and os.access("/data", os.W_OK)):
-                # Fallback on local developer machines where `/` is read-only
-                rel_fallback = raw_path.lstrip("/")
-                url = f"sqlite+aiosqlite:///{rel_fallback}"
-                parent_dir = os.path.dirname(os.path.abspath(rel_fallback))
-            else:
-                parent_dir = os.path.dirname(os.path.abspath(raw_path))
-            if parent_dir:
-                try:
-                    os.makedirs(parent_dir, exist_ok=True)
-                except OSError:
-                    pass
-    return url
+    async def prepare_tables(self) -> None:
+        if not auth_guard.is_production_environment():
+            await super().prepare_tables()
+            return
+        if self._tables_created:
+            return
+        async with self._table_creation_lock:
+            if self._tables_created:
+                return
+            from google.adk.sessions.migration import _schema_check_utils
 
+            def _verify_adk_schema_readonly(sync_conn: Any) -> str:
+                existing = set(auth_store.sa_inspect(sync_conn).get_table_names())
+                missing = sorted(set(auth_store.REQUIRED_ADK_V1_TABLES) - existing)
+                if missing:
+                    raise RuntimeError(
+                        "Production ADK session schema verification failed: missing tables "
+                        f"{', '.join(missing)}. Run 'alembic upgrade head' before starting."
+                    )
+                ver = _schema_check_utils.get_db_schema_version_from_connection(sync_conn)
+                if ver != _schema_check_utils.LATEST_SCHEMA_VERSION:
+                    raise RuntimeError(
+                        f"Production ADK session schema verification failed: expected schema_version "
+                        f"{_schema_check_utils.LATEST_SCHEMA_VERSION!r}, found {ver!r}."
+                    )
+                return ver
 
-def _patched_db_session_init(self: DatabaseSessionService, db_url: str | None = None, *args: Any, **kwargs: Any) -> None:
-    if db_url is not None:
-        db_url = _normalize_sqlite_db_url(db_url)
-    _ORIG_DB_SESSION_INIT(self, db_url=db_url, *args, **kwargs)
-    # Harden SQLite concurrency with 30s busy_timeout and WAL journal mode so concurrent requests never fail with
-    # 'database is locked' or partial writes.
-    if db_url and db_url.startswith("sqlite") and hasattr(self, "db_engine"):
-        try:
-            import sqlalchemy.event
-
-            @sqlalchemy.event.listens_for(self.db_engine.sync_engine, "connect")
-            def _set_sqlite_pragmas(dbapi_conn: Any, _conn_record: Any) -> None:
-                try:
-                    cur = dbapi_conn.cursor()
-                    cur.execute("PRAGMA busy_timeout=30000;")
-                    if ":memory:" not in (db_url or ""):
-                        cur.execute("PRAGMA journal_mode=WAL;")
-                    cur.execute("PRAGMA synchronous=OFF;")
-                    cur.execute("PRAGMA temp_store=MEMORY;")
-                    cur.execute("PRAGMA cache_size=-64000;")
-                    cur.close()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-
-DatabaseSessionService.__init__ = _patched_db_session_init  # type: ignore[method-assign]
+            async with self.db_engine.connect() as conn:
+                self._db_schema_version = await conn.run_sync(_verify_adk_schema_readonly)
+            self._tables_created = True
 
 
 class ResilientGcsArtifactService(GcsArtifactService):
-    """Subclass of ADK's `GcsArtifactService` backed by `gs://pqc-inventory-agent-cd06-pqc-agent-staging`
-    with local `/data/artifacts` fallback so offline unit tests and container startups never fail.
+    """Subclass of ADK's ``GcsArtifactService`` backed by Cloud Storage object storage in production,
+    with isolated non-production memory fallback exclusively for offline local development and unit tests.
     """
 
     def __init__(self, bucket_name: str, **kwargs: Any) -> None:
-        clean_bucket = bucket_name.replace("gs://", "").strip("/")
+        clean_bucket = (bucket_name or "").replace("gs://", "").strip("/")
         self.bucket_name = clean_bucket
         self._local_fallback_store: Dict[str, List[types.Part]] = {}
+        if not clean_bucket:
+            if auth_guard.is_production_environment():
+                raise RuntimeError("Production artifact storage failure: PQC_ARTIFACT_BUCKET must be configured.")
+            self.storage_client = None  # type: ignore[assignment]
+            self.bucket = None  # type: ignore[assignment]
+            self._gcs_online = False
+            return
         try:
             super().__init__(bucket_name=clean_bucket, **kwargs)
             self._gcs_online = True
         except Exception as exc:
-            logger.warning("GcsArtifactService initialized in local-fallback mode for bucket '%s': %s", clean_bucket, exc)
+            if auth_guard.is_production_environment():
+                raise RuntimeError(
+                    f"Production artifact storage failure: unable to initialize GcsArtifactService for '{clean_bucket}': {exc}"
+                ) from exc
+            logger.warning("GcsArtifactService initialized in local-dev fallback mode for bucket '%s': %s", clean_bucket, exc)
             self.storage_client = None  # type: ignore[assignment]
             self.bucket = None  # type: ignore[assignment]
             self._gcs_online = False
@@ -202,26 +186,6 @@ class ResilientGcsArtifactService(GcsArtifactService):
         custom_metadata: Optional[dict[str, Any]] = None,
     ) -> int:
         part_obj = artifact if isinstance(artifact, types.Part) else types.Part.model_validate(artifact)
-        key = f"{app_name}/{user_id}/{session_id or 'user'}/{filename}"
-        versions = self._local_fallback_store.setdefault(key, [])
-        versions.append(part_obj)
-        local_version = len(versions) - 1
-
-        # Also persist a copy on `/data/artifacts` if writable
-        base_dir = "/data/artifacts" if (os.path.isdir("/data") and os.access("/data", os.W_OK)) else "data/artifacts"
-        try:
-            target_dir = os.path.join(base_dir, app_name, user_id, session_id or "user")
-            os.makedirs(target_dir, exist_ok=True)
-            safe_name = os.path.basename(filename)
-            if part_obj.inline_data and part_obj.inline_data.data:
-                with open(os.path.join(target_dir, safe_name), "wb") as f:
-                    f.write(part_obj.inline_data.data)
-            elif part_obj.text:
-                with open(os.path.join(target_dir, safe_name), "w", encoding="utf-8") as f:
-                    f.write(part_obj.text)
-        except OSError:
-            pass
-
         if self._gcs_online and self.bucket is not None:
             try:
                 return await super().save_artifact(
@@ -233,8 +197,14 @@ class ResilientGcsArtifactService(GcsArtifactService):
                     custom_metadata=custom_metadata,
                 )
             except Exception as exc:
-                logger.debug("GCS artifact upload fallback to local store for '%s': %s", filename, exc)
-        return local_version
+                if auth_guard.is_production_environment():
+                    raise
+                logger.debug("GCS artifact upload fallback to local-dev store for '%s': %s", filename, exc)
+
+        key = f"{app_name}/{user_id}/{session_id or 'user'}/{os.path.basename(filename)}"
+        versions = self._local_fallback_store.setdefault(key, [])
+        versions.append(part_obj)
+        return len(versions) - 1
 
     async def load_artifact(
         self,
@@ -245,335 +215,70 @@ class ResilientGcsArtifactService(GcsArtifactService):
         session_id: Optional[str] = None,
         version: Optional[int] = None,
     ) -> Optional[types.Part]:
-        key = f"{app_name}/{user_id}/{session_id or 'user'}/{filename}"
-        if key in self._local_fallback_store and self._local_fallback_store[key]:
-            idx = version if (version is not None and 0 <= version < len(self._local_fallback_store[key])) else -1
-            return self._local_fallback_store[key][idx]
         if self._gcs_online and self.bucket is not None:
             try:
-                return await super().load_artifact(
+                loaded = await super().load_artifact(
                     app_name=app_name,
                     user_id=user_id,
                     filename=filename,
                     session_id=session_id,
                     version=version,
                 )
+                if loaded is not None:
+                    return loaded
             except Exception:
-                return None
+                if auth_guard.is_production_environment():
+                    raise
+        key = f"{app_name}/{user_id}/{session_id or 'user'}/{os.path.basename(filename)}"
+        if key in self._local_fallback_store and self._local_fallback_store[key]:
+            idx = version if (version is not None and 0 <= version < len(self._local_fallback_store[key])) else -1
+            return self._local_fallback_store[key][idx]
         return None
 
     async def list_artifact_keys(
         self, *, app_name: str, user_id: str, session_id: Optional[str] = None
     ) -> list[str]:
-        prefix = f"{app_name}/{user_id}/{session_id or 'user'}/"
-        local_keys = [k[len(prefix) :] for k in self._local_fallback_store if k.startswith(prefix)]
         if self._gcs_online and self.bucket is not None:
             try:
                 gcs_keys = await super().list_artifact_keys(
                     app_name=app_name, user_id=user_id, session_id=session_id
                 )
-                return sorted(set(local_keys + list(gcs_keys)))
+                if gcs_keys or auth_guard.is_production_environment():
+                    return sorted(set(gcs_keys))
             except Exception:
-                pass
+                if auth_guard.is_production_environment():
+                    raise
+        prefix = f"{app_name}/{user_id}/{session_id or 'user'}/"
+        local_keys = [k[len(prefix) :] for k in self._local_fallback_store if k.startswith(prefix)]
         return sorted(set(local_keys))
 
 
-# =============================================================================
-# Partitioned Per-Tenant / Per-Session Atomic Storage + Optional Cloud Firestore
-# =============================================================================
-import re as _re
 import subprocess as _subprocess
-import tempfile as _tempfile
-
-_STORAGE_LOCK = threading.RLock()
-_BG_STORAGE_IO = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="pqc-storage-io")
-_SESSION_METADATA_CACHE: Dict[str, Dict[str, Dict[str, Any]]] = {}
-_TENANT_USERS_CACHE: Dict[str, Dict[str, Dict[str, Any]]] = {}
-_FIRESTORE_CLIENT: Any = None
-_FIRESTORE_CHECKED = False
-
-
-def _get_firestore_client() -> Any:
-    """Returns a Cloud Firestore client when `PQC_ENABLE_FIRESTORE=true` and `google-cloud-firestore` is installed."""
-    global _FIRESTORE_CLIENT, _FIRESTORE_CHECKED
-    if auth_guard.env_flag("PQC_ENABLE_FIRESTORE") is not True:
-        return None
-    if _FIRESTORE_CHECKED:
-        return _FIRESTORE_CLIENT
-    _FIRESTORE_CHECKED = True
-    try:
-        from google.cloud import firestore  # type: ignore[import-untyped]
-
-        db_id = os.getenv("PQC_FIRESTORE_DATABASE", "(default)").strip() or "(default)"
-        proj_id = os.getenv("GOOGLE_CLOUD_PROJECT", "pqc-inventory-agent-cd06").strip()
-        _FIRESTORE_CLIENT = firestore.Client(project=proj_id, database=db_id)
-    except Exception as exc:
-        logger.warning("Cloud Firestore client unavailable (falling back to partitioned /data/tenants): %s", exc)
-        _FIRESTORE_CLIENT = None
-    return _FIRESTORE_CLIENT
 
 
 def _get_data_dir() -> str:
+    """Returns local developer workspace directory (never used in production or for authoritative state)."""
     override = os.getenv("PQC_DATA_DIR", "").strip()
-    if override:
+    if override and not override.startswith("/data"):
         os.makedirs(override, exist_ok=True)
         return override
-    if os.path.isdir("/data") and os.access("/data", os.W_OK):
-        return "/data"
     os.makedirs("data", exist_ok=True)
     return "data"
 
 
-def _safe_fs_segment(value: str, fallback: str = "default") -> str:
-    cleaned = _re.sub(r"[^a-zA-Z0-9._@-]", "_", str(value or "").strip()).strip("._")
-    return cleaned or fallback
-
-
-def _get_tenant_partition_dir(uid: str) -> str:
-    return os.path.join(_get_data_dir(), "tenants", _safe_fs_segment(normalize_user_id(uid), DEFAULT_USER_ID))
-
-
-def _atomic_write_json(path: str, payload: Any) -> None:
-    """Writes JSON atomically via a unique temporary file + fsync + `os.replace` so concurrent readers never see partial data."""
-    parent = os.path.dirname(os.path.abspath(path))
-    os.makedirs(parent, exist_ok=True)
-    fd, tmp_path = _tempfile.mkstemp(prefix=".tmp_pqc_", suffix=".json", dir=parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-            f.flush()
-            if not auth_guard.running_on_cloud_run():
-                try:
-                    os.fsync(f.fileno())
-                except OSError:
-                    pass
-        os.replace(tmp_path, path)
-    except Exception:
-        try:
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
-
-
-def _get_metadata_store_path() -> str:
-    return os.path.join(_get_data_dir(), "pqc_session_metadata.json")
-
-
-def _load_session_metadata_map() -> Dict[str, Dict[str, Any]]:
-    with _STORAGE_LOCK:
-        cache_key = os.path.abspath(_get_data_dir())
-        cached = _SESSION_METADATA_CACHE.get(cache_key)
-        if cached is not None:
-            return {k: dict(v) for k, v in cached.items()}
-        merged: Dict[str, Dict[str, Any]] = {}
-        path = _get_metadata_store_path()
-        if os.path.exists(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    raw = json.load(f)
-                if isinstance(raw, dict):
-                    merged.update(raw)
-            except Exception:
-                pass
-        # Load partitioned per-tenant / per-session metadata files (/data/tenants/<uid>/sessions/<session_id>.json)
-        tenants_dir = os.path.join(_get_data_dir(), "tenants")
-        if os.path.isdir(tenants_dir):
-            try:
-                for tenant_entry in os.scandir(tenants_dir):
-                    if not tenant_entry.is_dir():
-                        continue
-                    sess_dir = os.path.join(tenant_entry.path, "sessions")
-                    if not os.path.isdir(sess_dir):
-                        continue
-                    for sess_file in os.scandir(sess_dir):
-                        if not sess_file.is_file() or not sess_file.name.endswith(".json"):
-                            continue
-                        try:
-                            with open(sess_file.path, "r", encoding="utf-8") as sf:
-                                sdata = json.load(sf)
-                            if isinstance(sdata, dict):
-                                sid = str(sdata.get("session_id") or sess_file.name[:-5])
-                                merged[sid] = sdata
-                        except Exception:
-                            pass
-            except OSError:
-                pass
-        _SESSION_METADATA_CACHE[cache_key] = {k: dict(v) for k, v in merged.items()}
-        return {k: dict(v) for k, v in merged.items()}
-
-
-def _flush_session_metadata_to_disk(
-    meta_snapshot: Dict[str, Dict[str, Any]],
-    changed_session_id: Optional[str],
-    store_path: str,
-) -> None:
-    with _STORAGE_LOCK:
-        try:
-            for sid, sdata in meta_snapshot.items():
-                if not isinstance(sdata, dict):
-                    continue
-                if changed_session_id is not None and sid != changed_session_id:
-                    continue
-                uid = normalize_user_id(sdata.get("user_id") or DEFAULT_USER_ID)
-                sdata_copy = dict(sdata)
-                sdata_copy["session_id"] = sid
-                sdata_copy["user_id"] = uid
-                sess_path = os.path.join(
-                    _get_tenant_partition_dir(uid),
-                    "sessions",
-                    f"{_safe_fs_segment(sid, 'session')}.json",
-                )
-                _atomic_write_json(sess_path, sdata_copy)
-                fs_client = _get_firestore_client()
-                if fs_client is not None:
-                    try:
-                        (
-                            fs_client.collection("pqc_tenants")
-                            .document(uid)
-                            .collection("sessions")
-                            .document(sid)
-                            .set(sdata_copy, merge=True)
-                        )
-                    except Exception:
-                        pass
-            _atomic_write_json(store_path, meta_snapshot)
-        except OSError:
-            pass
-
-
-def _save_session_metadata_map(meta_map: Dict[str, Dict[str, Any]], changed_session_id: Optional[str] = None) -> None:
-    with _STORAGE_LOCK:
-        cache_key = os.path.abspath(_get_data_dir())
-        snapshot = {k: dict(v) for k, v in meta_map.items() if isinstance(v, dict)}
-        _SESSION_METADATA_CACHE[cache_key] = snapshot
-        store_path = _get_metadata_store_path()
-        if auth_guard.running_on_cloud_run():
-            _BG_STORAGE_IO.submit(_flush_session_metadata_to_disk, snapshot, changed_session_id, store_path)
-        else:
-            _flush_session_metadata_to_disk(snapshot, changed_session_id, store_path)
-
-
-def _delete_partitioned_session_metadata(uid: str, session_id: str) -> None:
-    with _STORAGE_LOCK:
-        cache_key = os.path.abspath(_get_data_dir())
-        if cache_key in _SESSION_METADATA_CACHE:
-            _SESSION_METADATA_CACHE[cache_key].pop(session_id, None)
-        sess_path = os.path.join(
-            _get_tenant_partition_dir(uid),
-            "sessions",
-            f"{_safe_fs_segment(session_id, 'session')}.json",
-        )
-        try:
-            if os.path.exists(sess_path):
-                os.unlink(sess_path)
-        except OSError:
-            pass
-        fs_client = _get_firestore_client()
-        if fs_client is not None:
-            try:
-                (
-                    fs_client.collection("pqc_tenants")
-                    .document(normalize_user_id(uid))
-                    .collection("sessions")
-                    .document(session_id)
-                    .delete()
-                )
-            except Exception:
-                pass
-
-
-# =============================================================================
-# Multi-Tenant @google.com Identity, Region & Persistent Session Token Manager
-# =============================================================================
-
-
-def _get_tenant_users_path() -> str:
-    return os.path.join(_get_data_dir(), "pqc_tenant_users.json")
-
-
-def _load_tenant_users_map() -> Dict[str, Dict[str, Any]]:
-    with _STORAGE_LOCK:
-        cache_key = os.path.abspath(_get_data_dir())
-        cached = _TENANT_USERS_CACHE.get(cache_key)
-        if cached is not None:
-            return {k: dict(v) for k, v in cached.items()}
-        users_map: Dict[str, Dict[str, Any]] = {}
-        path = _get_tenant_users_path()
-        if os.path.exists(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, dict):
-                    users_map.update(data)
-            except Exception:
-                pass
-        # Also load partitioned per-tenant profile files (/data/tenants/<uid>/profile.json)
-        tenants_dir = os.path.join(_get_data_dir(), "tenants")
-        if os.path.isdir(tenants_dir):
-            try:
-                for entry in os.scandir(tenants_dir):
-                    if not entry.is_dir():
-                        continue
-                    prof_file = os.path.join(entry.path, "profile.json")
-                    if os.path.isfile(prof_file):
-                        try:
-                            with open(prof_file, "r", encoding="utf-8") as pf:
-                                pdata = json.load(pf)
-                            if isinstance(pdata, dict) and pdata.get("email"):
-                                uid = normalize_user_id(pdata["email"])
-                                users_map[uid] = pdata
-                        except Exception:
-                            pass
-            except OSError:
-                pass
-        _TENANT_USERS_CACHE[cache_key] = {k: dict(v) for k, v in users_map.items()}
-        return {k: dict(v) for k, v in users_map.items()}
-
-
-def _flush_tenant_users_to_disk(
-    users_snapshot: Dict[str, Dict[str, Any]],
-    changed_uid: Optional[str],
-    users_path: str,
-) -> None:
-    with _STORAGE_LOCK:
-        try:
-            for uid, profile in users_snapshot.items():
-                if not isinstance(profile, dict):
-                    continue
-                if changed_uid is not None and uid != changed_uid:
-                    continue
-                prof_path = os.path.join(_get_tenant_partition_dir(uid), "profile.json")
-                _atomic_write_json(prof_path, profile)
-                fs_client = _get_firestore_client()
-                if fs_client is not None:
-                    try:
-                        fs_client.collection("pqc_tenants").document(uid).set(profile, merge=True)
-                    except Exception:
-                        pass
-            _atomic_write_json(users_path, users_snapshot)
-        except OSError:
-            pass
-
-
-def _save_tenant_users_map(users_map: Dict[str, Dict[str, Any]], changed_uid: Optional[str] = None) -> None:
-    with _STORAGE_LOCK:
-        cache_key = os.path.abspath(_get_data_dir())
-        snapshot = {k: dict(v) for k, v in users_map.items() if isinstance(v, dict)}
-        _TENANT_USERS_CACHE[cache_key] = snapshot
-        users_path = _get_tenant_users_path()
-        if auth_guard.running_on_cloud_run():
-            _BG_STORAGE_IO.submit(_flush_tenant_users_to_disk, snapshot, changed_uid, users_path)
-        else:
-            _flush_tenant_users_to_disk(snapshot, changed_uid, users_path)
+def export_workspace_json_backup(output_path: Optional[str] = None, *, user_id: Optional[str] = None) -> Dict[str, Any]:
+    """Exports a non-authoritative JSON snapshot of database records for explicit backup/portability only."""
+    snapshot = auth_store.get_active_auth_store().export_workspace_backup_snapshot(user_id=user_id)
+    if output_path:
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as fh:
+            json.dump(snapshot, fh, ensure_ascii=False, indent=2)
+    return snapshot
 
 
 
 _AUTH_SECRET_CACHE: Optional[bytes] = None
 _AUTH_SECRET_CACHE_KEY: Optional[Tuple[str, ...]] = None
-_REVOKED_SESSION_JTIS: Dict[str, float] = {}
-_REVOKED_LOCK = threading.Lock()
 _ACTIVE_PKCE_VERIFIER: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("pqc_active_pkce_verifier", default=None)
 _ACTIVE_OIDC_NONCE: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("pqc_active_oidc_nonce", default=None)
 ACCOUNT_JAR_COOKIE_NAME = "pqc_account_jar"
@@ -591,7 +296,7 @@ def _current_secret_env_key() -> Tuple[str, ...]:
 
 
 def _get_auth_secret() -> bytes:
-    """Returns the HMAC key for session tokens and OAuth state.
+    """Returns the HMAC key for session tokens and account jar cookies.
 
     In production (Cloud Run / `PQC_PRODUCTION_MODE=true`), fails closed if `PQC_AUTH_SECRET` is missing or < 32 chars.
     """
@@ -599,85 +304,45 @@ def _get_auth_secret() -> bytes:
     env_key = _current_secret_env_key()
     if _AUTH_SECRET_CACHE is not None and _AUTH_SECRET_CACHE_KEY == env_key:
         return _AUTH_SECRET_CACHE
-    try:
-        data_dir: Optional[str] = _get_data_dir()
-    except OSError:
-        data_dir = None
+    data_dir: Optional[str] = None
+    if not auth_guard.is_production_environment():
+        try:
+            data_dir = _get_data_dir()
+        except OSError:
+            data_dir = None
     _AUTH_SECRET_CACHE = auth_guard.load_or_create_hmac_secret(data_dir)
     _AUTH_SECRET_CACHE_KEY = env_key
     return _AUTH_SECRET_CACHE
 
 
-def _get_revoked_tokens_path() -> str:
-    return os.path.join(_get_data_dir(), "pqc_revoked_tokens.json")
-
-
-def _load_revoked_tokens_unlocked() -> None:
-    now = time.time()
-    path = _get_revoked_tokens_path()
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            if isinstance(raw, dict):
-                for k, exp_ts in raw.items():
-                    if isinstance(exp_ts, (int, float)) and float(exp_ts) > now:
-                        _REVOKED_SESSION_JTIS[str(k)] = float(exp_ts)
-        except Exception:
-            pass
-    for k, exp_ts in list(_REVOKED_SESSION_JTIS.items()):
-        if exp_ts <= now:
-            del _REVOKED_SESSION_JTIS[k]
-
-
-def _persist_revoked_tokens_unlocked() -> None:
-    try:
-        _atomic_write_json(_get_revoked_tokens_path(), _REVOKED_SESSION_JTIS)
-    except OSError:
-        pass
-
-
-def _token_revocation_keys(decoded: Optional[Mapping[str, Any]], raw_token: Optional[str]) -> List[str]:
-    keys: List[str] = []
-    if decoded and decoded.get("jti"):
-        keys.append(f"jti:{decoded['jti']}")
-    if raw_token:
-        clean = str(raw_token).strip()
-        if clean.lower().startswith("bearer "):
-            clean = clean[7:].strip()
-        if clean:
-            digest = hashlib.sha256(clean.encode("utf-8")).hexdigest()
-            keys.append(f"tok:{digest}")
-    return keys
-
-
-def revoke_tenant_session_token(token: Optional[str]) -> None:
-    """Revokes a signed session token server-side so it cannot be reused via cookie or header after logout/rotation."""
+def revoke_tenant_session_token(token: Optional[str], *, reason: str = "logout") -> None:
+    """Revokes a signed session token in the shared transactional database across all application instances."""
     if not token:
         return
     try:
         decoded = auth_guard.verify_signed_payload(token, _get_auth_secret(), expected_type=SESSION_TOKEN_TYPE)
     except Exception:
         decoded = None
+    jti = str((decoded or {}).get("jti") or "") or None
+    uid = normalize_user_id((decoded or {}).get("email") or (decoded or {}).get("uid")) if decoded else None
     exp_ts = float((decoded or {}).get("exp") or (time.time() + SESSION_TOKEN_TTL_SECONDS))
-    keys = _token_revocation_keys(decoded, token)
-    if not keys:
-        return
-    with _REVOKED_LOCK:
-        _load_revoked_tokens_unlocked()
-        for k in keys:
-            _REVOKED_SESSION_JTIS[k] = exp_ts
-        _persist_revoked_tokens_unlocked()
+    auth_store.get_active_auth_store().revoke_session(
+        jti=jti,
+        raw_token=token,
+        user_id=uid,
+        expires_at=exp_ts,
+        reason=reason,
+    )
 
 
 def is_tenant_session_token_revoked(decoded: Mapping[str, Any], raw_token: Optional[str] = None) -> bool:
-    keys = _token_revocation_keys(decoded, raw_token)
-    if not keys:
-        return False
-    now = time.time()
-    with _REVOKED_LOCK:
-        _load_revoked_tokens_unlocked()
-        return any(_REVOKED_SESSION_JTIS.get(k, 0.0) > now for k in keys)
+    """Checks authoritative database state to determine whether a session token has been revoked or expired (fail-closed)."""
+    jti = str(decoded.get("jti") or "") or None
+    try:
+        return auth_store.get_active_auth_store().is_session_revoked_or_expired(jti=jti, raw_token=raw_token)
+    except Exception as exc:
+        logger.error("Session revocation check failed closed due to persistence error: %s", exc)
+        return True
 
 
 def infer_region_from_timezone(timezone_str: Optional[str] = None, explicit_region: Optional[str] = None) -> str:
@@ -750,25 +415,41 @@ def _format_display_name(email: str, provided_name: Optional[str] = None) -> str
 
 
 def sign_tenant_session_token(user_profile: Dict[str, Any]) -> str:
-    """Creates an HMAC-SHA256 signed session token encoding the authenticated @google.com user profile and a unique jti."""
+    """Creates an HMAC-SHA256 signed session token with a unique `jti` and registers it in the distributed auth store."""
     now_ts = int(time.time())
+    uid = normalize_user_id(user_profile["email"])
+    jti = str(user_profile.get("jti") or secrets.token_urlsafe(24))
+    exp_ts = int(user_profile.get("exp") or (now_ts + SESSION_TOKEN_TTL_SECONDS))
+    region = str(user_profile.get("region") or "NorthAm")
+    auth_method = str(user_profile.get("auth_method") or "google_workspace_signin")
     payload = {
-        "uid": normalize_user_id(user_profile["email"]),
-        "email": normalize_user_id(user_profile["email"]),
+        "uid": uid,
+        "email": uid,
         "name": user_profile.get("name") or _format_display_name(user_profile["email"]),
         "picture": user_profile.get("picture") or "",
-        "region": user_profile.get("region") or "NorthAm",
-        "auth_method": user_profile.get("auth_method") or "google_workspace_signin",
-        "jti": str(user_profile.get("jti") or secrets.token_urlsafe(16)),
+        "region": region,
+        "auth_method": auth_method,
+        "jti": jti,
         "typ": SESSION_TOKEN_TYPE,
         "iat": now_ts,
-        "exp": now_ts + SESSION_TOKEN_TTL_SECONDS,
+        "exp": exp_ts,
     }
-    return auth_guard.sign_payload(payload, _get_auth_secret())
+    signed = auth_guard.sign_payload(payload, _get_auth_secret())
+    auth_store.get_active_auth_store().register_session(
+        jti=jti,
+        raw_token=signed,
+        user_id=uid,
+        email=uid,
+        region=region,
+        auth_method=auth_method,
+        issued_at=float(now_ts),
+        expires_at=float(exp_ts),
+    )
+    return signed
 
 
 def verify_tenant_session_token(token: Optional[str]) -> Optional[Dict[str, Any]]:
-    """Verifies an HMAC-SHA256 signed session token (`typ` = session, unexpired, unrevoked, allowed corporate domain)."""
+    """Verifies an HMAC-SHA256 signed session token (`typ` = session, unexpired, unrevoked in DB, allowed domain)."""
     decoded = auth_guard.verify_signed_payload(token, _get_auth_secret(), expected_type=SESSION_TOKEN_TYPE)
     if not decoded:
         return None
@@ -779,18 +460,6 @@ def verify_tenant_session_token(token: Optional[str]) -> Optional[Dict[str, Any]
     if not ok:
         return None
     return decoded
-
-
-def sign_oauth_state(payload: Dict[str, Any]) -> str:
-    """Signs an OAuth `state` value (typ = oauth_state, 10 minute expiry) so callbacks cannot be forged."""
-    now_ts = int(time.time())
-    body = dict(payload)
-    body.update({"typ": OAUTH_STATE_TYPE, "iat": now_ts, "exp": now_ts + OAUTH_STATE_TTL_SECONDS})
-    return auth_guard.sign_payload(body, _get_auth_secret())
-
-
-def verify_oauth_state(state: Optional[str]) -> Optional[Dict[str, Any]]:
-    return auth_guard.verify_signed_payload(state, _get_auth_secret(), expected_type=OAUTH_STATE_TYPE)
 
 
 def _is_true_claim(value: Any) -> bool:
@@ -814,23 +483,36 @@ def _verify_google_oauth_or_id_token(
     google_access_token: Optional[str] = None,
     expected_nonce: Optional[str] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """Verifies a Google ID token (JWT) or a Google OAuth access token with Google's tokeninfo endpoint.
+    """Verifies a Google OIDC ID token (cryptographic JWT verification) or a Google OAuth access token.
 
-    Returns `({"email", "email_verified": True, ...}, None)` only for a VERIFIED email in `ALLOWED_AUTH_DOMAINS`;
-    ID tokens must come from accounts.google.com, must not be expired, must match `expected_nonce` when bound to an
-    OIDC state, and, when OAuth client IDs are configured, must carry one of them as `aud`.
+    Returns `({"email", "email_verified": True, ...}, None)` only for a VERIFIED email in `ALLOWED_AUTH_DOMAINS`.
+    Enforces issuer, audience, cryptographic signature, expiration, and distributed single-use OIDC `nonce` binding.
     """
     active_nonce = expected_nonce if expected_nonce is not None else _ACTIVE_OIDC_NONCE.get()
     if id_token_jwt:
         tok = id_token_jwt.strip()
-        try:
-            url = f"https://oauth2.googleapis.com/tokeninfo?id_token={urllib.parse.quote(tok)}"
-            req = urllib.request.Request(url, headers={"Accept": "application/json"})
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                info = json.loads(resp.read().decode("utf-8"))
+        audiences = _accepted_id_token_audiences()
+        if tok.count(".") == 2 or auth_guard.is_production_environment():
+            if tok.count(".") != 2:
+                return None, "Malformed Google ID token JWT."
+            info, sig_err = auth_guard.verify_google_oidc_id_token(
+                tok,
+                audiences=audiences,
+                expected_nonce=active_nonce,
+            )
+            if info is None:
+                return None, sig_err or "Google ID token verification failed."
+        else:
+            # Offline synthetic unit-test fallback (only when not in production and token is not a 3-segment JWT)
+            try:
+                url = f"https://oauth2.googleapis.com/tokeninfo?id_token={urllib.parse.quote(tok)}"
+                req = urllib.request.Request(url, headers={"Accept": "application/json"})
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    info = json.loads(resp.read().decode("utf-8"))
+            except Exception as exc:
+                return None, f"Google ID token verification failed: {exc}"
             if info.get("iss") not in ("accounts.google.com", "https://accounts.google.com"):
                 return None, "Google ID token has an unexpected issuer."
-            audiences = _accepted_id_token_audiences()
             if audiences and info.get("aud") not in audiences:
                 return None, "Google ID token was issued for a different OAuth client (audience mismatch)."
             if "exp" in info:
@@ -839,25 +521,33 @@ def _verify_google_oauth_or_id_token(
                         return None, "Google ID token has expired."
                 except (TypeError, ValueError):
                     return None, "Google ID token has an invalid exp claim."
-            if active_nonce and info.get("nonce") != active_nonce:
-                return None, "Google ID token nonce mismatch."
-            raw_email = str(info.get("email") or "").strip()
-            if not raw_email or not _is_true_claim(info.get("email_verified")):
-                return None, "Google ID token does not contain a verified email address."
-            email = normalize_user_id(raw_email)
-            ok, msg = is_allowed_corporate_email(email)
-            if not ok:
-                return None, msg
-            return {
-                "email": email,
-                "email_verified": True,
-                "name": info.get("name") or _format_display_name(email),
-                "picture": info.get("picture") or "",
-                "hd": info.get("hd") or email.split("@")[-1],
-                "auth_method": "google_id_token",
-            }, None
-        except Exception as exc:
-            return None, f"Google ID token verification failed: {exc}"
+            if active_nonce is not None:
+                claim_nonce = str(info.get("nonce") or "")
+                if not claim_nonce or not hmac.compare_digest(claim_nonce.encode("utf-8"), active_nonce.encode("utf-8")):
+                    return None, "Google ID token nonce mismatch."
+
+        nonce_to_consume = str(info.get("nonce") or active_nonce or "").strip()
+        if nonce_to_consume:
+            if not auth_store.get_active_auth_store().consume_replay_token(
+                "oidc_nonce", nonce_to_consume, ttl_seconds=3600
+            ):
+                return None, "Google ID token nonce has already been used (replay rejected)."
+
+        raw_email = str(info.get("email") or "").strip()
+        if not raw_email or not _is_true_claim(info.get("email_verified")):
+            return None, "Google ID token does not contain a verified email address."
+        email = normalize_user_id(raw_email)
+        ok, msg = is_allowed_corporate_email(email)
+        if not ok:
+            return None, msg
+        return {
+            "email": email,
+            "email_verified": True,
+            "name": info.get("name") or _format_display_name(email),
+            "picture": info.get("picture") or "",
+            "hd": info.get("hd") or email.split("@")[-1],
+            "auth_method": "google_id_token",
+        }, None
 
     if google_access_token:
         tok = google_access_token.strip()
@@ -978,10 +668,10 @@ def upsert_tenant_user_profile(
     auth_method: str = "google_workspace_signin",
     picture: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Creates or updates a persistent @google.com tenant user profile in `/data/tenants/<uid>/profile.json`."""
+    """Atomically creates or updates an authoritative corporate tenant user profile in ``pqc_tenant_users``."""
     clean_email = normalize_user_id(email)
-    users_map = _load_tenant_users_map()
-    existing = users_map.get(clean_email, {})
+    store = auth_store.get_active_auth_store()
+    existing = store.get_tenant_user(clean_email) or {}
     now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
     resolved_region = infer_region_from_timezone(
@@ -989,24 +679,19 @@ def upsert_tenant_user_profile(
         explicit_region=region or existing.get("region"),
     )
     resolved_name = _format_display_name(clean_email, name or existing.get("name"))
-    domain = clean_email.split("@", 1)[-1] if "@" in clean_email else "google.com"
     resolved_picture = picture if (picture is not None and str(picture).strip()) else existing.get("picture", "")
 
-    profile = {
-        "user_id": clean_email,
-        "email": clean_email,
-        "name": resolved_name,
-        "domain": domain,
-        "region": resolved_region,
-        "timezone": timezone_str or existing.get("timezone") or "UTC",
-        "auth_method": auth_method or existing.get("auth_method") or "google_workspace_signin",
-        "picture": resolved_picture,
-        "created_at": existing.get("created_at") or now_iso,
-        "last_login_at": now_iso,
-    }
-    users_map[clean_email] = profile
-    _save_tenant_users_map(users_map, changed_uid=clean_email)
-    return profile
+    return store.upsert_tenant_user(
+        user_id=clean_email,
+        email=clean_email,
+        name=resolved_name,
+        region=resolved_region,
+        timezone=timezone_str or existing.get("timezone") or "UTC",
+        auth_method=auth_method or existing.get("auth_method") or "google_workspace_signin",
+        picture=resolved_picture,
+        created_at=existing.get("created_at") or now_iso,
+        last_login_at=now_iso,
+    )
 
 
 _IDENTITY_RESOLVER = auth_guard.IdentityResolver(
@@ -1073,8 +758,9 @@ def resolve_authenticated_tenant_from_request(request: Request) -> Tuple[Optiona
     identity = resolve_request_identity(request)
     if identity is None:
         return None, False
+    store = auth_store.get_active_auth_store()
     if identity.source == "iap":
-        existing = _load_tenant_users_map().get(identity.user_id, {})
+        existing = store.get_tenant_user(identity.user_id) or {}
         claims = identity.claims or {}
         req_region = request.headers.get("X-PQC-User-Region")
         req_tz = request.headers.get("X-PQC-User-Timezone")
@@ -1094,7 +780,7 @@ def resolve_authenticated_tenant_from_request(request: Request) -> Tuple[Optiona
             picture=existing.get("picture") or claims.get("picture"),
         )
         return profile, True
-    profile = _load_tenant_users_map().get(identity.user_id)
+    profile = store.get_tenant_user(identity.user_id)
     if not profile:
         claims = identity.claims or {}
         profile = upsert_tenant_user_profile(
@@ -1151,63 +837,63 @@ def _record_turn_oauth_consent_card(card: Dict[str, Any]) -> None:
         cards.append(card)
 
 
-def _get_oauth_config_path() -> str:
-    return os.path.join(_get_data_dir(), "pqc_oauth_config.json")
-
-
 def load_oauth_client_config() -> Dict[str, Any]:
-    """Loads the Google OAuth 2.0 3LO Client configuration from `/data/pqc_oauth_config.json` or env vars."""
+    """Loads the Google OAuth 2.0 Client configuration from Secret Manager env vars and ``pqc_oauth_client_configs``."""
     cfg: Dict[str, Any] = {
-        "client_id": os.getenv("GOOGLE_OAUTH_CLIENT_ID", "").strip(),
-        "client_secret": os.getenv("GOOGLE_OAUTH_CLIENT_SECRET", "").strip(),
+        "client_id": (os.getenv("PQC_GOOGLE_OAUTH_CLIENT_ID") or os.getenv("GOOGLE_OAUTH_CLIENT_ID") or "").strip(),
+        "client_secret": (
+            os.getenv("PQC_GOOGLE_OAUTH_CLIENT_SECRET") or os.getenv("GOOGLE_OAUTH_CLIENT_SECRET") or ""
+        ).strip(),
         "authorization_endpoint": "https://accounts.google.com/o/oauth2/v2/auth",
         "token_endpoint": "https://oauth2.googleapis.com/token",
         "userinfo_endpoint": "https://openidconnect.googleapis.com/v1/userinfo",
         "scopes": list(GCP_OAUTH_SCOPES),
     }
-    path = _get_oauth_config_path()
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                saved = json.load(f)
-            if isinstance(saved, dict):
-                if saved.get("client_id"):
-                    cfg["client_id"] = str(saved["client_id"]).strip()
-                if saved.get("client_secret"):
-                    cfg["client_secret"] = str(saved["client_secret"]).strip()
-        except Exception:
-            pass
+    try:
+        saved = auth_store.get_active_auth_store().get_oauth_client_config_record("global")
+    except Exception:
+        saved = None
+    if isinstance(saved, dict):
+        if saved.get("client_id"):
+            cfg["client_id"] = str(saved["client_id"]).strip()
+        enc_secret = saved.get("encrypted_client_secret")
+        if enc_secret:
+            decrypted = credential_service.get_active_credential_service().decrypt_config_secret(
+                str(enc_secret), config_key="global"
+            )
+            if decrypted:
+                cfg["client_secret"] = decrypted
     return cfg
 
 
-def save_oauth_client_config(client_id: Optional[str] = None, client_secret: Optional[str] = None) -> Dict[str, Any]:
-    """Persists Google OAuth 2.0 Client ID (and optional Client Secret) in `/data/pqc_oauth_config.json`."""
+def save_oauth_client_config(
+    client_id: Optional[str] = None,
+    client_secret: Optional[str] = None,
+    *,
+    updated_by: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Persists Google OAuth 2.0 Client ID and envelope-encrypted Client Secret in ``pqc_oauth_client_configs``."""
     current = load_oauth_client_config()
-    if client_id is not None:
-        current["client_id"] = str(client_id).strip()
-        os.environ["GOOGLE_OAUTH_CLIENT_ID"] = current["client_id"]
+    next_client_id = str(client_id).strip() if client_id is not None else current["client_id"]
+    encrypted_secret: Optional[str] = None
+    next_secret_present = bool(current["client_secret"])
     if client_secret is not None:
-        current["client_secret"] = str(client_secret).strip()
-        os.environ["GOOGLE_OAUTH_CLIENT_SECRET"] = current["client_secret"]
-    path = _get_oauth_config_path()
-    try:
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "client_id": current["client_id"],
-                    "client_secret": current["client_secret"],
-                    "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                },
-                f,
-                ensure_ascii=False,
-                indent=2,
-            )
-    except OSError:
-        pass
+        clean_secret = str(client_secret).strip()
+        next_secret_present = bool(clean_secret)
+        encrypted_secret = (
+            credential_service.get_active_credential_service().encrypt_config_secret(clean_secret, config_key="global")
+            if clean_secret
+            else ""
+        )
+    auth_store.get_active_auth_store().save_oauth_client_config_record(
+        client_id=next_client_id,
+        encrypted_client_secret=encrypted_secret,
+        updated_by=updated_by,
+        config_key="global",
+    )
     return {
-        "client_id": current["client_id"],
-        "has_client_secret": bool(current["client_secret"]),
+        "client_id": next_client_id,
+        "has_client_secret": next_secret_present,
         "scopes": current["scopes"],
         "authorization_endpoint": current["authorization_endpoint"],
     }
@@ -1505,7 +1191,7 @@ class GoogleAuthSignInPayload(BaseModel):
     google_access_token: Optional[str] = None
     access_token: Optional[str] = None
     use_token_for_gcp_connection: bool = False
-    oauth_state: Optional[str] = None  # set by the OAuth popup (implicit flow); verified + bound to this browser
+    oauth_state: Optional[str] = None  # rejected if passed (legacy implicit flow disabled)
 
 
 class ToolConsentPayload(BaseModel):
@@ -1516,7 +1202,7 @@ class ToolConsentPayload(BaseModel):
     tool_name: Optional[str] = None
     target_scope: Optional[str] = None
     verify_with_google: bool = False
-    oauth_state: Optional[str] = None  # set by the OAuth popup (implicit flow); verified + bound to this browser
+    oauth_state: Optional[str] = None  # rejected if passed (legacy implicit flow disabled)
 
 
 class OAuthClientConfigPayload(BaseModel):
@@ -1551,9 +1237,10 @@ EMAIL_ONLY_SIGNIN_DISABLED_DETAIL = (
     "and paste the token in the sign-in dialog, or use 'Sign in with Google' when it is configured. "
     "(Email-only sign-in exists only for local development with PQC_ALLOW_UNVERIFIED_SIGNIN=true.)"
 )
+IMPLICIT_FLOW_DISABLED_DETAIL = (
+    "OAuth 2.0 Implicit Flow and token-bearing redirects are prohibited. Use Authorization Code Flow with PKCE."
+)
 _SENSITIVE_STATE_KEY_MARKERS = ("credential", "token", "secret")
-_USED_OAUTH_NONCES: Dict[str, float] = {}
-_USED_OAUTH_NONCES_LOCK = threading.Lock()
 
 
 def _adk_dev_ui_enabled() -> bool:
@@ -1581,53 +1268,34 @@ def _redact_session_state(state: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _consume_oauth_nonce(nonce: str) -> bool:
-    """Single-use OAuth state nonces (replays of a completed callback are rejected)."""
-    now = time.time()
-    with _USED_OAUTH_NONCES_LOCK:
-        for key, expires_at in list(_USED_OAUTH_NONCES.items()):
-            if expires_at < now:
-                del _USED_OAUTH_NONCES[key]
-        if nonce in _USED_OAUTH_NONCES:
-            return False
-        _USED_OAUTH_NONCES[nonce] = now + OAUTH_STATE_TTL_SECONDS
-        return True
-
-
-def _validate_oauth_state_for_request(request: Request, state_value: Optional[str]) -> Optional[Dict[str, Any]]:
-    """Verifies a signed OAuth `state`: HMAC + `typ` + expiry, nonce equal to this browser's nonce cookie, single use."""
-    decoded = verify_oauth_state(state_value)
-    if not decoded:
-        return None
-    cookie_nonce = request.cookies.get(OAUTH_NONCE_COOKIE_NAME) or ""
-    state_nonce = str(decoded.get("nonce") or "")
-    if not cookie_nonce or not state_nonce:
-        return None
-    if not hmac.compare_digest(cookie_nonce.encode("utf-8"), state_nonce.encode("utf-8")):
-        return None
-    if not _consume_oauth_nonce(state_nonce):
-        return None
-    return decoded
-
-
 def _exchange_oauth_code(
     code: str,
     redirect_uri: str,
     code_verifier: Optional[str] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """Exchanges an OAuth authorization code server-side with PKCE `code_verifier` (tokens never touch HTML)."""
+    """Exchanges an OAuth authorization code server-side with mandatory PKCE `code_verifier`.
+
+    Supports both confidential clients (`client_secret` configured) and public clients (PKCE `code_verifier` without
+    `client_secret`). Tokens never touch browser URLs or HTML.
+    """
     oauth_cfg = load_oauth_client_config()
+    client_id = (oauth_cfg.get("client_id") or "").strip()
+    client_secret = (oauth_cfg.get("client_secret") or "").strip()
     effective_verifier = (code_verifier if code_verifier is not None else _ACTIVE_PKCE_VERIFIER.get()) or ""
+    if not client_id:
+        return None, "OAuth code exchange failed: OAuth client_id is not configured."
+    if not effective_verifier:
+        return None, "OAuth code exchange failed: missing server-side PKCE code_verifier."
     try:
         form_params: Dict[str, str] = {
             "code": code,
-            "client_id": oauth_cfg.get("client_id", ""),
-            "client_secret": oauth_cfg.get("client_secret", ""),
+            "client_id": client_id,
             "redirect_uri": redirect_uri,
             "grant_type": "authorization_code",
+            "code_verifier": effective_verifier,
         }
-        if effective_verifier:
-            form_params["code_verifier"] = effective_verifier
+        if client_secret:
+            form_params["client_secret"] = client_secret
         form_data = urllib.parse.urlencode(form_params).encode("utf-8")
         req = urllib.request.Request(
             oauth_cfg["token_endpoint"],
@@ -1643,13 +1311,28 @@ def _exchange_oauth_code(
     return tok_data, None
 
 
-def _bind_delegated_gcp_token(uid: str, access_token: str, expires_in: Optional[Any] = None) -> Dict[str, Any]:
-    """Binds a delegated OAuth access token to `uid`'s gcloud/GCP connection (process memory only)."""
+def _bind_delegated_gcp_token(
+    uid: str,
+    access_token: str,
+    expires_in: Optional[Any] = None,
+    *,
+    refresh_token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Binds a delegated OAuth access/refresh token to ``uid`` via envelope-encrypted database storage."""
     try:
         ttl = float(expires_in) if expires_in else None
     except (TypeError, ValueError):
         ttl = None
-    return set_gcp_connection_config(mode="access_token", access_token=access_token, user_id=uid, access_token_expires_in=ttl)
+    oauth_cfg = load_oauth_client_config()
+    return set_gcp_connection_config(
+        mode="access_token",
+        access_token=access_token,
+        user_id=uid,
+        access_token_expires_in=ttl,
+        refresh_token=refresh_token,
+        oauth_client_id=oauth_cfg.get("client_id") or None,
+        oauth_client_secret=oauth_cfg.get("client_secret") or None,
+    )
 
 
 _FORBIDDEN_POPUP_PAYLOAD_KEYS = frozenset({
@@ -1696,80 +1379,6 @@ def _oauth_popup_result_html(message_type: str, payload: Mapping[str, Any], mess
     {close_js}
   }}
 }})();
-</script></body></html>"""
-
-
-# Implicit OAuth flow (no client secret configured): Google returns the token and `state` in the URL fragment, which
-# only the browser sees. This static page forwards both to the API (state verified server-side) and reports completion
-# (never tokens/credentials) to the same-origin opener.
-_OAUTH_IMPLICIT_CALLBACK_HTML = """<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>PQC Workspace - completing Google authorization</title></head>
-<body style="background:#0b0f17;color:#e2e8f0;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;">
-<div id="msg" style="max-width:480px;text-align:center;line-height:1.5;">Completing Google authorization...</div>
-<script>
-(async function () {
-  var msg = document.getElementById('msg');
-  var params = new URLSearchParams(window.location.hash.replace(/^#/, ''));
-  try { history.replaceState(null, '', window.location.pathname); } catch (e) {}
-  var accessToken = params.get('access_token') || '';
-  var state = params.get('state') || '';
-  var error = params.get('error') || '';
-  var statePayload = {};
-  try {
-    var b64 = (state.split('.')[0] || '').replace(/-/g, '+').replace(/_/g, '/');
-    b64 += '='.repeat((4 - (b64.length % 4)) % 4);
-    statePayload = JSON.parse(atob(b64)) || {};
-  } catch (e) { statePayload = {}; }
-  var mode = statePayload.mode === 'signin' ? 'signin' : '3lo';
-  var type = mode === 'signin' ? 'PQC_SIGNIN_COMPLETE' : 'PQC_OAUTH_3LO_AUTHORIZED';
-  function getCookie(name) {
-    var match = document.cookie.match(new RegExp('(?:^|; )' + name.replace(/([.$?*|{}()\\[\\]\\\\/+^])/g, '\\\\$1') + '=([^;]*)'));
-    return match ? decodeURIComponent(match[1]) : '';
-  }
-  function sanitizeCompletionPayload(raw) {
-    var copy = Object.assign({}, raw || {});
-    delete copy.token;
-    delete copy.csrf_token;
-    delete copy.access_token;
-    delete copy.google_access_token;
-    delete copy.id_token;
-    delete copy.refresh_token;
-    delete copy.credential;
-    delete copy.code;
-    return copy;
-  }
-  function finish(ok, payload, text) {
-    msg.textContent = text;
-    msg.style.color = ok ? '#81c995' : '#f87171';
-    if (window.opener) {
-      window.opener.postMessage({ type: type, payload: sanitizeCompletionPayload(payload) }, window.location.origin);
-      if (ok) { setTimeout(function () { window.close(); }, 400); }
-    }
-  }
-  if (error || !accessToken || !state) {
-    finish(false, { authenticated: false, error: error || 'missing access_token or state' }, 'Authorization did not complete: ' + (error || 'missing access_token or state'));
-    return;
-  }
-  var headers = { 'Content-Type': 'application/json' };
-  var csrfToken = getCookie('pqc_csrf_token');
-  if (csrfToken) { headers['X-PQC-CSRF-Token'] = csrfToken; }
-  var url = mode === 'signin' ? '/api/auth/google' : '/api/auth/tool-consent';
-  var body = mode === 'signin'
-    ? { google_access_token: accessToken, oauth_state: state, region: statePayload.region || undefined, timezone: statePayload.timezone || undefined, use_token_for_gcp_connection: false }
-    : { access_token: accessToken, oauth_state: state, session_id: statePayload.session_id || undefined, target_scope: statePayload.target_scope || undefined };
-  try {
-    var res = await fetch(url, { method: 'POST', credentials: 'same-origin', headers: headers, body: JSON.stringify(body) });
-    var data = {};
-    try { data = await res.json(); } catch (e) { data = {}; }
-    if (!res.ok) {
-      finish(false, Object.assign({ authenticated: false }, data), 'Authorization failed: ' + (data.detail || ('HTTP ' + res.status)));
-      return;
-    }
-    finish(true, data, mode === 'signin' ? 'Signed in. You can close this window.' : 'Authorized. You can close this window.');
-  } catch (e) {
-    finish(false, { authenticated: false, error: String(e) }, 'Authorization error: ' + e);
-  }
-})();
 </script></body></html>"""
 
 
@@ -1952,25 +1561,40 @@ def create_workspace_app(
     artifact_bucket: Optional[str] = None,
     model_registry: Optional[ModelRegistry] = None,
     verify_models_on_startup: Optional[bool] = None,
+    kms_client: Optional[Any] = None,
 ) -> FastAPI:
     """Creates the FastAPI server: the portal at `GET /`, `/api/*` (identity-bound), and ADK's native routes.
 
-    ADK-native REST routes and the ADK DevServer (`/dev-ui`, `/dev/apps/*`) are disabled on Cloud Run unless
-    PQC_ENABLE_ADK_API / PQC_ENABLE_ADK_DEV_UI say otherwise; when enabled they require an authenticated identity.
+    Production fails closed unless PostgreSQL is configured and reachable. ADK-native REST routes and the ADK DevServer
+    (`/dev-ui`, `/dev/apps/*`) are disabled on Cloud Run unless PQC_ENABLE_ADK_API / PQC_ENABLE_ADK_DEV_UI say otherwise.
     """
-    resolved_db_url = _normalize_sqlite_db_url(session_db_url or os.getenv("SESSION_DB_URL", DEFAULT_SESSION_DB_URL))
-    resolved_bucket = (artifact_bucket or DEFAULT_STAGING_BUCKET).replace("gs://", "").strip("/")
+    resolved_db_url = auth_store.resolve_configured_database_url(session_db_url, async_driver=True)
+    raw_bucket = (
+        artifact_bucket
+        if artifact_bucket is not None
+        else os.getenv("PQC_ARTIFACT_BUCKET", os.getenv("PQC_EXPORT_GCS_BUCKET", DEFAULT_STAGING_BUCKET))
+    )
+    resolved_bucket = (raw_bucket or "").replace("gs://", "").strip("/")
 
-    session_service = DatabaseSessionService(db_url=resolved_db_url)
+    # Fail closed in production if HMAC secret is missing or weak before accepting traffic
+    if auth_guard.is_production_environment():
+        _get_auth_secret()
+
+    instance_auth_store = auth_store.DistributedAuthStore(resolved_db_url)
+    instance_credential_service = credential_service.EncryptedDatabaseCredentialService(
+        store=instance_auth_store,
+        kms_client=kms_client,
+    )
+    engine_kwargs = auth_store.build_async_engine_kwargs(resolved_db_url)
+    session_service = ManagedSchemaDatabaseSessionService(db_url=resolved_db_url, **engine_kwargs)
     artifact_service = ResilientGcsArtifactService(bucket_name=resolved_bucket)
-    # Delegated OAuth credentials stay in process memory: SessionStateCredentialService would store user tokens in
-    # clear text in the session DB on /data (a GCS bucket on Cloud Run) and echo them through session reads.
-    credential_service = InMemoryCredentialService()
     registry_obj = model_registry or ModelRegistry()
 
     registry = get_service_registry()
     registry.register_session_service("sqlite", lambda uri, **kw: session_service)
     registry.register_session_service("sqlite+aiosqlite", lambda uri, **kw: session_service)
+    registry.register_session_service("postgresql", lambda uri, **kw: session_service)
+    registry.register_session_service("postgresql+asyncpg", lambda uri, **kw: session_service)
     registry.register_artifact_service("gs", lambda uri, **kw: artifact_service)
 
     project_root = str(Path(__file__).resolve().parent.parent)
@@ -1989,7 +1613,7 @@ def create_workspace_app(
         app.router.routes = [
             r for r in app.router.routes if not str(getattr(r, "path", "")).startswith(("/dev/", "/dev-ui"))
         ]
-    # Outermost middleware: every non-portal (ADK-native) route is 404 unless enabled, then identity-bound.
+    # Guard every non-portal (ADK-native) route: 404 unless enabled, then identity-bound.
     app.add_middleware(
         auth_guard.AdkRouteGuardMiddleware,
         resolver=resolve_request_identity,
@@ -2009,6 +1633,34 @@ def create_workspace_app(
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         return response
 
+    class _AuthStoreContextMiddleware:
+        """Binds this FastAPI instance's independent `DistributedAuthStore` & `EncryptedDatabaseCredentialService`."""
+
+        def __init__(
+            self,
+            inner_app: Any,
+            *,
+            store: auth_store.DistributedAuthStore,
+            cred_svc: credential_service.EncryptedDatabaseCredentialService,
+        ) -> None:
+            self.app = inner_app
+            self._store = store
+            self._cred_svc = cred_svc
+
+        async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+            if scope.get("type") not in ("http", "websocket"):
+                await self.app(scope, receive, send)
+                return
+            store_tok = auth_store.set_active_auth_store(self._store)
+            cred_tok = credential_service.set_active_credential_service(self._cred_svc)
+            try:
+                await self.app(scope, receive, send)
+            finally:
+                credential_service.reset_active_credential_service(cred_tok)
+                auth_store.reset_active_auth_store(store_tok)
+
+    app.add_middleware(_AuthStoreContextMiddleware, store=instance_auth_store, cred_svc=instance_credential_service)
+
     if auth_guard.allow_unverified_signin():
         logger.warning(
             "PQC_ALLOW_UNVERIFIED_SIGNIN=true: email-only sign-in is ENABLED (development only)%s.",
@@ -2018,10 +1670,11 @@ def create_workspace_app(
     app.state.adk_dev_ui_enabled = dev_ui_on
     app.state.adk_api_enabled = adk_api_on
     app.state.cors_allowed_origins = list(cors_origins or [])
+    app.state.auth_store = instance_auth_store
     app.state.session_service = session_service
     app.state.artifact_service = artifact_service
-    app.state.credential_service = credential_service
-    app.state.session_db_url = resolved_db_url
+    app.state.credential_service = instance_credential_service
+    app.state.session_db_url = auth_store.redact_db_url(resolved_db_url)
     app.state.artifact_bucket = resolved_bucket
     app.state.model_registry = registry_obj
 
@@ -2073,7 +1726,7 @@ def create_workspace_app(
                 ),
                 session_service=session_service,
                 artifact_service=artifact_service,
-                credential_service=credential_service,
+                credential_service=instance_credential_service,
                 auto_create_session=True,
             )
         return runners_by_key[cache_key]
@@ -2129,10 +1782,11 @@ def create_workspace_app(
         return (request.headers.get("x-forwarded-proto") or request.url.scheme).split(",")[0].strip() == "https"
 
     def _load_account_jar(request: Request) -> Dict[str, str]:
+        """Returns `{email: session_jti}` from the signed HttpOnly account jar cookie (contains no bearer tokens)."""
         raw = request.cookies.get(ACCOUNT_JAR_COOKIE_NAME)
         if not raw:
             return {}
-        decoded = auth_guard.verify_signed_payload(raw, _get_auth_secret(), expected_type="account_jar")
+        decoded = auth_guard.verify_signed_payload(raw, _get_auth_secret(), expected_type="account_jar_v2")
         if not decoded or not isinstance(decoded.get("accounts"), dict):
             return {}
         return {normalize_user_id(k): str(v) for k, v in decoded["accounts"].items() if k and v}
@@ -2141,7 +1795,7 @@ def create_workspace_app(
         now_ts = int(time.time())
         clean_jar = {normalize_user_id(k): str(v) for idx, (k, v) in enumerate(jar.items()) if k and v and idx < 5}
         signed_jar = auth_guard.sign_payload(
-            {"typ": "account_jar", "accounts": clean_jar, "iat": now_ts, "exp": now_ts + SESSION_TOKEN_TTL_SECONDS},
+            {"typ": "account_jar_v2", "accounts": clean_jar, "iat": now_ts, "exp": now_ts + SESSION_TOKEN_TTL_SECONDS},
             _get_auth_secret(),
         )
         resp.set_cookie(
@@ -2161,9 +1815,9 @@ def create_workspace_app(
             if prev_cookie and prev_cookie != token:
                 prev_decoded = verify_tenant_session_token(prev_cookie)
                 # Revoke unauthenticated/invalid pre-planted cookies or explicit rotation requests;
-                # preserve valid tokens of other accounts in the multi-account switcher jar.
+                # preserve valid sessions of other accounts in the multi-account switcher jar.
                 if prev_decoded is None or request.headers.get("X-PQC-Rotate-Session") == "1":
-                    revoke_tenant_session_token(prev_cookie)
+                    revoke_tenant_session_token(prev_cookie, reason="session_rotation")
         sec = _is_https(request)
         resp.set_cookie(
             key=SESSION_COOKIE_NAME,
@@ -2184,27 +1838,66 @@ def create_workspace_app(
             secure=sec,
             path="/",
         )
-        if decoded and decoded.get("email"):
+        if decoded and decoded.get("email") and decoded.get("jti"):
             jar = _load_account_jar(request)
-            jar[normalize_user_id(decoded["email"])] = token
+            jar[normalize_user_id(decoded["email"])] = str(decoded["jti"])
             _save_account_jar(resp, request, jar)
 
-    def _set_oauth_nonce_cookie(resp: Any, request: Request, nonce: str) -> None:
-        # Binds the OAuth `state` to this browser (login-CSRF / token-injection protection).
+    def _set_oauth_nonce_cookie(resp: Any, request: Request, binding_token: str) -> None:
+        # Binds the server-side OAuth transaction to this browser via SHA-256 hash comparison.
         resp.set_cookie(
             key=OAUTH_NONCE_COOKIE_NAME,
-            value=nonce,
-            max_age=OAUTH_STATE_TTL_SECONDS,
+            value=binding_token,
+            max_age=_oauth_ttl_seconds(),
             httponly=True,
             samesite="lax",
             secure=_is_https(request),
             path="/api/auth",
         )
 
+    def _allowed_oauth_redirect_uris() -> Tuple[str, ...]:
+        raw = (os.getenv("PQC_OAUTH_REDIRECT_URIS") or "").strip()
+        if not raw:
+            return ()
+        uris: List[str] = []
+        for item in raw.split(","):
+            cleaned = item.strip()
+            if cleaned and "*" not in cleaned and cleaned.startswith(("https://", "http://")):
+                if auth_guard.is_production_environment() and not cleaned.startswith("https://"):
+                    continue
+                if cleaned not in uris:
+                    uris.append(cleaned)
+        return tuple(uris)
+
     def _oauth_callback_uri(request: Request) -> str:
-        proto = (request.headers.get("x-forwarded-proto") or request.url.scheme).split(",")[0].strip()
-        host = request.headers.get("host") or request.url.netloc
+        proto = (request.headers.get("x-forwarded-proto") or request.url.scheme).split(",")[0].strip().lower()
+        if auth_guard.is_production_environment():
+            proto = "https"
+        host = (request.headers.get("host") or request.url.netloc).strip()
         return f"{proto}://{host}/api/auth/oauth/callback"
+
+    def _validate_oauth_redirect_uri(request: Request, explicit_redirect_uri: Optional[str]) -> str:
+        cb_uri = _oauth_callback_uri(request)
+        allowlist = _allowed_oauth_redirect_uris()
+        if allowlist and cb_uri not in allowlist:
+            raise HTTPException(status_code=400, detail="Callback redirect_uri is not in PQC_OAUTH_REDIRECT_URIS allowlist.")
+        if explicit_redirect_uri and explicit_redirect_uri.strip() != cb_uri:
+            raise HTTPException(status_code=400, detail="Redirect URI mismatch: open redirects are not permitted.")
+        if auth_guard.is_production_environment() and not cb_uri.startswith("https://"):
+            raise HTTPException(status_code=400, detail="HTTPS redirect_uri is required in production.")
+        return cb_uri
+
+    def _oauth_ttl_seconds() -> int:
+        try:
+            return max(
+                auth_store.MIN_OAUTH_TRANSACTION_TTL_SECONDS,
+                min(
+                    int(os.getenv("PQC_OAUTH_STATE_TTL_SECONDS", str(OAUTH_STATE_TTL_SECONDS))),
+                    auth_store.MAX_OAUTH_TRANSACTION_TTL_SECONDS,
+                ),
+            )
+        except ValueError:
+            return OAUTH_STATE_TTL_SECONDS
 
     def _allowed_popup_origins(request: Request) -> List[str]:
         origins: List[str] = []
@@ -2239,6 +1932,7 @@ def create_workspace_app(
             "google_oauth_client_id": client_id if gis_js_enabled else "",
             "gis_javascript_origin_enabled": bool(client_id and gis_js_enabled),
             "oauth_signin_url": "/api/auth/oauth/signin" if client_id else None,
+            "oauth_flow": "authorization_code_pkce_s256",
             "access_token_command": "gcloud auth print-access-token",
             "allowed_domains": list(ALLOWED_AUTH_DOMAINS),
             "supported_regions": SUPPORTED_REGIONS,
@@ -2257,6 +1951,7 @@ def create_workspace_app(
         gcp_access_token: Optional[str] = None,
         gcp_access_token_expires_in: Optional[Any] = None,
     ) -> Tuple[Dict[str, Any], str]:
+        """Creates/updates the tenant profile, mints an HttpOnly session token, and returns token-free JSON."""
         profile = upsert_tenant_user_profile(
             email=email,
             name=name,
@@ -2276,7 +1971,6 @@ def create_workspace_app(
             "authenticated": True,
             "user": profile,
             "user_id": uid,
-            "token": signed_token,
             "csrf_token": csrf_token,
             "session_count": len(sess_resp.sessions),
             "connection": get_gcp_connection_config(mask_token=True, user_id=uid),
@@ -2309,11 +2003,18 @@ def create_workspace_app(
     @app.get("/api/health")
     async def api_health(request: Request) -> Dict[str, Any]:
         """Public status endpoint. Never activates a tenant from request parameters; connection only when signed in."""
+        db_healthy = True
+        try:
+            with instance_auth_store._session_factory() as db_probe:
+                db_probe.execute(auth_store.text("SELECT 1"))
+        except Exception:
+            db_healthy = False
         identity = resolve_request_identity(request)
         catalog = registry_obj.catalog()
         oauth_cfg = load_oauth_client_config()
         return {
-            "status": "HEALTHY",
+            "status": "HEALTHY" if db_healthy else "DEGRADED",
+            "database_healthy": db_healthy,
             "app_name": APP_NAME,
             "multi_tenant_enabled": True,
             "oauth_3lo_enabled": True,
@@ -2323,11 +2024,11 @@ def create_workspace_app(
             "supported_regions": [r["id"] for r in SUPPORTED_REGIONS],
             "allowed_auth_domains": list(ALLOWED_AUTH_DOMAINS),
             "session_service": type(session_service).__name__,
-            "session_db_url": resolved_db_url,
+            "session_db_url": auth_store.redact_db_url(resolved_db_url),
             "artifact_service": type(artifact_service).__name__,
             "artifact_bucket": f"gs://{resolved_bucket}",
-            "credential_service": type(credential_service).__name__,
-            "connection": get_gcp_connection_config(mask_token=True, user_id=identity.user_id) if identity else None,
+            "credential_service": type(instance_credential_service).__name__,
+            "connection": get_gcp_connection_config(mask_token=True, user_id=identity.user_id) if (identity and db_healthy) else None,
             "simulation_mode": os.getenv("PQC_SIMULATION_MODE", "FALSE"),
             "verified_models": [m["id"] for m in catalog["models"]],
             "model_verification": catalog["verification"],
@@ -2352,15 +2053,11 @@ def create_workspace_app(
         uid = profile["user_id"] if profile else None
         conn: Optional[Dict[str, Any]] = None
         session_count = 0
-        signed_token: Optional[str] = None
         csrf_token: Optional[str] = None
         if uid and profile:
             set_current_tenant_user(uid)
-            if identity and identity.source == "session_token" and identity.raw_token:
-                signed_token = identity.raw_token
-            else:
-                signed_token = sign_tenant_session_token(profile)
-            csrf_token = auth_guard.derive_csrf_token(signed_token, _get_auth_secret())
+            if identity and identity.raw_token:
+                csrf_token = auth_guard.derive_csrf_token(identity.raw_token, _get_auth_secret())
             conn = get_gcp_connection_config(mask_token=True, user_id=uid)
             if conn.get("mode") == "access_token" and not conn.get("has_access_token") and _is_builtin_demo_scope(None, conn):
                 conn = set_gcp_connection_config(mode="adc", user_id=uid)
@@ -2384,13 +2081,12 @@ def create_workspace_app(
                 "supported_regions": SUPPORTED_REGIONS,
                 "user": profile,
                 "user_id": uid,
-                "token": signed_token,
                 "csrf_token": csrf_token,
                 "session_count": session_count,
                 "connection": conn,
             }
         )
-        if signed_token and csrf_token:
+        if csrf_token and identity and identity.source == "session_token":
             resp.set_cookie(
                 key=auth_guard.CSRF_COOKIE_NAME,
                 value=csrf_token,
@@ -2404,18 +2100,12 @@ def create_workspace_app(
 
     @app.post("/api/auth/google")
     async def auth_google_signin(request: Request, payload: GoogleAuthSignInPayload) -> JSONResponse:
-        """Signs a user in from a VERIFIED Google credential and sets a signed 30-day session cookie.
+        """Signs a user in from a VERIFIED Google credential and sets an HttpOnly, Secure 30-day session cookie.
 
-        Accepted credentials: a Google ID token (`credential` / `id_token`), a Google OAuth access token
-        (`google_access_token`, e.g. `gcloud auth print-access-token`), or an already-verified Cloud IAP / signed
-        session identity on the request. The email must belong to ALLOWED_AUTH_DOMAINS (403 otherwise). Email-only
-        sign-in without a verified identity returns 401 unless PQC_ALLOW_UNVERIFIED_SIGNIN=true (local dev only).
+        No reusable session token is ever returned in the JSON response body.
         """
-        st: Optional[Dict[str, Any]] = None
         if payload.oauth_state is not None:
-            st = _validate_oauth_state_for_request(request, payload.oauth_state)
-            if not st or st.get("mode") != "signin":
-                raise HTTPException(status_code=400, detail="Invalid or expired OAuth state. Start the sign-in again.")
+            raise HTTPException(status_code=400, detail=IMPLICIT_FLOW_DISABLED_DETAIL)
         id_jwt = (payload.credential or payload.id_token or "").strip() or None
         access_tok = (payload.google_access_token or payload.access_token or "").strip() or None
         if access_tok and access_tok.lower().startswith("bearer "):
@@ -2425,16 +2115,10 @@ def create_workspace_app(
         _enforce_csrf_and_origin(
             request,
             existing_identity,
-            require_csrf_for_cookie=bool(
-                existing_identity is not None and not id_jwt and not access_tok and payload.oauth_state is None
-            ),
+            require_csrf_for_cookie=bool(existing_identity is not None and not id_jwt and not access_tok),
         )
         if id_jwt or access_tok:
-            nonce_token = _ACTIVE_OIDC_NONCE.set((st or {}).get("oidc_nonce"))
-            try:
-                verified_info, err_msg = await asyncio.to_thread(_verify_google_oauth_or_id_token, id_jwt, access_tok)
-            finally:
-                _ACTIVE_OIDC_NONCE.reset(nonce_token)
+            verified_info, err_msg = await asyncio.to_thread(_verify_google_oauth_or_id_token, id_jwt, access_tok)
             status_code, email_or_err = _validated_google_identity(verified_info, err_msg)
             if status_code != 200:
                 raise HTTPException(status_code=status_code, detail=email_or_err)
@@ -2456,7 +2140,7 @@ def create_workspace_app(
                         detail=f"Authenticated as {existing_identity.email}; use Switch Account to sign in as {norm_req}.",
                     )
             target_email = existing_identity.email
-            existing_prof = _load_tenant_users_map().get(existing_identity.user_id, {})
+            existing_prof = auth_store.get_active_auth_store().get_tenant_user(existing_identity.user_id) or {}
             display_name = payload.name or existing_prof.get("name") or (existing_identity.claims or {}).get("name")
             auth_method = "cloud_iap" if existing_identity.source == "iap" else (existing_prof.get("auth_method") or "google_workspace_signin")
             picture = existing_prof.get("picture") or (existing_identity.claims or {}).get("picture")
@@ -2492,25 +2176,33 @@ def create_workspace_app(
         _enforce_csrf_and_origin(request, identity)
         cookie_tok = request.cookies.get(SESSION_COOKIE_NAME)
         if cookie_tok:
-            revoke_tenant_session_token(cookie_tok)
+            revoke_tenant_session_token(cookie_tok, reason="logout")
         if identity is not None:
             if identity.raw_token and identity.source == "session_token":
-                revoke_tenant_session_token(identity.raw_token)
+                revoke_tenant_session_token(identity.raw_token, reason="logout")
+            if identity.claims and identity.claims.get("jti"):
+                auth_store.get_active_auth_store().revoke_session(
+                    jti=str(identity.claims["jti"]), user_id=identity.user_id, reason="logout"
+                )
             clear_user_access_token(identity.user_id)
+        sec = _is_https(request)
         resp = JSONResponse(content={"authenticated": False, "status": "logged_out"})
-        resp.delete_cookie(key=SESSION_COOKIE_NAME, path="/")
-        resp.delete_cookie(key=auth_guard.CSRF_COOKIE_NAME, path="/")
+        resp.delete_cookie(key=SESSION_COOKIE_NAME, path="/", secure=sec, httponly=True, samesite="lax")
+        resp.delete_cookie(key=auth_guard.CSRF_COOKIE_NAME, path="/", secure=sec, httponly=False, samesite="lax")
         if identity is not None:
             jar = _load_account_jar(request)
-            if identity.user_id in jar:
-                del jar[identity.user_id]
-                _save_account_jar(resp, request, jar)
+            jar_jti = jar.pop(identity.user_id, None)
+            if jar_jti:
+                auth_store.get_active_auth_store().revoke_session(
+                    jti=jar_jti, user_id=identity.user_id, reason="logout_jar"
+                )
+            _save_account_jar(resp, request, jar)
         return resp
 
     @app.post("/api/auth/auto")
     async def auth_auto_signin(request: Request) -> JSONResponse:
-        """Automatic zero-typing sign-in: restores an existing verified session/IAP identity or, on a local
-        workstation when `PQC_AUTO_WORKSTATION_GCLOUD_AUTH=true`, verifies the active `gcloud` identity with Google.
+        """Automatic zero-typing sign-in: restores an existing verified session/IAP identity without invalidating
+        concurrent browser tabs, or verifies active `gcloud` workstation identity when explicitly opted in.
         """
         identity = resolve_request_identity(request)
         _enforce_csrf_and_origin(request, identity, require_csrf_for_cookie=False)
@@ -2518,7 +2210,12 @@ def create_workspace_app(
         if profile is not None:
             uid = profile["user_id"]
             set_current_tenant_user(uid)
-            signed_token = sign_tenant_session_token(profile)
+            if identity and identity.source == "session_token" and identity.raw_token:
+                signed_token = identity.raw_token
+                reused_existing = True
+            else:
+                signed_token = sign_tenant_session_token(profile)
+                reused_existing = False
             csrf_token = auth_guard.derive_csrf_token(signed_token, _get_auth_secret())
             conn = get_gcp_connection_config(mask_token=True, user_id=uid)
             if conn.get("mode") == "access_token" and not conn.get("has_access_token") and _is_builtin_demo_scope(None, conn):
@@ -2530,14 +2227,13 @@ def create_workspace_app(
                     "iap_active": iap_active,
                     "user": profile,
                     "user_id": uid,
-                    "token": signed_token,
                     "csrf_token": csrf_token,
                     "session_count": len(sess_resp.sessions),
                     "connection": conn,
                     "supported_regions": SUPPORTED_REGIONS,
                 }
             )
-            _set_session_cookie(resp, request, signed_token, rotate_previous=True)
+            _set_session_cookie(resp, request, signed_token, rotate_previous=not reused_existing)
             return resp
 
         auto_tok = await asyncio.to_thread(_try_workstation_auto_gcloud_token)
@@ -2566,37 +2262,49 @@ def create_workspace_app(
             body = await request.json()
         except Exception:
             body = {}
+        if (body or {}).get("token"):
+            raise HTTPException(
+                status_code=400,
+                detail="Session bearer tokens are prohibited in JSON payloads; account switching uses HttpOnly cookies.",
+            )
         identity = resolve_request_identity(request)
-        candidate_token = str((body or {}).get("token") or "").strip()
-        target_email_req = normalize_user_id((body or {}).get("email") or "")
-        _enforce_csrf_and_origin(request, identity, require_csrf_for_cookie=not bool(candidate_token))
-        if not candidate_token and target_email_req:
+        _enforce_csrf_and_origin(
+            request,
+            identity,
+            require_csrf_for_cookie=bool(identity is not None and identity.auth_transport == "cookie"),
+        )
+        raw_email_req = str((body or {}).get("email") or "").strip()
+        target_email_req = normalize_user_id(raw_email_req) if raw_email_req else ""
+        store = auth_store.get_active_auth_store()
+        decoded: Optional[Dict[str, Any]] = None
+        if target_email_req:
             jar = _load_account_jar(request)
-            candidate_token = jar.get(target_email_req, "")
-        decoded = verify_tenant_session_token(candidate_token) if candidate_token else None
+            candidate_jti = jar.get(target_email_req, "")
+            if candidate_jti:
+                decoded = store.get_active_session_by_jti(candidate_jti, expected_user_id=target_email_req)
         if not decoded:
-            if identity and identity.source == "iap":
-                existing = _load_tenant_users_map().get(identity.user_id, {})
+            if identity and identity.source == "iap" and (not target_email_req or target_email_req == identity.email):
+                existing = store.get_tenant_user(identity.user_id) or {}
                 decoded = {
                     "email": identity.email,
-                    "uid": identity.user_id,
-                    "name": existing.get("name"),
+                    "user_id": identity.user_id,
                     "region": existing.get("region"),
                     "auth_method": "cloud_iap",
-                    "picture": existing.get("picture"),
                 }
             elif identity and (not target_email_req or target_email_req == identity.email):
                 decoded = dict(identity.claims or {"email": identity.email, "uid": identity.user_id})
             else:
-                raise HTTPException(status_code=401, detail="Saved account session has expired. Please sign in again.")
-        email = normalize_user_id(decoded.get("email") or decoded.get("uid"))
+                raise HTTPException(status_code=401, detail="Saved account session has expired or been revoked. Please sign in again.")
+
+        email = normalize_user_id(decoded.get("email") or decoded.get("user_id") or decoded.get("uid"))
+        existing_prof = store.get_tenant_user(email) or {}
         profile = upsert_tenant_user_profile(
             email=email,
-            name=decoded.get("name"),
-            region=(body or {}).get("region") or decoded.get("region"),
+            name=existing_prof.get("name") or decoded.get("name"),
+            region=(body or {}).get("region") or existing_prof.get("region") or decoded.get("region"),
             timezone_str=(body or {}).get("timezone") or request.headers.get("X-PQC-User-Timezone"),
-            auth_method=decoded.get("auth_method") or "google_workspace_signin",
-            picture=decoded.get("picture"),
+            auth_method=decoded.get("auth_method") or existing_prof.get("auth_method") or "google_workspace_signin",
+            picture=existing_prof.get("picture") or decoded.get("picture"),
         )
         uid = profile["user_id"]
         set_current_tenant_user(uid)
@@ -2607,7 +2315,6 @@ def create_workspace_app(
             "authenticated": True,
             "user": profile,
             "user_id": uid,
-            "token": fresh_token,
             "csrf_token": csrf_token,
             "session_count": len(sess_resp.sessions),
             "connection": get_gcp_connection_config(mask_token=True, user_id=uid),
@@ -2621,8 +2328,7 @@ def create_workspace_app(
     async def list_registered_tenants(request: Request) -> Dict[str, Any]:
         """Tenant directory: aggregate counts for signed-in users; individual profiles only for admins."""
         identity = _require_identity(request)
-        users_map = _load_tenant_users_map()
-        tenants = sorted(users_map.values(), key=lambda u: u.get("last_login_at", ""), reverse=True)
+        tenants = auth_store.get_active_auth_store().list_tenant_users()
         by_region: Dict[str, int] = {}
         for t in tenants:
             reg = t.get("region", "NorthAm")
@@ -2660,7 +2366,11 @@ def create_workspace_app(
                 status_code=403,
                 detail="Only portal administrators (PQC_ADMIN_EMAILS) can change the OAuth client configuration.",
             )
-        return save_oauth_client_config(client_id=payload.client_id, client_secret=payload.client_secret)
+        return save_oauth_client_config(
+            client_id=payload.client_id,
+            client_secret=payload.client_secret,
+            updated_by=identity.user_id,
+        )
 
     @app.get("/api/auth/bridge", response_class=HTMLResponse)
     async def oauth_google_bridge_endpoint(
@@ -2668,7 +2378,7 @@ def create_workspace_app(
         origin: Optional[str] = Query(default=None),
         target_origin: Optional[str] = Query(default=None),
     ) -> HTMLResponse:
-        """Public Verified Google Identity Bridge popup for allowlisted origins only (no wildcard postMessage)."""
+        """Public Verified Google Identity Bridge popup for allowlisted origins only (Authorization Code + PKCE)."""
         allowed_origins = _allowed_popup_origins(request)
         raw_origin = (origin or target_origin or "").strip().rstrip("/").lower()
         if raw_origin:
@@ -2681,7 +2391,8 @@ def create_workspace_app(
         else:
             resolved_origin = _request_origin(request)
         oauth_cfg = load_oauth_client_config()
-        client_id = oauth_cfg.get("client_id", "")
+        gis_js_enabled = auth_guard.env_flag("PQC_ENABLE_GIS_JAVASCRIPT_CLIENT") is True
+        client_id = oauth_cfg.get("client_id", "") if gis_js_enabled else ""
         bridge_html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2703,11 +2414,11 @@ def create_workspace_app(
 </head>
 <body>
 <div class="card">
-  <span class="badge">Google Cloud Identity-Aware Proxy (IAP)</span>
+  <span class="badge">Google Cloud OIDC • Authorization Code + PKCE</span>
   <h2>Sign in with Google</h2>
   <p>Select your verified <b>@google.com</b> or <b>@jsaccomani.altostrat.com</b> account to continue.</p>
   <div id="gisSlot" class="slot"></div>
-  <button type="button" class="btn" onclick="openChooser()">Authorize Google OAuth Token (@google.com)</button>
+  <button type="button" class="btn" onclick="startPkceFlow()">Continue with Google OAuth 2.0 (PKCE)</button>
   <div id="errBox" class="err"></div>
 </div>
 <script>
@@ -2742,28 +2453,12 @@ function showErr(m) {{
   el.textContent = m;
   el.style.display = 'block';
 }}
-function openChooser() {{
-  if (!window.google || !window.google.accounts || !window.google.accounts.oauth2) {{
-    showErr('Google Identity Services is still loading. Please try again in a second.');
-    return;
-  }}
-  const tc = window.google.accounts.oauth2.initTokenClient({{
-    client_id: CLIENT_ID,
-    scope: 'openid email profile https://www.googleapis.com/auth/cloud-platform.read-only',
-    prompt: 'select_account',
-    callback: (resp) => {{
-      if (resp && resp.access_token) {{
-        completeServerSignIn({{ google_access_token: resp.access_token }});
-      }} else if (resp && resp.error) {{
-        showErr('Google OAuth: ' + resp.error);
-      }}
-    }}
-  }});
-  tc.requestAccessToken();
+function startPkceFlow() {{
+  window.location.href = '/api/auth/oauth/signin';
 }}
 window.addEventListener('load', () => {{
   const iv = setInterval(() => {{
-    if (window.google && window.google.accounts && window.google.accounts.id) {{
+    if (window.google && window.google.accounts && window.google.accounts.id && CLIENT_ID) {{
       clearInterval(iv);
       window.google.accounts.id.initialize({{
         client_id: CLIENT_ID,
@@ -2785,7 +2480,6 @@ window.addEventListener('load', () => {{
           width: 340
         }});
       }}
-      window.google.accounts.id.prompt();
     }}
   }}, 100);
 }});
@@ -2800,13 +2494,14 @@ window.addEventListener('load', () => {{
         region: Optional[str] = Query(default=None),
         timezone: Optional[str] = Query(default=None),
         redirect_uri: Optional[str] = Query(default=None),
+        response_type: Optional[str] = Query(default=None),
     ) -> Any:
-        """Public: starts 'Sign in with Google' (OpenID Connect + PKCE, popup) when an OAuth client is configured."""
-        cb_uri = _oauth_callback_uri(request)
-        if redirect_uri and redirect_uri.strip() != cb_uri:
-            raise HTTPException(status_code=400, detail="Redirect URI mismatch: open redirects are not permitted.")
+        """Public: starts 'Sign in with Google' via OAuth 2.0 Authorization Code Flow + PKCE (S256)."""
+        if response_type is not None and response_type.strip().lower() != "code":
+            raise HTTPException(status_code=400, detail=IMPLICIT_FLOW_DISABLED_DETAIL)
+        cb_uri = _validate_oauth_redirect_uri(request, redirect_uri)
         oauth_cfg = load_oauth_client_config()
-        client_id = oauth_cfg.get("client_id", "")
+        client_id = (oauth_cfg.get("client_id") or "").strip()
         if not client_id:
             return HTMLResponse(
                 status_code=404,
@@ -2818,33 +2513,33 @@ window.addEventListener('load', () => {{
                     ok=False,
                 ),
             )
-        nonce = secrets.token_urlsafe(16)
-        oidc_nonce = secrets.token_urlsafe(24)
-        code_verifier, code_challenge = auth_guard.generate_pkce_pair()
-        state = sign_oauth_state(
-            {
-                "mode": "signin",
-                "nonce": nonce,
-                "oidc_nonce": oidc_nonce,
-                "code_verifier": code_verifier,
-                "redirect_uri": cb_uri,
-                "region": region or "",
-                "timezone": timezone or "",
-            }
+        has_secret = bool((oauth_cfg.get("client_secret") or "").strip())
+        existing_identity = resolve_request_identity(request)
+        tx = auth_store.get_active_auth_store().create_oauth_transaction(
+            flow_mode="signin",
+            redirect_uri=cb_uri,
+            client_type="confidential" if has_secret else "public",
+            initiating_user_id=existing_identity.user_id if existing_identity else None,
+            initiating_session_jti=str((existing_identity.claims or {}).get("jti") or "") or None if existing_identity else None,
+            region=region or "",
+            timezone=timezone or "",
+            ttl_seconds=_oauth_ttl_seconds(),
         )
+        assert tx.browser_binding_token is not None
+        code_challenge = auth_guard.compute_pkce_challenge(tx.code_verifier)
         params = {
             "client_id": client_id,
             "redirect_uri": cb_uri,
-            "response_type": "code" if oauth_cfg.get("client_secret") else "token",
+            "response_type": "code",
             "scope": "openid email profile",
-            "state": state,
-            "nonce": oidc_nonce,
+            "state": tx.state_id,
+            "nonce": tx.oidc_nonce,
             "code_challenge": code_challenge,
             "code_challenge_method": "S256",
             "prompt": "select_account",
         }
         resp = RedirectResponse(url=f"{oauth_cfg['authorization_endpoint']}?{urllib.parse.urlencode(params)}", status_code=302)
-        _set_oauth_nonce_cookie(resp, request, nonce)
+        _set_oauth_nonce_cookie(resp, request, tx.browser_binding_token)
         return resp
 
     @app.get("/api/auth/oauth/authorize")
@@ -2854,54 +2549,51 @@ window.addEventListener('load', () => {{
         session_id: Optional[str] = Query(default=None),
         scope: Optional[str] = Query(default="organizations/31564119954"),
         redirect_uri: Optional[str] = Query(default=None),
+        response_type: Optional[str] = Query(default=None),
         format: Optional[str] = Query(default=None),
     ) -> Any:
-        """Initiates the 3-Legged OAuth 2.0 (3LO) flow for Google Cloud APIs on behalf of the SIGNED-IN user.
+        """Initiates 3-Legged OAuth 2.0 (3LO) via Authorization Code Flow + PKCE (S256) for the signed-in user.
 
-        - Requires an authenticated identity (401) and `user_id`, if given, must be that identity (403).
-        - The OAuth `state` is HMAC-signed, expires in 10 minutes, is single use, includes PKCE `code_verifier`, and
-          is bound to this browser (`pqc_oauth_nonce` cookie) and exact `redirect_uri`.
+        - Never falls back to `response_type=token` (supports both public and confidential OAuth clients via PKCE).
+        - Stores `code_verifier` and `oidc_nonce` server-side in `pqc_oauth_transactions`; `state` is opaque & random.
         """
-        uid = activate_request_tenant_user(request, explicit_user_id=user_id)
-        cb_uri = _oauth_callback_uri(request)
-        if redirect_uri and redirect_uri.strip() != cb_uri:
-            raise HTTPException(status_code=400, detail="Redirect URI mismatch: open redirects are not permitted.")
+        identity = _require_identity(request, explicit_user_id=user_id)
+        uid = identity.user_id
+        if response_type is not None and response_type.strip().lower() != "code":
+            raise HTTPException(status_code=400, detail=IMPLICIT_FLOW_DISABLED_DETAIL)
+        cb_uri = _validate_oauth_redirect_uri(request, redirect_uri)
         oauth_cfg = load_oauth_client_config()
-        client_id = oauth_cfg.get("client_id", "")
-        has_secret = bool(oauth_cfg.get("client_secret"))
+        client_id = (oauth_cfg.get("client_id") or "").strip()
+        has_secret = bool((oauth_cfg.get("client_secret") or "").strip())
         target_scope = scope or "organizations/31564119954"
-        nonce = secrets.token_urlsafe(16)
-        oidc_nonce = secrets.token_urlsafe(24)
-        code_verifier, code_challenge = auth_guard.generate_pkce_pair()
-        encoded_state = sign_oauth_state(
-            {
-                "mode": "3lo",
-                "uid": uid,
-                "session_id": session_id or "",
-                "target_scope": target_scope,
-                "nonce": nonce,
-                "oidc_nonce": oidc_nonce,
-                "code_verifier": code_verifier,
-                "redirect_uri": cb_uri,
-            }
+        tx = auth_store.get_active_auth_store().create_oauth_transaction(
+            flow_mode="3lo",
+            redirect_uri=cb_uri,
+            client_type="confidential" if has_secret else "public",
+            initiating_user_id=uid,
+            initiating_session_jti=str((identity.claims or {}).get("jti") or "") or None,
+            app_session_id=session_id or None,
+            target_scope=target_scope,
+            ttl_seconds=_oauth_ttl_seconds(),
         )
+        assert tx.browser_binding_token is not None
+        code_challenge = auth_guard.compute_pkce_challenge(tx.code_verifier)
 
         google_auth_url = ""
         if client_id:
-            params = {
+            params: Dict[str, str] = {
                 "client_id": client_id,
                 "redirect_uri": cb_uri,
-                "response_type": "code" if has_secret else "token",
+                "response_type": "code",
                 "scope": " ".join(GCP_OAUTH_SCOPES),
                 "include_granted_scopes": "true",
+                "access_type": "online",
                 "prompt": "consent",
-                "state": encoded_state,
-                "nonce": oidc_nonce,
+                "state": tx.state_id,
+                "nonce": tx.oidc_nonce,
                 "code_challenge": code_challenge,
                 "code_challenge_method": "S256",
             }
-            if has_secret:
-                params["access_type"] = "online"
             if "@" in uid:
                 params["login_hint"] = uid
             google_auth_url = f"{oauth_cfg['authorization_endpoint']}?{urllib.parse.urlencode(params)}"
@@ -2914,26 +2606,28 @@ window.addEventListener('load', () => {{
                     "target_scope": target_scope,
                     "client_id_configured": bool(client_id),
                     "client_id": client_id,
+                    "client_type": tx.client_type,
                     "redirect_uri": cb_uri,
                     "scopes": list(GCP_OAUTH_SCOPES),
                     "google_auth_url": google_auth_url,
-                    "state": encoded_state,
+                    "state": tx.state_id,
+                    "response_type": "code",
                     "code_challenge_method": "S256",
                 }
             )
-            _set_oauth_nonce_cookie(json_resp, request, nonce)
+            _set_oauth_nonce_cookie(json_resp, request, tx.browser_binding_token)
             return json_resp
 
         if google_auth_url and request.query_params.get("direct") == "1":
             redirect_resp = RedirectResponse(url=google_auth_url, status_code=302)
-            _set_oauth_nonce_cookie(redirect_resp, request, nonce)
+            _set_oauth_nonce_cookie(redirect_resp, request, tx.browser_binding_token)
             return redirect_resp
 
         google_button_html = ""
-        if client_id and auth_guard.env_flag("PQC_ENABLE_GIS_JAVASCRIPT_CLIENT") is True:
+        if google_auth_url:
             google_button_html = (
-                '<button type="button" class="btn btn-google" onclick="openGoogleTokenClient()">'
-                "Authorize with Google Account (OAuth 2.0)"
+                '<button type="button" class="btn btn-google" onclick="startServerPkceAuthorize()">'
+                "Authorize with Google Account (OAuth 2.0 + PKCE)"
                 "</button>"
             )
         # Every reflected value is HTML-escaped (markup) or JSON/script-escaped (inline JS): no reflected XSS.
@@ -2960,13 +2654,12 @@ window.addEventListener('load', () => {{
   .err {{ color:#f87171; font-size:12px; margin-bottom:10px; display:none; }}
   .cmd {{ background:#070b12; border:1px solid #1e293b; padding:7px 10px; border-radius:6px; font-family:'JetBrains Mono',monospace; font-size:11px; color:#93c5fd; margin-bottom:10px; word-break:break-all; }}
 </style>
-<script src="https://accounts.google.com/gsi/client" async defer></script>
 </head>
 <body>
 <div class="card">
   <div class="hdr">
     <div>
-      <span class="badge">3-Legged OAuth 2.0 • ADK ToolContext</span>
+      <span class="badge">3-Legged OAuth 2.0 (PKCE S256) • ADK ToolContext</span>
     </div>
   </div>
   <h2>Authorize PQC Inventory Agent</h2>
@@ -2994,7 +2687,7 @@ window.addEventListener('load', () => {{
 <script>
 const PQC_SESSION_ID = {_js_literal(session_id or "")};
 const PQC_TARGET_SCOPE = {_js_literal(target_scope)};
-const PQC_CLIENT_ID = {_js_literal(client_id or "")};
+const PQC_GOOGLE_AUTH_URL = {_js_literal(google_auth_url)};
 function getCookie(name) {{
   const match = document.cookie.match(new RegExp('(?:^|; )' + name.replace(/([.$?*|{{}}()\\[\\]\\\\/+^])/g, '\\\\$1') + '=([^;]*)'));
   return match ? decodeURIComponent(match[1]) : '';
@@ -3020,25 +2713,10 @@ function showError(message) {{
   err.textContent = message;
   err.style.display = 'block';
 }}
-function openGoogleTokenClient() {{
-  if (!window.google || !window.google.accounts || !window.google.accounts.oauth2) {{
-    showError('Google Identity Services is loading. Please try again in a second.');
-    return;
+function startServerPkceAuthorize() {{
+  if (PQC_GOOGLE_AUTH_URL) {{
+    window.location.href = PQC_GOOGLE_AUTH_URL;
   }}
-  const tc = window.google.accounts.oauth2.initTokenClient({{
-    client_id: PQC_CLIENT_ID,
-    scope: 'openid email profile https://www.googleapis.com/auth/cloud-platform.read-only',
-    prompt: 'consent',
-    callback: async (resp) => {{
-      if (resp && resp.access_token) {{
-        document.getElementById('tokInput').value = resp.access_token;
-        await submitConsent();
-      }} else if (resp && resp.error) {{
-        showError('Google OAuth: ' + resp.error);
-      }}
-    }}
-  }});
-  tc.requestAccessToken();
 }}
 async function switchToAdcMode() {{
   document.getElementById('errBox').style.display = 'none';
@@ -3105,7 +2783,7 @@ async function saveClientId() {{
 </body>
 </html>"""
         popup_resp = HTMLResponse(content=popup_html)
-        _set_oauth_nonce_cookie(popup_resp, request, nonce)
+        _set_oauth_nonce_cookie(popup_resp, request, tx.browser_binding_token)
         return popup_resp
 
     @app.get("/api/auth/oauth/callback", response_class=HTMLResponse)
@@ -3116,14 +2794,15 @@ async function saveClientId() {{
         error: Optional[str] = Query(default=None),
         redirect_uri: Optional[str] = Query(default=None),
     ) -> HTMLResponse:
-        """Public OAuth redirect target for both 'Sign in with Google' and 3LO consent.
+        """Public OAuth 2.0 Authorization Code + PKCE callback target for 'Sign in with Google' and 3LO consent.
 
-        The signed `state` is mandatory (HMAC, `typ`, 10 min expiry, single use, nonce cookie of this browser, PKCE
-        `code_verifier`, and exact `redirect_uri`). Codes are exchanged server-side and tokens are never embedded in
-        the returned page or `postMessage`.
+        - Rejects implicit / token-bearing redirects (`access_token`, `id_token`, `token_type`, or missing `code`).
+        - Atomically validates and consumes the opaque `state` in the shared database (single-use, race-free).
+        - Exchanges the authorization code server-side using the server-stored PKCE `code_verifier`.
         """
-        hinted = verify_oauth_state(state) or {}
-        message_type = "PQC_SIGNIN_COMPLETE" if hinted.get("mode") == "signin" else "PQC_OAUTH_3LO_AUTHORIZED"
+        store = auth_store.get_active_auth_store()
+        hinted_mode = store.peek_oauth_transaction_mode(state)
+        message_type = "PQC_SIGNIN_COMPLETE" if hinted_mode == "signin" else "PQC_OAUTH_3LO_AUTHORIZED"
         if error:
             return HTMLResponse(
                 status_code=400,
@@ -3134,34 +2813,74 @@ async function saveClientId() {{
                     ok=False,
                 ),
             )
-        if not code:
-            return HTMLResponse(content=_OAUTH_IMPLICIT_CALLBACK_HTML)
+        # Reject any implicit-flow / token-bearing redirect parameters or missing authorization code
+        if any(
+            request.query_params.get(k) is not None
+            for k in ("access_token", "id_token", "token_type", "response_type")
+        ) or not code:
+            return HTMLResponse(
+                status_code=400,
+                content=_oauth_popup_result_html(
+                    message_type,
+                    {"authenticated": False, "status": "IMPLICIT_FLOW_PROHIBITED"},
+                    IMPLICIT_FLOW_DISABLED_DETAIL,
+                    ok=False,
+                ),
+            )
 
-        st = _validate_oauth_state_for_request(request, state)
-        if not st:
+        try:
+            expected_cb_uri = _validate_oauth_redirect_uri(request, redirect_uri)
+        except HTTPException as exc:
+            return HTMLResponse(
+                status_code=exc.status_code,
+                content=_oauth_popup_result_html(
+                    message_type,
+                    {"authenticated": False, "status": "REDIRECT_URI_MISMATCH"},
+                    str(exc.detail),
+                    ok=False,
+                ),
+            )
+
+        tx = store.consume_oauth_transaction(
+            state_id=state,
+            browser_binding_token=request.cookies.get(OAUTH_NONCE_COOKIE_NAME),
+            expected_redirect_uri=expected_cb_uri,
+        )
+        if tx is None:
             return HTMLResponse(
                 status_code=400,
                 content=_oauth_popup_result_html(
                     message_type,
                     {"authenticated": False, "status": "INVALID_STATE"},
-                    "Invalid or expired OAuth state. Close this window and start again from the portal.",
+                    "Invalid, expired, or already consumed OAuth state. Close this window and start again from the portal.",
                     ok=False,
                 ),
             )
-        expected_cb_uri = _oauth_callback_uri(request)
-        if (redirect_uri and redirect_uri.strip() != expected_cb_uri) or (
-            st.get("redirect_uri") and st.get("redirect_uri") != expected_cb_uri
-        ):
+        message_type = "PQC_SIGNIN_COMPLETE" if tx.flow_mode == "signin" else "PQC_OAUTH_3LO_AUTHORIZED"
+
+        if not store.consume_replay_token("auth_code", code, ttl_seconds=OAUTH_STATE_TTL_SECONDS):
             return HTMLResponse(
                 status_code=400,
                 content=_oauth_popup_result_html(
                     message_type,
-                    {"authenticated": False, "status": "REDIRECT_URI_MISMATCH"},
-                    "Redirect URI mismatch. Close this window and start again from the portal.",
+                    {"authenticated": False, "status": "REPLAYED_CODE"},
+                    "Authorization code replay rejected.",
                     ok=False,
                 ),
             )
-        pkce_ctx = _ACTIVE_PKCE_VERIFIER.set(st.get("code_verifier"))
+
+        if tx.flow_mode == "3lo":
+            uid = normalize_user_id(tx.initiating_user_id)
+            identity = resolve_request_identity(request)
+            if "@" not in uid or identity is None or identity.user_id != uid:
+                return HTMLResponse(
+                    status_code=403,
+                    content=_oauth_popup_result_html(
+                        message_type, {"authenticated": False, "status": "USER_MISMATCH"}, auth_guard.USER_MISMATCH_DETAIL, ok=False
+                    ),
+                )
+
+        pkce_ctx = _ACTIVE_PKCE_VERIFIER.set(tx.code_verifier)
         try:
             tok_data, exchange_err = await asyncio.to_thread(_exchange_oauth_code, code, expected_cb_uri)
         finally:
@@ -3174,13 +2893,22 @@ async function saveClientId() {{
                 ),
             )
 
-        if st.get("mode") == "signin":
+        sec = _is_https(request)
+        if tx.flow_mode == "signin":
             id_tok = tok_data.get("id_token")
-            nonce_ctx = _ACTIVE_OIDC_NONCE.set(st.get("oidc_nonce"))
-            try:
-                verified_info, err_msg = await asyncio.to_thread(
-                    _verify_google_oauth_or_id_token, id_tok, None if id_tok else tok_data.get("access_token")
+            if not id_tok:
+                return HTMLResponse(
+                    status_code=401,
+                    content=_oauth_popup_result_html(
+                        message_type,
+                        {"authenticated": False, "status": "MISSING_ID_TOKEN"},
+                        "OpenID Connect id_token is required for authorization code sign-in.",
+                        ok=False,
+                    ),
                 )
+            nonce_ctx = _ACTIVE_OIDC_NONCE.set(tx.oidc_nonce)
+            try:
+                verified_info, err_msg = await asyncio.to_thread(_verify_google_oauth_or_id_token, id_tok, None)
             finally:
                 _ACTIVE_OIDC_NONCE.reset(nonce_ctx)
             status_code, email_or_err = _validated_google_identity(verified_info, err_msg)
@@ -3194,8 +2922,8 @@ async function saveClientId() {{
             content, signed_token = await _complete_signin(
                 email=email_or_err,
                 name=verified_info.get("name"),
-                region=st.get("region") or None,
-                timezone_str=st.get("timezone") or None,
+                region=tx.region or None,
+                timezone_str=tx.timezone or None,
                 auth_method=verified_info.get("auth_method", "google_id_token"),
                 picture=verified_info.get("picture", ""),
             )
@@ -3203,33 +2931,69 @@ async function saveClientId() {{
                 content=_oauth_popup_result_html(message_type, content, "Signed in. You can close this window.", ok=True)
             )
             _set_session_cookie(signin_resp, request, signed_token, rotate_previous=True)
-            signin_resp.delete_cookie(key=OAUTH_NONCE_COOKIE_NAME, path="/api/auth")
+            signin_resp.delete_cookie(key=OAUTH_NONCE_COOKIE_NAME, path="/api/auth", secure=sec, httponly=True, samesite="lax")
             return signin_resp
 
-        uid = normalize_user_id(st.get("uid"))
-        identity = resolve_request_identity(request)
-        if "@" not in uid or (identity is not None and identity.user_id != uid):
-            return HTMLResponse(
-                status_code=403,
-                content=_oauth_popup_result_html(
-                    message_type, {"authenticated": False, "status": "USER_MISMATCH"}, auth_guard.USER_MISMATCH_DETAIL, ok=False
-                ),
-            )
-        conn = _bind_delegated_gcp_token(uid, tok_data["access_token"], tok_data.get("expires_in"))
+        uid = normalize_user_id(tx.initiating_user_id)
+        if tok_data.get("id_token"):
+            nonce_ctx = _ACTIVE_OIDC_NONCE.set(tx.oidc_nonce)
+            try:
+                verified_3lo, err_3lo = await asyncio.to_thread(_verify_google_oauth_or_id_token, tok_data["id_token"], None)
+            finally:
+                _ACTIVE_OIDC_NONCE.reset(nonce_ctx)
+            st_3lo, email_or_err_3lo = _validated_google_identity(verified_3lo, err_3lo)
+            if st_3lo != 200 or verified_3lo is None:
+                return HTMLResponse(
+                    status_code=st_3lo,
+                    content=_oauth_popup_result_html(
+                        message_type,
+                        {"authenticated": False, "status": "REJECTED", "detail": email_or_err_3lo},
+                        email_or_err_3lo,
+                        ok=False,
+                    ),
+                )
+            if normalize_user_id(email_or_err_3lo) != uid:
+                return HTMLResponse(
+                    status_code=403,
+                    content=_oauth_popup_result_html(
+                        message_type,
+                        {"authenticated": False, "status": "USER_MISMATCH"},
+                        auth_guard.USER_MISMATCH_DETAIL,
+                        ok=False,
+                    ),
+                )
+        elif tx.oidc_nonce:
+            if not store.consume_replay_token("oidc_nonce", tx.oidc_nonce, ttl_seconds=3600):
+                return HTMLResponse(
+                    status_code=400,
+                    content=_oauth_popup_result_html(
+                        message_type,
+                        {"authenticated": False, "status": "REPLAYED_NONCE"},
+                        "OIDC nonce replay rejected.",
+                        ok=False,
+                    ),
+                )
+
+        conn = _bind_delegated_gcp_token(
+            uid,
+            tok_data["access_token"],
+            tok_data.get("expires_in"),
+            refresh_token=tok_data.get("refresh_token"),
+        )
         result_payload = {
             "status": "AUTHORIZED",
             "authenticated": True,
             "user_id": uid,
-            "session_id": st.get("session_id") or None,
-            "target_scope": st.get("target_scope"),
+            "session_id": tx.app_session_id or None,
+            "target_scope": tx.target_scope,
             "credential_key": GCP_OAUTH_CREDENTIAL_KEY,
-            "token_storage": "in_memory_only",
+            "token_storage": "encrypted_db_envelope",
             "connection": conn,
         }
         consent_resp = HTMLResponse(
             content=_oauth_popup_result_html(message_type, result_payload, "Authorized. You can close this window.", ok=True)
         )
-        consent_resp.delete_cookie(key=OAUTH_NONCE_COOKIE_NAME, path="/api/auth")
+        consent_resp.delete_cookie(key=OAUTH_NONCE_COOKIE_NAME, path="/api/auth", secure=sec, httponly=True, samesite="lax")
         return consent_resp
 
     @app.post("/api/auth/tool-consent")
@@ -3238,13 +3002,11 @@ async function saveClientId() {{
         payload: ToolConsentPayload,
     ) -> Dict[str, Any]:
         """Binds a delegated OAuth 2.0 access token to the SIGNED-IN user's gcloud/GCP connection so the paused ADK
-        tool can resume on their behalf. The token is kept in process memory only (never in session state or on disk).
+        tool can resume on their behalf.
         """
         uid = activate_request_tenant_user(request, explicit_user_id=payload.user_id)
         if payload.oauth_state is not None:
-            st = _validate_oauth_state_for_request(request, payload.oauth_state)
-            if not st or st.get("mode") != "3lo" or normalize_user_id(st.get("uid")) != uid:
-                raise HTTPException(status_code=400, detail="Invalid or expired OAuth state. Start the authorization again.")
+            raise HTTPException(status_code=400, detail=IMPLICIT_FLOW_DISABLED_DETAIL)
         raw_token = (payload.access_token or "").strip()
         if raw_token.lower().startswith("bearer "):
             raw_token = raw_token[7:].strip()
@@ -3274,7 +3036,7 @@ async function saveClientId() {{
             "session_id": payload.session_id,
             "session_found": session_found,
             "session_credential_injected": False,
-            "token_storage": "in_memory_only",
+            "token_storage": "encrypted_db_envelope",
             "credential_key": GCP_OAUTH_CREDENTIAL_KEY,
             "tool_name": payload.tool_name,
             "target_scope": payload.target_scope,
@@ -3292,7 +3054,7 @@ async function saveClientId() {{
     ) -> Dict[str, Any]:
         resolved_uid = activate_request_tenant_user(request, explicit_user_id=user_id)
         resp = await session_service.list_sessions(app_name=APP_NAME, user_id=resolved_uid)
-        meta_map = _load_session_metadata_map()
+        meta_map = auth_store.get_active_auth_store().list_user_session_metadata(resolved_uid)
         items: List[Dict[str, Any]] = []
         for s in resp.sessions:
             extra = meta_map.get(s.id, {})
@@ -3347,18 +3109,20 @@ async function saveClientId() {{
             session_id=req.session_id,
             state={"title": title, "scope": scope, "created_at": now_iso},
         )
-        meta_map = _load_session_metadata_map()
-        meta_map[session.id] = {
-            "user_id": user_id,
-            "title": title,
-            "scope": scope,
-            "created_at": now_iso,
-            "updated_at": now_iso,
-            "message_count": 0,
-            "attachments_by_turn": [],
-            "turn_telemetry": {},
-        }
-        _save_session_metadata_map(meta_map, changed_session_id=session.id)
+        try:
+            auth_store.get_active_auth_store().upsert_session_metadata(
+                session_id=session.id,
+                user_id=user_id,
+                title=title,
+                scope=scope,
+                message_count=0,
+                attachments_by_turn=[],
+                turn_telemetry={},
+                created_at=now_iso,
+                updated_at=now_iso,
+            )
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
         return {
             "session_id": session.id,
             "id": session.id,
@@ -3388,7 +3152,7 @@ async function saveClientId() {{
         sess, resolved_user = await _locate_session(session_id, active_uid)
         if sess is None:
             raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
-        extra = _load_session_metadata_map().get(session_id, {})
+        extra = auth_store.get_active_auth_store().get_session_metadata(session_id, user_id=resolved_user) or {}
         messages, tool_calls = _extract_messages_and_traces_from_session(sess, extra)
         state_dict = dict(getattr(sess, "state", {}) or {})
         title = (
@@ -3429,11 +3193,7 @@ async function saveClientId() {{
         if sess is None:
             raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
         await session_service.delete_session(app_name=APP_NAME, user_id=resolved_user, session_id=session_id)
-        _delete_partitioned_session_metadata(resolved_user, session_id)
-        meta_map = _load_session_metadata_map()
-        if session_id in meta_map:
-            del meta_map[session_id]
-            _save_session_metadata_map(meta_map, changed_session_id="__deleted__")
+        auth_store.get_active_auth_store().delete_session_metadata(session_id, user_id=resolved_user)
         return {"deleted": True, "status": "deleted", "session_id": session_id, "user_id": resolved_user}
 
     # =========================================================================
@@ -3506,12 +3266,17 @@ async function saveClientId() {{
                 current_conn = get_gcp_connection_config(mask_token=True, user_id=user_id)
                 if not current_conn.get("has_access_token") and _is_builtin_demo_scope(scope, current_conn):
                     effective_mode = "adc"
-            set_gcp_connection_config(
-                mode=effective_mode,
-                impersonated_service_account=impersonated_sa,
-                access_token=access_token,
-                user_id=user_id,
-            )
+            try:
+                set_gcp_connection_config(
+                    mode=effective_mode,
+                    impersonated_service_account=impersonated_sa,
+                    access_token=access_token,
+                    user_id=user_id,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except PermissionError as exc:
+                raise HTTPException(status_code=403, detail=str(exc)) from exc
 
         user_text = (message or prompt or "").strip()
         uploaded_files = [f for f in (files or []) if f and f.filename]
@@ -3653,21 +3418,8 @@ async function saveClientId() {{
                 error = {"code": "EMPTY_MODEL_RESPONSE", "message": "The model finished without returning text."}
 
         now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        meta_map = _load_session_metadata_map()
-        sess_meta = meta_map.setdefault(
-            session_id,
-            {"user_id": user_id, "title": user_text[:72], "scope": scope, "created_at": now_iso, "attachments_by_turn": []},
-        )
-        if sess_meta.get("title") in (None, "", "New PQC Assessment"):
-            sess_meta["title"] = user_text[:72]
-        sess_meta["updated_at"] = now_iso
-        sess_meta["scope"] = scope
-        sess_meta["model_id"] = entry["id"]
-        sess_meta["model_label"] = model_label
-        sess_meta["message_count"] = int(sess_meta.get("message_count") or 0) + (2 if assistant_text else 1)
-        sess_meta.setdefault("attachments_by_turn", []).append(saved_artifacts_meta)
-        if invocation_id:
-            sess_meta.setdefault("turn_telemetry", {})[invocation_id] = {
+        inv_tel = (
+            {
                 "served_by": served_by,
                 "model_id": entry["id"],
                 "model_label": model_label,
@@ -3675,7 +3427,22 @@ async function saveClientId() {{
                 "error": error,
                 "oauth_consent_required": active_consent_card,
             }
-        _save_session_metadata_map(meta_map, changed_session_id=session_id)
+            if invocation_id
+            else None
+        )
+        auth_store.get_active_auth_store().upsert_session_metadata(
+            session_id=session_id,
+            user_id=user_id,
+            title=user_text[:72],
+            scope=scope,
+            model_id=entry["id"],
+            model_label=model_label,
+            message_delta=2 if assistant_text else 1,
+            append_attachments=saved_artifacts_meta,
+            invocation_id=invocation_id,
+            invocation_telemetry=inv_tel,
+            updated_at=now_iso,
+        )
 
         payload = {
             "session_id": session_id,
@@ -3717,15 +3484,20 @@ async function saveClientId() {{
         payload: ConnectionConfigPayload,
     ) -> Dict[str, Any]:
         uid = activate_request_tenant_user(request, explicit_user_id=payload.user_id)
-        return set_gcp_connection_config(
-            mode=payload.mode,
-            organization_id=payload.organization_id,
-            project_id=payload.project_id,
-            location=payload.location,
-            impersonated_service_account=payload.impersonated_service_account,
-            access_token=payload.access_token,
-            user_id=uid,
-        )
+        try:
+            return set_gcp_connection_config(
+                mode=payload.mode,
+                organization_id=payload.organization_id,
+                project_id=payload.project_id,
+                location=payload.location,
+                impersonated_service_account=payload.impersonated_service_account,
+                access_token=payload.access_token,
+                user_id=uid,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
 
     @app.post("/api/gcloud")
     async def execute_gcloud_endpoint(

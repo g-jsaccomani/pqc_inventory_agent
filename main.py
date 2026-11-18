@@ -15,16 +15,49 @@ import argparse
 import asyncio
 import json
 import os
+import sys
+import threading
 from typing import Any, Dict, Optional
 
 from dotenv import load_dotenv
 
-from pqc_agent.agent import DEFAULT_MODEL, DEFAULT_THINKING_LEVEL, create_pqc_agent, root_agent
-from pqc_agent.workspace_server import app, artifact_service, session_service
-
 load_dotenv()
 
+from pqc_agent.agent import DEFAULT_MODEL, DEFAULT_THINKING_LEVEL, create_pqc_agent, root_agent  # noqa: E402
+
 agent = root_agent
+
+_WORKSPACE_APP_LOCK = threading.Lock()
+_WORKSPACE_APP: Optional[Any] = None
+
+
+def get_workspace_app() -> Any:
+    """Lazily initializes and returns the singleton FastAPI Workspace Portal application.
+
+    Keeps non-server CLI paths (`deploy`, `tools`, `cbom`, `--help`) decoupled from database startup while preserving
+    full fail-closed PostgreSQL, Alembic schema, and Secret Manager checks when the web server or `ask` path runs.
+    """
+    global _WORKSPACE_APP
+    if _WORKSPACE_APP is not None:
+        return _WORKSPACE_APP
+    with _WORKSPACE_APP_LOCK:
+        if _WORKSPACE_APP is None:
+            preloaded = "pqc_agent.workspace_server" in sys.modules
+            from pqc_agent import workspace_server as _ws
+
+            _WORKSPACE_APP = _ws.create_workspace_app() if preloaded else _ws.app
+        return _WORKSPACE_APP
+
+
+def __getattr__(name: str) -> Any:
+    """PEP 562 lazy module attributes so `uvicorn main:app` initializes the server only when accessed."""
+    if name == "app":
+        return get_workspace_app()
+    if name == "session_service":
+        return get_workspace_app().state.session_service
+    if name == "artifact_service":
+        return get_workspace_app().state.artifact_service
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def get_agent_engine_app():
@@ -48,21 +81,27 @@ async def run_adk_agent_turn(
 
     from pqc_agent.telemetry import LlmCallTelemetryPlugin, capture_llm_calls, summarize_llm_calls
 
+    ws_app = get_workspace_app()
+    sess_service = ws_app.state.session_service
+    art_service = ws_app.state.artifact_service
+    cred_service = ws_app.state.credential_service
+
     runner = Runner(
         app=App(
             name="pqc_agent",
             root_agent=create_pqc_agent(model_name=model_name, thinking_level=thinking_level),
             plugins=[LlmCallTelemetryPlugin()],
         ),
-        session_service=session_service,
-        artifact_service=artifact_service,
+        session_service=sess_service,
+        artifact_service=art_service,
+        credential_service=cred_service,
         auto_create_session=True,
     )
     session = None
     if session_id:
-        session = await session_service.get_session(app_name="pqc_agent", user_id=user_id, session_id=session_id)
+        session = await sess_service.get_session(app_name="pqc_agent", user_id=user_id, session_id=session_id)
     if session is None:
-        session = await session_service.create_session(app_name="pqc_agent", user_id=user_id)
+        session = await sess_service.create_session(app_name="pqc_agent", user_id=user_id)
 
     content = types.Content(role="user", parts=[types.Part.from_text(text=prompt)])
     text_parts = []
@@ -144,6 +183,11 @@ def deploy_to_agent_engine(
             "google-cloud-asset>=3.26.0",
             "google-cloud-kms>=2.24.0",
             "google-cloud-storage>=2.16.0",
+            "sqlalchemy>=2.0.0",
+            "psycopg[binary]>=3.2.0",
+            "asyncpg>=0.30.0",
+            "alembic>=1.14.0",
+            "cryptography>=43.0.0",
             "pypdf>=4.0.0",
             "python-docx>=1.1.0",
             "pydantic>=2.8.0",
@@ -190,7 +234,7 @@ def main() -> None:
     if args.command == "serve":
         import uvicorn
 
-        uvicorn.run(app, host=args.host, port=args.port)
+        uvicorn.run(get_workspace_app(), host=args.host, port=args.port)
     elif args.command == "ask":
         prompt = args.prompt or f"Run a complete post-quantum cryptography readiness assessment for scope '{args.scope}'."
         result = asyncio.run(run_adk_agent_turn(prompt, model_name=args.model, thinking_level=args.thinking_level))

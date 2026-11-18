@@ -27,36 +27,46 @@ LEGACY_CONSTANT_KEY = b"pqc-workspace-fallback-hmac-key-2026"
 
 @pytest.fixture(autouse=True)
 def _isolated_auth_state(tmp_path, monkeypatch):
-    """Fresh data dir + clean auth env + empty in-memory connection/token stores for every test."""
+    """Fresh data dir + isolated SQLite DB + clean auth/KMS env for every unit test."""
+    from pqc_agent import auth_store
     from pqc_agent import workspace_server as ws
-    from tools import gcloud_bridge
 
+    auth_store.clear_fallback_auth_stores()
     monkeypatch.setenv("PQC_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("SESSION_DB_URL", f"sqlite:///{tmp_path / 'sessions.db'}")
     monkeypatch.setenv("PQC_AUTH_SECRET", "test-only-256-bit-hmac-secret-key-0123456789abcdef")
     for name in (
         "K_SERVICE",
         "PQC_PRODUCTION_MODE",
         "PQC_ENV",
+        "DATABASE_URL",
+        "PQC_CLOUD_SQL_CONNECTION_NAME",
+        "PQC_DB_HOST",
+        "PQC_KMS_KEY_NAME",
+        "PQC_ALLOWED_IMPERSONATION_SERVICE_ACCOUNTS",
         "PQC_ALLOW_UNVERIFIED_SIGNIN",
         "PQC_ENABLE_ADK_API",
         "PQC_ENABLE_ADK_DEV_UI",
+        "PQC_ENABLE_GIS_JAVASCRIPT_CLIENT",
         "PQC_ALLOWED_ORIGINS",
+        "PQC_OAUTH_REDIRECT_URIS",
+        "PQC_OAUTH_STATE_TTL_SECONDS",
         "PQC_IAP_AUDIENCE",
         "PQC_REQUIRE_IAP_AUDIENCE",
         "PQC_AUTH_SECRET_FILE",
         "PQC_AUTH_SECRET_PREVIOUS",
         "PQC_ADMIN_EMAILS",
         "PQC_GOOGLE_ID_TOKEN_AUDIENCES",
+        "PQC_GOOGLE_OAUTH_CLIENT_ID",
+        "PQC_GOOGLE_OAUTH_CLIENT_SECRET",
         "GOOGLE_OAUTH_CLIENT_ID",
         "GOOGLE_OAUTH_CLIENT_SECRET",
     ):
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.setattr(gcloud_bridge, "_USER_CONNECTIONS", {})
-    monkeypatch.setattr(gcloud_bridge, "_USER_ACCESS_TOKENS", {})
-    monkeypatch.setattr(gcloud_bridge, "_USER_CONNECTIONS_LOADED", False)
     monkeypatch.setattr(ws, "_AUTH_SECRET_CACHE", None)
     monkeypatch.setattr(ws, "_AUTH_SECRET_CACHE_KEY", None)
-    monkeypatch.setattr(ws, "_REVOKED_SESSION_JTIS", {})
+    yield
+    auth_store.clear_fallback_auth_stores()
 
 
 def _registry():
@@ -70,12 +80,42 @@ def _registry():
     )
 
 
+def _allow_unit_test_db_when_no_live_pg(monkeypatch):
+    """Allows route/cookie unit tests that toggle K_SERVICE to run without live GCS ADC or when PQC_TEST_POSTGRES_URL is unset."""
+    from pqc_agent import workspace_server as ws
+
+    monkeypatch.setattr(
+        ws.ResilientGcsArtifactService,
+        "__init__",
+        lambda self, bucket_name, **kw: (
+            setattr(self, "_local_fallback_store", {})
+            or setattr(self, "_gcs_online", False)
+            or setattr(self, "bucket_name", bucket_name)
+        ),
+    )
+    if os.getenv("PQC_TEST_POSTGRES_URL"):
+        return
+    from pqc_agent import auth_store
+
+    monkeypatch.setattr(auth_store, "validate_production_postgres_only", lambda _url: None)
+
+
 def _app(tmp_path):
+    from pqc_agent.migration_tool import run_alembic_upgrade_head
     from pqc_agent.workspace_server import create_workspace_app
 
+    is_prod_test = bool(os.getenv("K_SERVICE"))
+    db_url = (
+        os.environ["PQC_TEST_POSTGRES_URL"]
+        if (is_prod_test and os.getenv("PQC_TEST_POSTGRES_URL"))
+        else f"sqlite:///{tmp_path / 'sessions.db'}"
+    )
+    if is_prod_test:
+        run_alembic_upgrade_head(db_url)
+    bucket = "gs://test-unit-bucket" if is_prod_test else None
     return create_workspace_app(
-        session_db_url=f"sqlite:///{tmp_path / 'sessions.db'}",
-        artifact_bucket=None,  # local fallback: no GCS calls
+        session_db_url=db_url,
+        artifact_bucket=bucket,
         model_registry=_registry(),
         verify_models_on_startup=False,
     )
@@ -117,11 +157,11 @@ def test_s1_verified_credential_checks(tmp_path, google_verifier):
         unverified = client.post("/api/auth/google", json={"google_access_token": f"unverified:{ALICE}"})
         assert unverified.status_code == 401
         assert client.post("/api/auth/google", json={"google_access_token": "valid:eve@evil.example.com"}).status_code == 403
-        # The verified email wins over any email the client claims.
+        # The verified email wins over any email the client claims, and no session token appears in JSON.
         resp = client.post("/api/auth/google", json={"google_access_token": f"valid:{ALICE}", "email": BOB})
         assert resp.status_code == 200
         body = resp.json()
-        assert body["user_id"] == ALICE and body["token"]
+        assert body["user_id"] == ALICE and "token" not in body and resp.cookies.get("pqc_session_token")
         cookie = resp.headers["set-cookie"].lower()
         assert "pqc_session_token=" in cookie and "httponly" in cookie and "samesite=lax" in cookie
         assert (None, f"valid:{ALICE}") in google_verifier
@@ -322,6 +362,7 @@ ADK_PROBES = [
 
 def test_s4_s5_adk_routes_and_dev_server_are_off_on_cloud_run(tmp_path, monkeypatch, signin):
     monkeypatch.setenv("K_SERVICE", "pqc-inventory-agent")
+    _allow_unit_test_db_when_no_live_pg(monkeypatch)
     app = _app(tmp_path)
     assert app.state.adk_dev_ui_enabled is False and app.state.adk_api_enabled is False
     paths = [str(getattr(r, "path", "")) for r in app.router.routes]
@@ -343,6 +384,7 @@ def test_s4_s5_adk_routes_and_dev_server_are_off_on_cloud_run(tmp_path, monkeypa
 def test_s4_enabled_adk_routes_require_identity_and_bind_user(tmp_path, monkeypatch, signin):
     monkeypatch.setenv("K_SERVICE", "pqc-inventory-agent")
     monkeypatch.setenv("PQC_ENABLE_ADK_API", "true")
+    _allow_unit_test_db_when_no_live_pg(monkeypatch)
     app = _app(tmp_path)
     assert app.state.adk_api_enabled is True and app.state.adk_dev_ui_enabled is False
     with TestClient(app) as client:
@@ -442,16 +484,22 @@ def test_s6_hmac_secret_is_never_a_constant(tmp_path, monkeypatch):
 
 
 def test_s6_tokens_are_typed_and_bound_to_the_secret(monkeypatch):
-    from pqc_agent import auth_guard
+    from pqc_agent import auth_guard, auth_store
     from pqc_agent import workspace_server as ws
 
     profile = {"email": ALICE, "name": "Alice", "region": "NorthAm"}
     token = ws.sign_tenant_session_token(profile)
     assert ws.verify_tenant_session_token(token)["email"] == ALICE
     assert ws.verify_tenant_session_token(token + "0") is None
-    # An OAuth state value can never be replayed as a session token (typ claim).
-    state = ws.sign_oauth_state({"mode": "3lo", "uid": ALICE, "email": ALICE, "nonce": "n"})
-    assert ws.verify_tenant_session_token(state) is None
+    # An opaque OAuth state_id and any differently typed signed payload can never be replayed as a session token.
+    tx = auth_store.get_active_auth_store().create_oauth_transaction(
+        flow_mode="3lo", redirect_uri="http://testserver/api/auth/oauth/callback", initiating_user_id=ALICE
+    )
+    assert ws.verify_tenant_session_token(tx.state_id) is None
+    other_typed = auth_guard.sign_payload(
+        {"uid": ALICE, "email": ALICE, "typ": "account_jar_v2", "exp": int(time.time()) + 60}, ws._get_auth_secret()
+    )
+    assert ws.verify_tenant_session_token(other_typed) is None
     # Legacy (untyped) tokens and tokens signed with another key are rejected.
     legacy = auth_guard.sign_payload({"uid": ALICE, "email": ALICE, "exp": int(time.time()) + 60}, ws._get_auth_secret())
     assert ws.verify_tenant_session_token(legacy) is None
@@ -466,47 +514,70 @@ def test_s6_tokens_are_typed_and_bound_to_the_secret(monkeypatch):
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# S7 - OAuth access tokens are never persisted
+# S7 - Delegated OAuth credentials are envelope-encrypted in DB and never stored in plaintext
 # ---------------------------------------------------------------------------------------------------------------
-def test_s7_access_tokens_live_in_memory_only(tmp_path, signin):
+def test_s7_access_tokens_are_envelope_encrypted_and_never_stored_in_plaintext(tmp_path, signin):
+    from sqlalchemy import select
+    from pqc_agent import auth_store, credential_service
     from tools import gcloud_bridge as gb
 
     secret_token = "ya29.super-secret-delegated-token-123456"
     state = gb.set_gcp_connection_config(mode="access_token", access_token=secret_token, user_id="carol@google.com")
     assert state["has_access_token"] is True and secret_token not in json.dumps(state)
-    assert state["access_token_storage"] == "in_memory_only" and state["access_token_expires_at"]
+    assert state["access_token_storage"] == "encrypted_db_envelope" and state["access_token_expires_at"]
     assert gb.get_gcp_connection_config(mask_token=False, user_id="carol@google.com")["access_token_preview"] == secret_token
-    store = pathlib.Path(gb._get_user_connections_path()).read_text(encoding="utf-8")
-    assert secret_token not in store
-    assert '"access_token":' not in store  # no token field (the mode *value* "access_token" is fine)
-    assert json.loads(store)["carol@google.com"]["mode"] == "access_token"
 
-    gb._USER_ACCESS_TOKENS["dave@google.com"] = ("ya29.expired", time.time() - 1)
+    # Inspect raw database rows: neither pqc_user_connections nor pqc_delegated_credentials contains plaintext token!
+    store = auth_store.get_active_auth_store()
+    with store._session_factory() as db:
+        conn_row = db.get(auth_store.UserConnectionRecord, "carol@google.com")
+        assert conn_row is not None and conn_row.mode == "access_token"
+        cred_rows = db.scalars(
+            select(auth_store.DelegatedCredentialRecord).where(
+                auth_store.DelegatedCredentialRecord.user_id == "carol@google.com"
+            )
+        ).all()
+        assert len(cred_rows) == 1
+        assert secret_token not in cred_rows[0].ciphertext_b64
+        assert secret_token not in cred_rows[0].wrapped_dek_b64
+
+    # Expired credential fails closed and is automatically revoked/wiped on load
+    svc = credential_service.get_active_credential_service()
+    svc.store_delegated_token(user_id="dave@google.com", access_token="ya29.expired", expires_in=10.0)
+    assert svc.load_delegated_token(user_id="dave@google.com", now_override=time.time() + 60.0) is None
     assert gb.get_gcp_connection_config(user_id="dave@google.com")["has_access_token"] is False
-    assert "dave@google.com" not in gb._USER_ACCESS_TOKENS
 
     with TestClient(_app(tmp_path)) as client:
         signin(client, ALICE, use_token_for_gcp_connection=True)
         assert gb.get_gcp_connection_config(user_id=ALICE)["has_access_token"] is True
         alice = {"X-PQC-User-Token": client.cookies.get("pqc_session_token")}
         consent = client.post("/api/auth/tool-consent", headers=alice, json={"access_token": "ya29.consented-token-999"})
-        assert consent.status_code == 200 and consent.json()["token_storage"] == "in_memory_only"
+        assert consent.status_code == 200 and consent.json()["token_storage"] == "encrypted_db_envelope"
         for path in pathlib.Path(os.environ["PQC_DATA_DIR"]).rglob("*"):
             if path.is_file():
                 content = path.read_bytes()
                 assert b"ya29." not in content and b"valid:" not in content, path
+        db_bytes = (tmp_path / "sessions.db").read_bytes()
+        assert b"ya29.consented-token-999" not in db_bytes
         client.post("/api/auth/logout", headers=alice)
         assert gb.get_gcp_connection_config(user_id=ALICE)["has_access_token"] is False
 
 
-def test_s7_legacy_plaintext_tokens_are_purged_from_disk(monkeypatch):
-    from tools import gcloud_bridge as gb
+def test_s7_legacy_plaintext_tokens_are_stripped_during_migration(tmp_path):
+    from pqc_agent.migration_tool import migrate_legacy_persistence
 
-    store = pathlib.Path(gb._get_user_connections_path())
-    store.write_text(json.dumps({"legacy@google.com": {"mode": "access_token", "access_token": "ya29.legacy-plaintext"}}))
-    conn = gb.get_gcp_connection_config(user_id="legacy@google.com")
-    assert conn["mode"] == "access_token" and conn["has_access_token"] is False
-    assert "ya29.legacy-plaintext" not in store.read_text(encoding="utf-8")
+    legacy_dir = tmp_path / "legacy_data"
+    legacy_dir.mkdir()
+    legacy_file = legacy_dir / "pqc_user_connections.json"
+    legacy_file.write_text(
+        json.dumps({"legacy@google.com": {"mode": "access_token", "access_token": "ya29.legacy-plaintext"}}),
+        encoding="utf-8",
+    )
+    target_db = f"sqlite:///{tmp_path / 'migrated.db'}"
+    report = migrate_legacy_persistence(target_db_url=target_db, source_data_dir=str(legacy_dir))
+    assert report.status == "SUCCESS"
+    assert any(a["code"] == "LEGACY_PLAINTEXT_TOKEN_STRIPPED" for a in report.anomalies)
+    assert b"ya29.legacy-plaintext" not in (tmp_path / "migrated.db").read_bytes()
 
 
 def test_s7_session_state_never_returns_credentials():
@@ -628,22 +699,44 @@ def test_oauth_state_is_signed_single_use_and_browser_bound(tmp_path, monkeypatc
 
 
 def test_google_oauth_signin_popup_flow(tmp_path, monkeypatch, google_verifier):
+    from urllib.parse import parse_qs, urlparse
+
+    from pqc_agent import workspace_server as ws
+
+    exchanged = []
+
+    def fake_exchange(code, redirect_uri, code_verifier=None):
+        exchanged.append((code, redirect_uri, code_verifier or ws._ACTIVE_PKCE_VERIFIER.get()))
+        return {"access_token": "ya29.public-pkce", "id_token": f"valid:{ALICE}", "expires_in": 3599}, None
+
+    monkeypatch.setattr(ws, "_exchange_oauth_code", fake_exchange)
     with TestClient(_app(tmp_path)) as client:
         assert client.get("/api/auth/oauth/signin", follow_redirects=False).status_code == 404
+        # Public OAuth client (client_id ONLY, no client_secret) MUST use Authorization Code + PKCE (never response_type=token)
         monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_ID", "portal-client.apps.googleusercontent.com")
         assert client.get("/api/auth/config").json()["google_oauth_client_configured"] is True
         start = client.get("/api/auth/oauth/signin", params={"region": "EMEA"}, follow_redirects=False)
         assert start.status_code == 302 and start.headers["location"].startswith("https://accounts.google.com/")
-        assert "response_type=token" in start.headers["location"]
-        from urllib.parse import parse_qs, urlparse
+        assert "response_type=code" in start.headers["location"]
+        assert "response_type=token" not in start.headers["location"]
+        assert "code_challenge_method=S256" in start.headers["location"]
 
-        state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
-        signed_in = client.post("/api/auth/google", json={"google_access_token": f"valid:{ALICE}", "oauth_state": state})
-        assert signed_in.status_code == 200 and signed_in.json()["user_id"] == ALICE
-        replay = client.post("/api/auth/google", json={"google_access_token": f"valid:{ALICE}", "oauth_state": state})
-        assert replay.status_code == 400
-        page = client.get("/api/auth/oauth/callback")  # implicit flow landing page (token is in the URL fragment)
-        assert page.status_code == 200 and "/api/auth/google" in page.text and "oauth_state" in page.text
+        qs = parse_qs(urlparse(start.headers["location"]).query)
+        state = qs["state"][0]
+        assert "." not in state  # opaque server-side state, never signed JSON
+
+        # Legacy implicit flow parameters are explicitly rejected
+        assert client.post("/api/auth/google", json={"google_access_token": f"valid:{ALICE}", "oauth_state": state}).status_code == 400
+        assert client.get("/api/auth/oauth/callback").status_code == 400
+        assert client.get("/api/auth/oauth/callback", params={"access_token": "ya29.x", "state": state}).status_code == 400
+
+        # Valid Authorization Code + PKCE callback signs Alice in and sets HttpOnly cookie
+        cb_ok = client.get("/api/auth/oauth/callback", params={"code": "pub-code-1", "state": state})
+        assert cb_ok.status_code == 200 and "PQC_SIGNIN_COMPLETE" in cb_ok.text
+        assert exchanged and exchanged[-1][2]  # PKCE code_verifier supplied from server-side transaction
+        assert client.get("/api/auth/me").json()["user_id"] == ALICE
+        # Replaying the consumed state fails closed
+        assert client.get("/api/auth/oauth/callback", params={"code": "pub-code-2", "state": state}).status_code == 400
 
 
 def test_oauth_popup_escapes_reflected_values(tmp_path, signin):
@@ -688,14 +781,16 @@ def test_auto_signin_account_switcher_and_partitioned_tenant_storage(tmp_path, m
         r0 = client.post("/api/auth/auto")
         assert r0.status_code == 200 and r0.json()["authenticated"] is False
 
-        # 2. When workstation auto-gcloud token is present, /api/auth/auto logs in automatically with profile & photo
+        # 2. When workstation auto-gcloud token is present, /api/auth/auto logs in automatically (cookie only, no JSON token)
         monkeypatch.setattr(ws, "_try_workstation_auto_gcloud_token", lambda: f"valid:{ALICE}")
         r_auto = client.post("/api/auth/auto", headers={"X-PQC-User-Region": "NorthAm"})
         assert r_auto.status_code == 200
         auto_data = r_auto.json()
         assert auto_data["authenticated"] is True
         assert auto_data["user_id"] == ALICE
-        alice_token = auto_data["token"]
+        assert "token" not in auto_data
+        alice_token = r_auto.cookies.get("pqc_session_token")
+        assert alice_token
 
         # 3. Sign in Bob (EMEA) and verify both Alice and Bob have isolated partitioned directories on disk
         r_bob = client.post(
@@ -703,7 +798,10 @@ def test_auto_signin_account_switcher_and_partitioned_tenant_storage(tmp_path, m
             json={"google_access_token": f"valid:{BOB}", "region": "EMEA"},
         )
         assert r_bob.status_code == 200
-        bob_token = r_bob.json()["token"]
+        assert "token" not in r_bob.json()
+        bob_token = r_bob.cookies.get("pqc_session_token")
+        bob_csrf = r_bob.json()["csrf_token"]
+        assert bob_token
 
         # Create a session for Bob and update Bob's connection
         bob_sess = client.post("/api/sessions", headers=_hdr(bob_token), json={"title": "EMEA Banking PQC"}).json()
@@ -713,18 +811,27 @@ def test_auto_signin_account_switcher_and_partitioned_tenant_storage(tmp_path, m
             json={"mode": "impersonation", "organization_id": "222222222", "impersonated_service_account": "emea@p.iam.gserviceaccount.com"},
         )
 
-        # Verify partitioned files exist under <tmp_path>/data/tenants/<uid>/
-        bob_dir = tmp_path / "data" / "tenants" / BOB
-        alice_dir = tmp_path / "data" / "tenants" / ALICE
-        assert (bob_dir / "profile.json").is_file()
-        assert (bob_dir / "connection.json").is_file()
-        assert (bob_dir / "sessions" / f"{bob_sess['session_id']}.json").is_file()
-        assert (alice_dir / "profile.json").is_file()
+        # Verify authoritative records live in transactional DB tables and zero JSON dual-writes occur on disk
+        from pqc_agent import auth_store
 
-        # 4. Switch back to Alice via /api/auth/switch (1-click Gemini Account Switcher)
-        r_switch = client.post("/api/auth/switch", json={"token": alice_token, "region": "LATAM"})
+        store = auth_store.get_active_auth_store()
+        assert store.get_tenant_user(BOB)["region"] == "EMEA"
+        assert store.get_tenant_user(ALICE)["region"] == "NorthAm"
+        assert store.get_user_connection(BOB)["organization_id"] == "222222222"
+        assert store.get_session_metadata(bob_sess["session_id"], user_id=BOB)["title"] == "EMEA Banking PQC"
+        assert store.get_session_metadata(bob_sess["session_id"], user_id=ALICE) is None
+        assert not (tmp_path / "data" / "tenants").exists()
+
+        # 4. Passing bearer tokens in JSON to /api/auth/switch is rejected; switching uses HttpOnly pqc_account_jar + CSRF
+        assert client.post("/api/auth/switch", json={"token": alice_token, "region": "LATAM"}).status_code == 400
+        r_switch = client.post(
+            "/api/auth/switch",
+            headers={"X-PQC-CSRF-Token": bob_csrf},
+            json={"email": ALICE, "region": "LATAM"},
+        )
         assert r_switch.status_code == 200
         sw_data = r_switch.json()
+        assert "token" not in sw_data
         assert sw_data["authenticated"] is True
         assert sw_data["user_id"] == ALICE
         assert sw_data["user"]["region"] == "LATAM"
@@ -784,6 +891,7 @@ def test_phase1_oauth_pkce_oidc_nonce_expiry_and_redirect_uri_mismatch(tmp_path,
     from urllib.parse import parse_qs, urlparse
 
     from pqc_agent import auth_guard
+    from pqc_agent import auth_store as as_mod
     from pqc_agent import workspace_server as ws
 
     monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_ID", "portal-client.apps.googleusercontent.com")
@@ -825,7 +933,8 @@ def test_phase1_oauth_pkce_oidc_nonce_expiry_and_redirect_uri_mismatch(tmp_path,
     fake_urlopen.exp_offset = 600
     monkeypatch.setattr(ws.urllib.request, "urlopen", fake_urlopen)
 
-    with TestClient(_app(tmp_path)) as client:
+    app_inst = _app(tmp_path)
+    with TestClient(app_inst) as client:
         # 1. Open redirect / redirect_uri mismatch is rejected on signin and authorize
         assert (
             client.get("/api/auth/oauth/signin", params={"redirect_uri": "https://evil.example.com/cb"}, follow_redirects=False).status_code
@@ -841,19 +950,22 @@ def test_phase1_oauth_pkce_oidc_nonce_expiry_and_redirect_uri_mismatch(tmp_path,
             == 400
         )
 
-        # 2. /api/auth/oauth/signin includes PKCE S256 challenge and OIDC nonce, and callback verifies both
+        # 2. /api/auth/oauth/signin uses an opaque random state and stores PKCE S256 verifier ONLY server-side in DB
         start = client.get("/api/auth/oauth/signin", params={"region": "NorthAm"}, follow_redirects=False)
         assert start.status_code == 302
         qs = parse_qs(urlparse(start.headers["location"]).query)
         assert qs["response_type"] == ["code"]
         assert qs["code_challenge_method"] == ["S256"]
         state = qs["state"][0]
-        decoded_state = ws.verify_oauth_state(state)
-        assert decoded_state["code_verifier"]
-        assert auth_guard.compute_pkce_challenge(decoded_state["code_verifier"]) == qs["code_challenge"][0]
-        assert decoded_state["oidc_nonce"] == qs["nonce"][0]
+        assert "." not in state
+        with app_inst.state.auth_store._session_factory() as db:
+            tx_row = db.get(as_mod.OAuthTransactionRecord, state)
+            assert tx_row is not None
+            assert tx_row.code_verifier not in state
+            assert auth_guard.compute_pkce_challenge(tx_row.code_verifier) == qs["code_challenge"][0]
+            assert tx_row.oidc_nonce == qs["nonce"][0]
 
-        # Mismatched redirect_uri on callback is rejected
+        # Mismatched redirect_uri on callback is rejected without consuming or exchanging code
         bad_redir = client.get(
             "/api/auth/oauth/callback",
             params={"code": "auth-code-1", "state": state, "redirect_uri": "https://evil.example.com/cb"},
@@ -864,12 +976,15 @@ def test_phase1_oauth_pkce_oidc_nonce_expiry_and_redirect_uri_mismatch(tmp_path,
         start2 = client.get("/api/auth/oauth/signin", params={"region": "EMEA"}, follow_redirects=False)
         qs2 = parse_qs(urlparse(start2.headers["location"]).query)
         state2 = qs2["state"][0]
-        decoded_state2 = ws.verify_oauth_state(state2)
-        fake_urlopen.expected_nonce = decoded_state2["oidc_nonce"]
+        with app_inst.state.auth_store._session_factory() as db:
+            tx_row2 = db.get(as_mod.OAuthTransactionRecord, state2)
+            expected_verifier2 = tx_row2.code_verifier
+            fake_urlopen.expected_nonce = tx_row2.oidc_nonce
 
         cb_ok = client.get("/api/auth/oauth/callback", params={"code": "auth-code-2", "state": state2})
         assert cb_ok.status_code == 200
-        assert exchanged_requests and exchanged_requests[-1]["code_verifier"] == [decoded_state2["code_verifier"]]
+        assert exchanged_requests and exchanged_requests[-1]["code_verifier"] == [expected_verifier2]
+        assert exchanged_requests[-1]["client_secret"] == ["portal-client-secret"]
         # Popup HTML must NOT contain the session token or OAuth tokens
         assert "ya29.pkce-verified" not in cb_ok.text
         assert "jwt-from-code" not in cb_ok.text
@@ -884,12 +999,11 @@ def test_phase1_oauth_pkce_oidc_nonce_expiry_and_redirect_uri_mismatch(tmp_path,
 
         start4 = client.get("/api/auth/oauth/signin", follow_redirects=False)
         state4 = parse_qs(urlparse(start4.headers["location"]).query)["state"][0]
-        decoded_state4 = ws.verify_oauth_state(state4)
-        fake_urlopen.expected_nonce = decoded_state4["oidc_nonce"]
+        with app_inst.state.auth_store._session_factory() as db:
+            fake_urlopen.expected_nonce = db.get(as_mod.OAuthTransactionRecord, state4).oidc_nonce
         fake_urlopen.exp_offset = -600
         cb_expired = client.get("/api/auth/oauth/callback", params={"code": "auth-code-4", "state": state4})
         assert cb_expired.status_code == 401
-
 
 
 def test_phase1_no_localstorage_session_token_exposure_and_cookie_flags(tmp_path, monkeypatch, google_verifier):
@@ -903,6 +1017,7 @@ def test_phase1_no_localstorage_session_token_exposure_and_cookie_flags(tmp_path
 
     # 2. Verify Secure, HttpOnly, SameSite=lax cookies on HTTPS / production requests
     monkeypatch.setenv("K_SERVICE", "pqc-inventory-agent")
+    _allow_unit_test_db_when_no_live_pg(monkeypatch)
     with TestClient(_app(tmp_path)) as client:
         resp = client.post(
             "/api/auth/google",
@@ -910,6 +1025,7 @@ def test_phase1_no_localstorage_session_token_exposure_and_cookie_flags(tmp_path
             json={"google_access_token": f"valid:{ALICE}"},
         )
         assert resp.status_code == 200
+        assert "token" not in resp.json()
         set_cookies = resp.headers.get_list("set-cookie") if hasattr(resp.headers, "get_list") else [resp.headers.get("set-cookie", "")]
         joined = " ; ".join(set_cookies).lower()
         assert "pqc_session_token=" in joined
@@ -935,9 +1051,10 @@ def test_phase1_csrf_protection_session_fixation_rotation_and_logout_revocation(
         )
         assert login_resp.status_code == 200
         alice_data = login_resp.json()
-        alice_token = alice_data["token"]
+        assert "token" not in alice_data
+        alice_token = login_resp.cookies.get("pqc_session_token")
         csrf_token = alice_data["csrf_token"]
-        assert alice_token != planted_token
+        assert alice_token and alice_token != planted_token
         # The pre-planted token was revoked during login rotation
         assert ws.verify_tenant_session_token(planted_token) is None
 
@@ -985,9 +1102,15 @@ def test_phase1_csrf_protection_session_fixation_rotation_and_logout_revocation(
 def test_phase1_production_fail_closed_hmac_secret_rotation_and_iap_audience_enforcement(tmp_path, monkeypatch):
     from pqc_agent import auth_guard
     from pqc_agent import workspace_server as ws
+    from pqc_agent.migration_tool import run_alembic_upgrade_head
+
+    if os.getenv("PQC_TEST_POSTGRES_URL"):
+        monkeypatch.setenv("SESSION_DB_URL", os.environ["PQC_TEST_POSTGRES_URL"])
+    run_alembic_upgrade_head(os.environ["SESSION_DB_URL"])
 
     # 1. Production fails closed when PQC_AUTH_SECRET is missing or too short (< 32 chars)
     monkeypatch.setenv("K_SERVICE", "pqc-inventory-agent")
+    _allow_unit_test_db_when_no_live_pg(monkeypatch)
     monkeypatch.delenv("PQC_AUTH_SECRET", raising=False)
     monkeypatch.setattr(ws, "_AUTH_SECRET_CACHE", None)
     with pytest.raises(RuntimeError, match="PQC_AUTH_SECRET"):

@@ -8,7 +8,7 @@
 - `read_uploaded_artifact` returns the raw extracted content of a file attached to the conversation so the Gemini
   agent can read and interpret it. No keyword/regex parameter extraction is performed here.
 
-The ledger is persisted as JSONL (`/data/calibration-history.jsonl` on Cloud Run, `data/` locally).
+The calibration ledger is persisted transactionally in PostgreSQL (`pqc_calibration_events` table).
 """
 
 from __future__ import annotations
@@ -22,23 +22,6 @@ from typing import Any, Dict, List, Optional
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MAX_ARTIFACT_CHARS = int(os.getenv("PQC_MAX_ARTIFACT_CHARS", "60000"))
-
-
-def _resolve_default_calibration_path() -> str:
-    env_override = os.getenv("PQC_CALIBRATION_STORE_PATH", "").strip()
-    if env_override:
-        return env_override
-    if os.path.isdir("/data") and os.access("/data", os.W_OK):
-        return "/data/calibration-history.jsonl"
-    data_dir = os.path.join(PROJECT_ROOT, "data")
-    try:
-        os.makedirs(data_dir, exist_ok=True)
-        return os.path.join(data_dir, "calibration-history.jsonl")
-    except OSError:
-        return os.path.join(PROJECT_ROOT, "exports", "calibration_history.jsonl")
-
-
-DEFAULT_CALIBRATION_PATH = _resolve_default_calibration_path()
 
 # Session-scoped cache of text extracted from uploaded files (filled by the portal upload endpoint).
 _UPLOADED_ARTIFACT_CACHE: Dict[str, Dict[str, Any]] = {}
@@ -112,19 +95,12 @@ def _infer_sector_key(raw_text: str) -> str:
     return "ENTERPRISE_DEFAULT"
 
 
-def _load_calibration_ledger(store_path: Optional[str] = None) -> List[Dict[str, Any]]:
-    path = store_path or DEFAULT_CALIBRATION_PATH
-    if not os.path.exists(path):
-        return []
-    records: List[Dict[str, Any]] = []
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                if line.strip():
-                    records.append(json.loads(line))
-    except Exception:
-        return []
-    return records
+def _load_calibration_ledger(scope: Optional[str] = None) -> List[Dict[str, Any]]:
+    from pqc_agent import auth_store
+
+    if scope:
+        return auth_store.get_active_auth_store().list_calibration_events(scope=scope)
+    return []
 
 
 def _mosca(x: float, y: float, z: float) -> Dict[str, Any]:
@@ -149,23 +125,10 @@ def calibrate_assessment_context(
     gateway_header_limit_kb: Optional[int] = None,
     parameter_source_note: str = "",
 ) -> str:
-    """Records Mosca parameters for a scope and computes the Mosca inequality (X + Y > Z).
+    """Records Mosca parameters for a scope in ``pqc_calibration_events`` and computes the Mosca inequality (X + Y > Z)."""
+    from pqc_agent import auth_store
+    from tools.gcloud_bridge import get_current_tenant_user
 
-    Use this when stakeholders (or a document the user uploaded) state data shelf-life (X), migration time (Y) or the
-    assumed quantum threat horizon (Z). Missing values are filled from the sector baseline and flagged as defaults.
-
-    Args:
-        scope: Target scope (e.g. 'organizations/<id>' or 'projects/<id>').
-        industry_sector: Sector key or short description (normalized to a baseline profile).
-        confidentiality_years_x: Mosca X — years the protected data must stay confidential.
-        migration_years_y: Mosca Y — years needed to migrate to post-quantum cryptography.
-        crqc_horizon_years_z: Mosca Z — assumed years until a cryptographically relevant quantum computer.
-        gateway_header_limit_kb: Current HTTP header buffer limit on gateways/proxies, if known.
-        parameter_source_note: Where the values came from (stakeholder interview, questionnaire section, file name).
-
-    Returns:
-        JSON with the recorded entry, which parameters were provided vs. defaulted, and the Mosca arithmetic.
-    """
     sector_key = _infer_sector_key(industry_sector)
     base = SECTOR_CALIBRATION_PROFILES[sector_key]
     provided = {
@@ -179,9 +142,11 @@ def calibrate_assessment_context(
     z = float(crqc_horizon_years_z) if provided["crqc_horizon_years_z"] else base["default_crqc_horizon_years_z"]
     header_kb = int(gateway_header_limit_kb) if provided["gateway_header_limit_kb"] else base["gateway_header_limit_kb_default"]
 
+    active_uid = get_current_tenant_user()
     entry = {
         "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "scope": scope,
+        "user_id": active_uid,
         "industry_sector": sector_key,
         "sector_label": base["sector_label"],
         "mosca": _mosca(x, y, z),
@@ -189,21 +154,15 @@ def calibrate_assessment_context(
         "parameter_sources": {k: ("provided" if v else "sector_baseline_default") for k, v in provided.items()},
         "parameter_source_note": parameter_source_note,
     }
-    try:
-        os.makedirs(os.path.dirname(os.path.abspath(DEFAULT_CALIBRATION_PATH)), exist_ok=True)
-        with open(DEFAULT_CALIBRATION_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        persisted = True
-    except OSError:
-        persisted = False
-
-    scope_events = [r for r in _load_calibration_ledger() if r.get("scope") == scope]
+    store = auth_store.get_active_auth_store()
+    saved_entry = store.append_calibration_event(scope=scope, user_id=active_uid, entry=entry)
+    scope_events = store.list_calibration_events(scope=scope)
     return json.dumps(
         {
-            "status": "CALIBRATION_RECORDED" if persisted else "CALIBRATION_COMPUTED_NOT_PERSISTED",
-            "store_path": DEFAULT_CALIBRATION_PATH,
+            "status": "CALIBRATION_RECORDED",
+            "store_backend": "database:pqc_calibration_events",
             "scope_calibration_events": len(scope_events),
-            "recorded_entry": entry,
+            "recorded_entry": saved_entry,
             "baseline_notice": BASELINE_NOTICE if not all(provided.values()) else None,
         },
         separators=(",", ":"),
@@ -212,16 +171,8 @@ def calibrate_assessment_context(
 
 
 def get_historical_calibration_profile(scope: str = "organizations/default") -> str:
-    """Returns the Mosca calibration recorded for this exact scope, or the labeled default baseline if none exists.
-
-    Args:
-        scope: Target scope (e.g. 'organizations/<id>' or 'projects/<id>').
-
-    Returns:
-        JSON with `calibration_mode` (CALIBRATED_FOR_SCOPE or DEFAULT_BASELINE_NOT_CALIBRATED), the active profile,
-        the recent calibration trail for this scope and the available sector baselines.
-    """
-    scope_records = [r for r in _load_calibration_ledger() if r.get("scope") == scope]
+    """Returns the Mosca calibration recorded in ``pqc_calibration_events`` for this exact scope, or default baseline."""
+    scope_records = _load_calibration_ledger(scope=scope)
     if scope_records:
         return json.dumps(
             {
