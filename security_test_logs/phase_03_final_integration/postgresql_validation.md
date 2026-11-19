@@ -3,10 +3,11 @@
 ## 1. Target Test Identification
 - **Prompt Reference:** `tests/test_phase2_persistence_and_credentials.py::test_live_postgres_16_alembic_and_multi_instance_persistence`
 - **Actual Repository Pytest Node ID:** `tests/test_phase2_persistence_and_credentials.py::test_phase2_live_postgresql_multi_instance_integration` *(lines 1507–1606)*
+- **Tested Source Code Commit SHA:** `57a904f40196d013007052146ac6303278ec583f`
 - **Validation Timestamp (UTC):** `2026-11-19T15:11:33Z` – `2026-11-19T15:16:15Z`
-- **Environment Classification:** Dedicated test environment required (production and shared databases strictly forbidden).
+- **Environment Classification:** Dedicated disposable test database required (production and shared databases strictly forbidden).
 - **Status:** **`BLOCKED`**
-- **Execution Command Attempted:** *None — live execution intentionally withheld because mandatory credential and connectivity prerequisites were not met.*
+- **Execution Command Attempted:** *None — live execution intentionally withheld because mandatory connectivity and authorized credential prerequisites were not met.*
 - **Duration:** `N/A` *(not executed)*
 
 ---
@@ -16,12 +17,12 @@
 ### Dependencies & Fixtures
 - Autouse fixture `_clean_phase2_env` (`tests/test_phase2_persistence_and_credentials.py`, lines 108–136) clears production indicators (`K_SERVICE`, `PQC_PRODUCTION_MODE`, `PQC_ENV`, `DATABASE_URL`, `PQC_CLOUD_SQL_CONNECTION_NAME`, `PQC_DB_HOST`, `PQC_KMS_KEY_NAME`, OAuth client vars) and resets fallback stores.
 - Shared `tests/conftest.py` registers `FakeModelForTests` for offline chat plumbing so the multi-instance workflow does not call live Vertex AI.
-- Credential envelope encryption tests inside this function use `_DeterministicCloudKmsStub` (no live Cloud KMS calls).
+- Credential envelope encryption checks inside this test use `_DeterministicCloudKmsStub` (no live Cloud KMS calls).
 
 ### Required Environment Variables & External Resources
-- `PQC_TEST_POSTGRES_URL` — PostgreSQL connection URL pointing to a disposable PostgreSQL 16 database.
+- `PQC_TEST_POSTGRES_URL` — PostgreSQL connection URL pointing to a dedicated disposable PostgreSQL 16 database.
 - `PQC_ALLOW_DESTRUCTIVE_TEST_DB=true` — explicit opt-in required before any DB connection or SQL execution.
-- Reachable PostgreSQL 16 server (local daemon, container, or Cloud SQL Auth Proxy tunnel).
+- Reachable PostgreSQL 16 server (local daemon, container, or authorized secure proxy connection).
 
 ### Destructive Operations & Built-In Safeguards
 - **Operations Performed by the Test:**
@@ -36,30 +37,27 @@
   - Requires database name strictly matching `^pqc_test_[a-zA-Z0-9_]+$`.
   - Offline safety-guard regression test `test_phase2_destructive_postgres_safety_guard_and_zero_sql_on_rejection` **PASSED** during the local suite run, confirming zero SQL execution on rejected targets.
 - **Cleanup Behavior:**
-  - Closes SQLAlchemy connections (`store_a.close()`, `store_b.close()`), revokes synthetic Alice delegated tokens during assertions, and leaves the migrated schema and final synthetic rows inside the disposable `pqc_test_*` database (tables/database are not dropped after test completion).
+  - Closes SQLAlchemy connections (`store_a.close()`, `store_b.close()`), revokes synthetic delegated tokens during assertions, and leaves the migrated schema and final synthetic rows inside the disposable `pqc_test_*` database (tables/database are not dropped after test completion).
 
 ---
 
-## 3. Read-Only Prerequisite Audit & Exact Blocking Reasons
+## 3. Prerequisite Audit & Blocking Reasons
 
-All environment checks were strictly read-only (`--quiet` on `gcloud` read queries; zero infrastructure mutations):
+All environment checks were strictly read-only, and zero unauthorized infrastructure changes were performed:
 
-1. **Local Database & Container Runtime Unavailable:**
-   - Neither PostgreSQL binaries (`postgres`, `psql`, `pg_isready`, `initdb`), a local listener on TCP `5432`, nor container runtimes (`docker`, `podman`) are installed in the execution environment.
-   - Neither `cloud-sql-proxy` nor the Python `google.cloud.sql.connector` package is installed in the environment.
-2. **Dedicated Validation Project (`pqc-inventory-agent-validation`):**
-   - `sqladmin.googleapis.com` is disabled and no Cloud SQL instance exists. Creating Cloud SQL infrastructure or enabling APIs is prohibited without explicit authorization.
-3. **Existing Non-Production Lab Cloud SQL PostgreSQL 16 Instance:**
-   - Read-only inspection confirmed an existing dedicated non-production PostgreSQL 16 validation instance exists with disposable database `pqc_test_validation` and a built-in test database user (no unrelated or production databases).
-   - **Blocking Credential Prerequisite:** `PQC_TEST_POSTGRES_URL` and `PQC_ALLOW_DESTRUCTIVE_TEST_DB` are unset; IAM database authentication (`cloudsql_iam_authentication`) is not enabled on the instance; Secret Manager API is disabled on that project; and no existing password for the built-in test user is available in the environment or a configured secret store.
-   - Resetting a Cloud SQL user password, creating a new user, enabling IAM authentication, or modifying authorized networks would mutate Cloud SQL infrastructure without explicit authorization and was therefore prohibited.
+1. **No Local PostgreSQL 16 Runtime or Proxy Client Available:**
+   - Neither local PostgreSQL 16 binaries, a local PostgreSQL service on TCP `5432`, a local container runtime, nor a Cloud SQL proxy/connector client is available in the execution environment.
+2. **No Authorized Dedicated Test Database Credentials Configured:**
+   - Neither `PQC_TEST_POSTGRES_URL` (targeting a dedicated disposable `^pqc_test_[a-zA-Z0-9_]+$` PostgreSQL 16 database) nor `PQC_ALLOW_DESTRUCTIVE_TEST_DB=true` is configured, and no authorized test database credentials are provided through an existing secure authentication mechanism for this run.
+3. **No Unauthorized Infrastructure Mutations Performed:**
+   - Creating, modifying, or reconfiguring database instances, database accounts, authentication modes, network rules, or APIs is prohibited without explicit authorization. Consequently, the test was not attempted and remains **`BLOCKED`**.
 
 ---
 
 ## 4. Cleanup Confirmation & Sanitized Evidence
-- **Cleanup Required:** None (no database connection was opened, no migration ran, no `TRUNCATE` ran, and zero Cloud SQL resources were created or modified).
-- **Offline Regression Confirmation:** During the full safe repository run (`.venv/bin/pytest -v -rs`), all offline PostgreSQL URL normalization, Cloud SQL Unix socket translation, Alembic offline PostgreSQL DDL generation (`upgrade head --sql`), Alembic online migration cycle, fail-closed production checks, multi-instance 11-step workflow, and destructive-test safety guard tests in `tests/test_phase2_persistence_and_credentials.py` **PASSED**, while line 1507 reported:
+- **Cleanup Required:** None (no database connection was opened, no migration ran, no `TRUNCATE` ran, and zero database or cloud resources were created or modified).
+- **Offline Regression Confirmation:** During the full safe repository suite (`.venv/bin/pytest -v -rs`, `343 passed, 0 failed, 4 skipped` in `62.68s`), all offline PostgreSQL URL normalization, Unix socket translation, Alembic offline PostgreSQL DDL generation (`upgrade head --sql`), Alembic online migration cycle, fail-closed production checks, multi-instance 11-step workflow, and destructive-test safety guard tests in `tests/test_phase2_persistence_and_credentials.py` **PASSED**, while line 1507 reported:
   ```text
   SKIPPED [1] tests/test_phase2_persistence_and_credentials.py:1507: Live PostgreSQL 16 integration test requires disposable PQC_TEST_POSTGRES_URL and explicit PQC_ALLOW_DESTRUCTIVE_TEST_DB=true opt-in.
   ```
-- **Historical Context (Does Not Satisfy Phase 3 Live Re-Execution Gate):** Phase 1–2 validation previously executed this suite against PostgreSQL 16.15 prior to Phase 3 changes; however, Phase 3 live re-execution on `security-hardening/phase-03-runtime-resilience` remains **`BLOCKED`** until authorized credentials and connectivity are provided.
+- **Phase 3 Gate Status:** Live PostgreSQL 16 re-execution on `security-hardening/phase-03-runtime-resilience` remains **`BLOCKED`** until authorized dedicated test database credentials and connectivity are provided.
