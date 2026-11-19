@@ -16,15 +16,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
        google-cloud-cli \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /app/exports
+# Create dedicated unprivileged runtime user/group (UID/GID 10001) and writable ephemeral runtime dirs
+RUN groupadd --gid 10001 pqcapp \
+    && useradd --uid 10001 --gid 10001 --create-home --home-dir /home/pqcapp --shell /usr/sbin/nologin pqcapp \
+    && mkdir -p /tmp/pqc-exports /tmp/gcloud-config \
+    && chown -R 10001:10001 /home/pqcapp /tmp/pqc-exports /tmp/gcloud-config \
+    && chmod 0700 /home/pqcapp /tmp/pqc-exports /tmp/gcloud-config
 
 # Production posture:
 # - Authoritative transactional persistence MUST be Cloud SQL for PostgreSQL
 #   (injected via DATABASE_URL or PQC_CLOUD_SQL_CONNECTION_NAME + Secret Manager PQC_DB_PASSWORD).
 # - Production fails closed if PostgreSQL, PQC_AUTH_SECRET, or PQC_KMS_KEY_NAME is missing.
 # - Cloud Storage (PQC_ARTIFACT_BUCKET) is used strictly for object/artifact storage, never SQLite/FUSE.
+# - Runtime executes as non-root UID 10001 with immutable root-owned /app and writable ephemeral /tmp paths.
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    HOME=/home/pqcapp \
+    PQC_EXPORT_DIR=/tmp/pqc-exports \
+    CLOUDSDK_CONFIG=/tmp/gcloud-config \
     PQC_PRODUCTION_MODE=true \
     GOOGLE_GENAI_USE_VERTEXAI=TRUE \
     GOOGLE_CLOUD_PROJECT=pqc-inventory-agent-cd06 \
@@ -49,7 +58,14 @@ COPY tools ./tools
 COPY scripts/run_db_migrations.py ./scripts/run_db_migrations.py
 COPY scripts/migrate_sqlite_to_postgres.py ./scripts/migrate_sqlite_to_postgres.py
 COPY main.py .
-RUN chmod 0755 /app/scripts/run_db_migrations.py /app/scripts/migrate_sqlite_to_postgres.py
+
+# Lock /app code tree owned by root:root (read/execute only for UID 10001; runtime cannot tamper with code)
+RUN chown -R root:root /app \
+    && find /app -type d -exec chmod 0755 {} + \
+    && find /app -type f -exec chmod 0644 {} + \
+    && chmod 0755 /app/scripts/run_db_migrations.py /app/scripts/migrate_sqlite_to_postgres.py
+
+USER 10001:10001
 
 EXPOSE 8080
 

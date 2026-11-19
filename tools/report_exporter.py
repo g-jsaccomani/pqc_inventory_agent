@@ -391,7 +391,32 @@ def _slug(text: str, max_len: int = 60) -> str:
 
 
 def _default_output_dir() -> pathlib.Path:
-    return pathlib.Path(os.getenv("PQC_EXPORT_DIR", "exports"))
+    import tempfile
+
+    configured = (os.getenv("PQC_EXPORT_DIR") or "").strip()
+    if configured:
+        return pathlib.Path(configured)
+    if os.getenv("K_SERVICE") or (os.getenv("PQC_PRODUCTION_MODE") or "").strip().lower() in ("1", "true", "yes"):
+        return pathlib.Path(tempfile.gettempdir()) / "pqc-exports"
+    return pathlib.Path("exports")
+
+
+def _ensure_writable_output_dir() -> pathlib.Path:
+    import errno
+    import tempfile
+
+    out_dir = _default_output_dir()
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if not os.access(out_dir, os.W_OK):
+            raise PermissionError(f"Output directory is not writable: {out_dir}")
+        return out_dir
+    except OSError as exc:
+        if isinstance(exc, PermissionError) or exc.errno in (errno.EACCES, errno.EPERM, errno.EROFS):
+            fallback = pathlib.Path(tempfile.gettempdir()) / f"pqc-exports-{os.getuid()}"
+            fallback.mkdir(mode=0o700, parents=True, exist_ok=True)
+            return fallback
+        raise
 
 
 async def save_assessment_report(
@@ -423,8 +448,7 @@ async def save_assessment_report(
 
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
     base_name = f"{ts}_{_slug(report_type, 24)}_{_slug(report_title)}"
-    out_dir = _default_output_dir()
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = _ensure_writable_output_dir()
     md_path = out_dir / f"{base_name}.md"
     html_path = out_dir / f"{base_name}.html"
     md_path.write_text(content + "\n", encoding="utf-8")
