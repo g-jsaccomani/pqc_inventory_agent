@@ -23,9 +23,13 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
-from pqc_agent import upload_validator
-
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _upload_validator():
+    from pqc_agent import upload_validator
+
+    return upload_validator
 MAX_ARTIFACT_CHARS = int(os.getenv("PQC_MAX_ARTIFACT_CHARS", "60000"))
 
 DEFAULT_UPLOAD_CACHE_MAX_ENTRIES = 128
@@ -299,7 +303,8 @@ def clear_uploaded_artifact_cache() -> None:
 
 def extract_text_from_uploaded_bytes(filename: str, raw_bytes: bytes, mime_type: str = "") -> str:
     """Validates magic bytes/structure and extracts bounded text or X.509 metadata (zero latin-1 fallback)."""
-    validated = upload_validator.validate_and_extract_upload(
+    uv = _upload_validator()
+    validated = uv.validate_and_extract_upload(
         filename=filename,
         raw_bytes=raw_bytes,
         declared_mime=mime_type,
@@ -320,11 +325,12 @@ def register_uploaded_artifact_for_analysis(
     """Caches validated uploaded artifact text partitioned strictly by `(user_id, session_id, sanitized_filename)`."""
     global _UPLOADED_ARTIFACT_CACHE_BYTES
 
+    uv = _upload_validator()
     uid = _resolve_cache_tenant_user(user_id)
     safe_session = str(session_id or "default").strip() or "default"
 
     if extracted_text is None:
-        validated = upload_validator.validate_and_extract_upload(
+        validated = uv.validate_and_extract_upload(
             filename=filename,
             raw_bytes=raw_bytes,
             declared_mime=mime_type,
@@ -334,9 +340,9 @@ def register_uploaded_artifact_for_analysis(
         resolved_mime = validated.canonical_mime
         text_val = validated.extracted_text
     else:
-        safe_name = upload_validator.sanitize_upload_filename(filename, require_allowed_extension=True)
+        safe_name = uv.sanitize_upload_filename(filename, require_allowed_extension=True)
         resolved_mime = mime_type
-        text_val = str(extracted_text)[: upload_validator.max_extracted_text_chars()]
+        text_val = str(extracted_text)[: uv.max_extracted_text_chars()]
 
     text_bytes_len = len(text_val.encode("utf-8", errors="ignore"))
     cache_key = f"{uid}:{safe_session}:{safe_name}"
@@ -377,13 +383,14 @@ def register_uploaded_artifact_for_analysis(
 
 
 def _lookup_cached_artifact(user_id: str, session_id: str, artifact_name: str = "") -> Optional[Dict[str, Any]]:
+    uv = _upload_validator()
     now_mono = time.monotonic()
     with _UPLOAD_CACHE_LOCK:
         _prune_upload_cache_unlocked(now_mono)
         if artifact_name:
             try:
-                safe_name = upload_validator.sanitize_upload_filename(artifact_name, require_allowed_extension=False)
-            except upload_validator.UploadValidationError:
+                safe_name = uv.sanitize_upload_filename(artifact_name, require_allowed_extension=False)
+            except uv.UploadValidationError:
                 return None
             cache_key = f"{user_id}:{session_id}:{safe_name}"
         else:
@@ -425,6 +432,7 @@ async def read_uploaded_artifact(artifact_name: str = "", tool_context: Any = No
     Returns:
         JSON with `artifact_name`, `extracted_text` (truncated if very large), optional `csv_preview` and `source`.
     """
+    uv = _upload_validator()
     session_id = "default"
     ctx_user_id: Optional[str] = None
     if tool_context is not None:
@@ -446,8 +454,8 @@ async def read_uploaded_artifact(artifact_name: str = "", tool_context: Any = No
     name = (artifact_name or "").strip()
     if name:
         try:
-            name = upload_validator.sanitize_upload_filename(name, require_allowed_extension=False)
-        except upload_validator.UploadValidationError:
+            name = uv.sanitize_upload_filename(name, require_allowed_extension=False)
+        except uv.UploadValidationError:
             name = ""
     text: Optional[str] = None
     source = None

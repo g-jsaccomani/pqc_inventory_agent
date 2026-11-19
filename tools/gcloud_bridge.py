@@ -39,8 +39,6 @@ import threading
 import time
 from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple
 
-from pqc_agent import auth_guard, egress_guard
-
 logger = logging.getLogger(__name__)
 
 DEFAULT_TENANT_USER_ID = "sec-architect"
@@ -91,6 +89,8 @@ def is_adc_authorized_user(user_id: Optional[str]) -> bool:
     """
     if not _is_authenticated_email_identity(user_id):
         return False
+    from pqc_agent import auth_guard
+
     norm_uid = normalize_user_id(user_id)
     admins = auth_guard.admin_emails()
     if not admins:
@@ -1841,6 +1841,8 @@ def build_sanitized_gcloud_env(
 
 
 def _scrub_output(text: Optional[str], *, secret_values: Sequence[str] = ()) -> str:
+    from pqc_agent import egress_guard
+
     cleaned = egress_guard.redact_sensitive_text(text or "")
     for secret in secret_values:
         s = (secret or "").strip()
