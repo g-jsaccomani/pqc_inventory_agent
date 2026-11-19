@@ -743,8 +743,13 @@ def test_p3_01_gcloud_environment_sanitization_strips_endpoint_overrides_and_pro
     monkeypatch.setenv("SSL_CERT_FILE", "/tmp/rogue_ca.pem")
     monkeypatch.setenv("REQUESTS_CA_BUNDLE", "/tmp/rogue_ca.pem")
     monkeypatch.setenv("LD_PRELOAD", "/tmp/evil.so")
-    gcloud_bridge.set_gcp_connection_config(mode="adc", user_id="env-test@google.com")
+    monkeypatch.setenv("PQC_ADMIN_EMAILS", "env-test@google.com")
     gcloud_bridge.set_current_tenant_user("env-test@google.com")
+    gcloud_bridge.set_gcp_connection_config(
+        mode="adc",
+        project_id="pqc-inventory-agent-cd06",
+        user_id="env-test@google.com",
+    )
     # Ensure singleton test store is bound in active context before simulating Cloud Run K_SERVICE env var
     tok_store = auth_store.set_active_auth_store(auth_store.get_active_auth_store())
 
@@ -837,7 +842,7 @@ def test_p3_01_gcloud_environment_sanitization_strips_endpoint_overrides_and_pro
         "gcloud folders list --organization=31564119954 --format=json",
         "gcloud run services describe checkout-api --region=us-central1 --project=pqc-inventory-agent-cd06 --format=json",
         "gcloud container clusters describe prod-gke --location=us-central1 --project=pqc-inventory-agent-cd06 --format=json",
-        "gcloud storage buckets describe gs://pqc-audit-evidence-bucket --project=pqc-inventory-agent-cd06 --format=json",
+        "gcloud storage buckets list --project=pqc-inventory-agent-cd06 --format=json",
         "gcloud iam service-accounts describe workload-sa@pqc-inventory-agent-cd06.iam.gserviceaccount.com --project=pqc-inventory-agent-cd06",
         "gcloud version",
         "gcloud --version --quiet",
@@ -1026,7 +1031,10 @@ def test_p3_01_confused_deputy_delegated_token_never_falls_back_to_adc(
         )
         assert unapproved_imp.status_code == 403
 
-        # Case 5: Explicit trusted ADC selection via /api/connection still works as designed
+        # Case 5: Non-admin ADC selection is denied (403); explicit trusted admin ADC selection works within scope
+        unauth_adc_switch = client.post("/api/connection", headers=headers, json={"mode": "adc"})
+        assert unauth_adc_switch.status_code == 403
+        monkeypatch.setenv("PQC_ADMIN_EMAILS", "alice@google.com")
         adc_switch = client.post("/api/connection", headers=headers, json={"mode": "adc"})
         assert adc_switch.status_code == 200
         assert adc_switch.json()["mode"] == "adc"

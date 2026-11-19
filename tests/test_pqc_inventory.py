@@ -553,8 +553,15 @@ def test_multimodal_upload_is_attached_for_the_model_without_pre_analysis(tmp_pa
         assert "discovery.md" in detail["artifacts"]
 
 
-def test_gcloud_bridge_connection_modes_and_safe_command_execution():
-    from tools.gcloud_bridge import execute_gcloud_command, get_gcp_connection_config, set_gcp_connection_config, validate_gcloud_command
+def test_gcloud_bridge_connection_modes_and_safe_command_execution(monkeypatch):
+    from tools.gcloud_bridge import (
+        execute_gcloud_command,
+        get_current_tenant_user,
+        get_gcp_connection_config,
+        set_current_tenant_user,
+        set_gcp_connection_config,
+        validate_gcloud_command,
+    )
 
     for safe_cmd in (
         "gcloud kms keys list --location=global --format=json",
@@ -573,11 +580,21 @@ def test_gcloud_bridge_connection_modes_and_safe_command_execution():
         assert validate_gcloud_command(blocked_cmd)[0] is False, blocked_cmd
         assert json.loads(execute_gcloud_command(blocked_cmd))["status"] == "BLOCKED_DESTRUCTIVE_OR_INVALID_COMMAND"
 
-    token_state = set_gcp_connection_config(mode="access_token", access_token="ya29.example_short_lived_token")
-    assert token_state["has_access_token"] is True
-    assert "ya29.example_short_lived_token" not in json.dumps(token_state)
-    set_gcp_connection_config(mode="adc")
-    assert get_gcp_connection_config()["mode"] == "adc"
+    monkeypatch.setenv("PQC_ADMIN_EMAILS", "admin@google.com")
+    prev_user = get_current_tenant_user()
+    set_current_tenant_user("admin@google.com")
+    try:
+        token_state = set_gcp_connection_config(
+            mode="access_token",
+            access_token="ya29.example_short_lived_token",
+            user_id="admin@google.com",
+        )
+        assert token_state["has_access_token"] is True
+        assert "ya29.example_short_lived_token" not in json.dumps(token_state)
+        set_gcp_connection_config(mode="adc", user_id="admin@google.com")
+        assert get_gcp_connection_config(user_id="admin@google.com")["mode"] == "adc"
+    finally:
+        set_current_tenant_user(prev_user)
 
 
 def test_portal_ui_is_gemini_only_dynamic_and_transparent(tmp_path, monkeypatch):
@@ -712,6 +729,11 @@ def test_multi_tenant_google_auth_regional_sessions_and_isolated_connections(tmp
         assert kenji_token
 
         # 3. Isolated GCP Connection Config per @google.com user
+        monkeypatch.setenv(
+            "PQC_ALLOWED_IMPERSONATION_SERVICE_ACCOUNTS",
+            "pqc-sa@alice-northam-proj.iam.gserviceaccount.com",
+        )
+        monkeypatch.setenv("PQC_ADMIN_EMAILS", "rahul@google.com")
         client.post(
             "/api/connection",
             headers={"X-PQC-User-Token": alice_token},
@@ -746,10 +768,10 @@ def test_multi_tenant_google_auth_regional_sessions_and_isolated_connections(tmp
         assert rahul_conn["organization_id"] == "222222222222"
         assert rahul_conn["project_id"] == "rahul-india-proj"
 
-        # Anna in EMEA still has the default demo connection untouched
+        # Non-admin Anna in EMEA defaults to isolated delegated OAuth 3LO mode (never server ADC)
         assert anna_conn["user_id"] == "anna@google.com"
-        assert anna_conn["mode"] == "adc"
-        assert anna_conn["organization_id"] == "31564119954"
+        assert anna_conn["mode"] == "access_token"
+        assert anna_conn["organization_id"] == ""
 
         # 4. Isolated Persistent Sessions per @google.com user
         alice_sess = client.post(
@@ -976,6 +998,8 @@ def test_all_five_phases_and_connection_modes_through_chat_api(tmp_path, monkeyp
 
     monkeypatch.setenv("PQC_DATA_DIR", str(tmp_path / "tenant_store"))
     monkeypatch.setenv("PQC_ALLOW_UNVERIFIED_SIGNIN", "true")
+    monkeypatch.setenv("PQC_ADMIN_EMAILS", "jsaccomani@google.com")
+    monkeypatch.setenv("PQC_ALLOWED_IMPERSONATION_SERVICE_ACCOUNTS", "sa@proj.iam.gserviceaccount.com")
 
     # 1. Verify all underlying phase tools execute cleanly on DEMO_SCOPE
     kms = json.loads(collect_kms_inventory(DEMO_SCOPE))

@@ -1,23 +1,25 @@
 """Antigravity-Style 'gcloud' CLI Execution Bridge & Dynamic GCP Connection Manager.
 
-Supports 3 connection modes switchable at runtime from the Gemini Enterprise Workspace Portal UI:
-1. 'adc' ('Service Account (Default ADC)')
-2. 'impersonation' ('Service Account Impersonation', e.g., 'pqc-reader@customer-project.iam.gserviceaccount.com')
-3. 'access_token' ('User gcloud Access Token' from `gcloud auth print-access-token` or 3LO OAuth)
+Supports 3 connection modes:
+1. 'access_token' ('User gcloud Access Token' / 3-Legged OAuth — default for all external/non-admin users)
+2. 'impersonation' ('Service Account Impersonation' — default-deny; requires explicit server-side allowlist
+   `PQC_ALLOWED_IMPERSONATION_SERVICE_ACCOUNTS`)
+3. 'adc' ('Service Account (Default ADC)' — default-deny; restricted strictly to server-authorized administrators
+   in `PQC_ADMIN_EMAILS`)
 
-Security Guarantees (Phase 1–3 Hardened):
-- Delegated user OAuth tokens are envelope-encrypted in PostgreSQL (`EncryptedDatabaseCredentialService`) and never
-  written to plaintext files, logs, or frontend payloads.
-- `validate_gcloud_command()` enforces a strict structured grammar: executable must be `gcloud`, top-level service
-  groups and `(group, ..., verb)` paths must match explicit read-only policies, flags are validated against per-command
-  allowlists with typed value validators, duplicate flags are rejected, and dangerous flags (`--api-endpoint-overrides`,
-  `--property`, `--impersonate-service-account`, `--flags-file`, `--credential-file-override`, `--access-token-file`,
-  `--account`, `--configuration`, `--log-http`, URL values, etc.) fail closed unconditionally.
-- `build_sanitized_gcloud_env()` constructs a clean subprocess environment from an explicit safe-variable allowlist,
-  stripping inherited `CLOUDSDK_API_ENDPOINT_OVERRIDES_*`, proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, etc.), and
-  ambient credential overrides while preserving legitimate Cloud Run ADC behavior.
-- `execute_gcloud_command()` enforces strict tenant credential boundaries: `access_token` mode uses ONLY the caller's
-  delegated token and NEVER falls back to server ADC on `PERMISSION_DENIED`, missing token, or token expiration.
+Security Guarantees (Phase 1–3.1 + P0 Authorization Hotfix):
+- **Default-Deny Server ADC & Impersonation:** External users cannot activate, persist, default into, or auto-switch
+  into `mode='adc'` or unauthorized `mode='impersonation'`. Authorization is enforced across HTTP routes,
+  `set_gcp_connection_config()`, `get_gcp_connection_config()`, `get_active_gcp_credentials()`,
+  `build_sanitized_gcloud_env()`, and `execute_gcloud_command()`.
+- **Independent Tenant & Resource Scope Enforcement:** `authorize_gcloud_command_scope()` validates `--project`,
+  `--organization`, `--folder`, `--scope`, positional hierarchy arguments, embedded `projects/...`,
+  `organizations/...`, `folders/...` resource paths, and service-account principals independently of the command
+  grammar, rejecting unscoped enumeration and cross-tenant queries before any subprocess executes.
+- **Trusted Executable Resolution:** `resolve_trusted_gcloud_binary()` never consults `PATH` or `shutil.which()`;
+  it resolves only root/system-installed `gcloud` binaries from `TRUSTED_GCLOUD_PATHS` with `realpath` and
+  world-writable permission checks.
+- **Zero Confused-Deputy Fallback:** Delegated `access_token` failures never retry or escalate to server ADC.
 """
 
 from __future__ import annotations
@@ -30,14 +32,14 @@ import logging
 import os
 import re
 import shlex
-import shutil
+import stat
 import subprocess
 import tempfile
 import threading
 import time
-from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple
 
-from pqc_agent import egress_guard
+from pqc_agent import auth_guard, egress_guard
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +50,7 @@ _CURRENT_USER_ID: contextvars.ContextVar[str] = contextvars.ContextVar(
 
 
 def normalize_user_id(user_id: Optional[str]) -> str:
-    """Normalizes a user identifier or @google.com email (stripping Cloud IAP prefixes if present)."""
+    """Normalizes a user identifier or corporate email (stripping Cloud IAP prefixes if present)."""
     if not user_id:
         return DEFAULT_TENANT_USER_ID
     cleaned = str(user_id).strip()
@@ -71,6 +73,40 @@ def set_current_tenant_user(user_id: Optional[str]) -> str:
 def get_current_tenant_user() -> str:
     """Returns the active tenant user ID for the current async/thread execution context."""
     return normalize_user_id(_CURRENT_USER_ID.get())
+
+
+def _is_authenticated_email_identity(user_id: Optional[str]) -> bool:
+    norm = normalize_user_id(user_id)
+    if not norm or norm == DEFAULT_TENANT_USER_ID or "@" not in norm:
+        return False
+    local_part, _, domain = norm.rpartition("@")
+    return bool(local_part and domain)
+
+
+def is_adc_authorized_user(user_id: Optional[str]) -> bool:
+    """Returns True ONLY if `user_id` is explicitly authorized for server ADC via `PQC_ADMIN_EMAILS`.
+
+    Default-deny in all environments (including local dev/test): never trusts client parameters, scopes,
+    headers, project IDs, organization IDs, session IDs, or absence of `K_SERVICE`.
+    """
+    if not _is_authenticated_email_identity(user_id):
+        return False
+    norm_uid = normalize_user_id(user_id)
+    admins = auth_guard.admin_emails()
+    if not admins:
+        return False
+    return norm_uid in admins
+
+
+def authorize_adc_mode(user_id: Optional[str]) -> str:
+    """Validates that `user_id` is authorized to activate or execute under server ADC; raises `PermissionError` otherwise."""
+    norm_uid = normalize_user_id(user_id)
+    if not is_adc_authorized_user(norm_uid):
+        raise PermissionError(
+            "ADC_UNAUTHORIZED: Forbidden: Server Service Account (ADC) mode is restricted to server-authorized "
+            "administrators (PQC_ADMIN_EMAILS). External and non-administrative users must use delegated OAuth 2.0 credentials."
+        )
+    return norm_uid
 
 
 # Allowed connection mode identifiers and human-readable labels
@@ -104,6 +140,32 @@ _MODE_ALIASES: Dict[str, str] = {
     "user_oauth": "access_token",
     "user oauth 2.0 (3lo)": "access_token",
 }
+
+# Trusted absolute installation paths for the `gcloud` CLI executable (never resolved from PATH or ~)
+TRUSTED_GCLOUD_PATHS: Tuple[str, ...] = (
+    "/usr/bin/gcloud",
+    "/usr/local/bin/gcloud",
+    "/google-cloud-sdk/bin/gcloud",
+    "/opt/google-cloud-sdk/bin/gcloud",
+    "/usr/lib/google-cloud-sdk/bin/gcloud",
+    "/snap/google-cloud-cli/current/bin/gcloud",
+    "/opt/homebrew/bin/gcloud",
+)
+
+TRUSTED_GCLOUD_REALPATH_PREFIXES: Tuple[str, ...] = (
+    "/usr/bin/",
+    "/usr/local/",
+    "/usr/lib/google-cloud-sdk/",
+    "/usr/share/google-cloud-sdk/",
+    "/google-cloud-sdk/",
+    "/opt/google-cloud-sdk/",
+    "/snap/google-cloud-cli/",
+    "/opt/homebrew/",
+)
+
+TRUSTED_SUBPROCESS_PATH = (
+    "/usr/bin:/bin:/usr/local/bin:/google-cloud-sdk/bin:/opt/google-cloud-sdk/bin:/opt/homebrew/bin"
+)
 
 # Read-only verbs allowed in `execute_gcloud_command`
 ALLOWED_GCLOUD_VERBS: FrozenSet[str] = frozenset(
@@ -204,6 +266,7 @@ _BLOCKED_FLAG_PREFIXES: Tuple[str, ...] = (
     "--account",
     "--config",
     "--log-http",
+    "--billing-project",
     "--no-",
 )
 
@@ -228,7 +291,12 @@ _POSITIVE_INT_RE = re.compile(r"^[1-9][0-9]{0,4}$")
 _FORMAT_RE = re.compile(
     r"^(?:json|yaml|text|list|none|(?:value|table|csv)(?:\[[a-zA-Z0-9_.,=-]+\])?\([a-zA-Z0-9_.,:\[\]()=/ -]{1,160}\))$"
 )
-_BUCKET_ARG_RE = re.compile(r"^(?:gs://)?[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]$")
+
+# Embedded resource hierarchy extractors for independent scope enforcement
+_EMBEDDED_PROJECT_RE = re.compile(r"(?:^|/)projects/((?:[a-z0-9.-]+:)?[a-zA-Z0-9_-]+)")
+_EMBEDDED_ORG_RE = re.compile(r"(?:^|/)organizations/([0-9]+)")
+_EMBEDDED_FOLDER_RE = re.compile(r"(?:^|/)folders/([0-9]+)")
+_EMBEDDED_SA_PROJECT_RE = re.compile(r"[a-zA-Z0-9._-]+@([a-zA-Z0-9.-]+)\.iam\.gserviceaccount\.com")
 
 _LOCK = threading.RLock()
 _SA_EMAIL_PATTERN = re.compile(r"^[a-zA-Z0-9._-]+@[a-zA-Z0-9.-]+\.iam\.gserviceaccount\.com$")
@@ -249,7 +317,27 @@ class _CommandPolicy:
     positional_validator: Optional[Callable[[str], Optional[str]]] = None
 
 
-def _check_common_arg_safety(value: str, *, allow_gs_uri: bool = False) -> Optional[str]:
+@dataclass(frozen=True)
+class AuthorizedTenantScope:
+    """Authorized GCP resource hierarchy boundaries for a specific authenticated tenant caller."""
+
+    user_id: str
+    projects: FrozenSet[str]
+    organizations: FrozenSet[str]
+    folders: FrozenSet[str]
+
+
+@dataclass(frozen=True)
+class _ServerScopePolicy:
+    has_project_restriction: bool
+    projects: FrozenSet[str]
+    has_org_restriction: bool
+    organizations: FrozenSet[str]
+    has_folder_restriction: bool
+    folders: FrozenSet[str]
+
+
+def _check_common_arg_safety(value: str) -> Optional[str]:
     if not value:
         return "Empty argument value is not permitted."
     if len(value) > 512:
@@ -262,8 +350,7 @@ def _check_common_arg_safety(value: str, *, allow_gs_uri: bool = False) -> Optio
         return "Path traversal sequences ('..') are prohibited."
     if _ENDPOINT_INJECTION_RE.search(value):
         return "Endpoint override or metadata address injection in argument value is prohibited."
-    check_target = value[5:] if (allow_gs_uri and value.startswith("gs://")) else value
-    if _URL_SCHEME_IN_VALUE_RE.search(check_target):
+    if _URL_SCHEME_IN_VALUE_RE.search(value):
         return "HTTP/HTTPS or external URI schemes in gcloud arguments are prohibited."
     return None
 
@@ -312,15 +399,6 @@ def _validate_resource_ref_value(val: str) -> Optional[str]:
         return f"Malformed resource identifier '{val}'."
     if not _RESOURCE_NAME_OR_PATH_RE.match(val):
         return f"Invalid resource identifier '{val}'."
-    return None
-
-
-def _validate_bucket_positional(val: str) -> Optional[str]:
-    err = _check_common_arg_safety(val, allow_gs_uri=True)
-    if err:
-        return err
-    if not _BUCKET_ARG_RE.match(val):
-        return f"Invalid Cloud Storage bucket identifier '{val}'."
     return None
 
 
@@ -402,17 +480,18 @@ _COMMON_IAM_FLAGS: FrozenSet[str] = frozenset(
     {"--filter", "--format", "--limit", "--page-size", "--flatten", "--quiet"}
 )
 
+# Service groups whose commands are inherently project-scoped when `--project` is omitted
+_PROJECT_SCOPED_GROUPS: FrozenSet[str] = frozenset(
+    {"kms", "compute", "privateca", "certificate-manager", "iam", "run", "container", "sql", "storage"}
+)
+
 
 def _build_command_policies() -> Dict[Tuple[str, ...], _CommandPolicy]:
     policies: List[_CommandPolicy] = [
-        # Version
+        # Local binary version diagnostic
         _CommandPolicy(("version",), frozenset({"--format", "--quiet"}), 0),
         # Cloud KMS
-        _CommandPolicy(
-            ("kms", "keyrings", "list"),
-            _COMMON_LIST_FLAGS | {"--project", "--location"},
-            0,
-        ),
+        _CommandPolicy(("kms", "keyrings", "list"), _COMMON_LIST_FLAGS | {"--project", "--location"}, 0),
         _CommandPolicy(
             ("kms", "keyrings", "describe"),
             _COMMON_DESCRIBE_FLAGS | {"--project", "--location"},
@@ -425,11 +504,7 @@ def _build_command_policies() -> Dict[Tuple[str, ...], _CommandPolicy]:
             1,
             _validate_resource_ref_value,
         ),
-        _CommandPolicy(
-            ("kms", "keys", "list"),
-            _COMMON_LIST_FLAGS | {"--project", "--location", "--keyring"},
-            0,
-        ),
+        _CommandPolicy(("kms", "keys", "list"), _COMMON_LIST_FLAGS | {"--project", "--location", "--keyring"}, 0),
         _CommandPolicy(
             ("kms", "keys", "describe"),
             _COMMON_DESCRIBE_FLAGS | {"--project", "--location", "--keyring"},
@@ -576,22 +651,14 @@ def _build_command_policies() -> Dict[Tuple[str, ...], _CommandPolicy]:
             1,
             _validate_resource_ref_value,
         ),
-        _CommandPolicy(
-            ("compute", "instances", "list"),
-            _COMMON_LIST_FLAGS | {"--project", "--zone"},
-            0,
-        ),
+        _CommandPolicy(("compute", "instances", "list"), _COMMON_LIST_FLAGS | {"--project", "--zone"}, 0),
         _CommandPolicy(
             ("compute", "instances", "describe"),
             _COMMON_DESCRIBE_FLAGS | {"--project", "--zone"},
             1,
             _validate_resource_ref_value,
         ),
-        _CommandPolicy(
-            ("compute", "disks", "list"),
-            _COMMON_LIST_FLAGS | {"--project", "--zone", "--region"},
-            0,
-        ),
+        _CommandPolicy(("compute", "disks", "list"), _COMMON_LIST_FLAGS | {"--project", "--zone", "--region"}, 0),
         _CommandPolicy(
             ("compute", "disks", "describe"),
             _COMMON_DESCRIBE_FLAGS | {"--project", "--zone", "--region"},
@@ -599,11 +666,7 @@ def _build_command_policies() -> Dict[Tuple[str, ...], _CommandPolicy]:
             _validate_resource_ref_value,
         ),
         # Certificate Authority Service (Private CA)
-        _CommandPolicy(
-            ("privateca", "pools", "list"),
-            _COMMON_LIST_FLAGS | {"--project", "--location"},
-            0,
-        ),
+        _CommandPolicy(("privateca", "pools", "list"), _COMMON_LIST_FLAGS | {"--project", "--location"}, 0),
         _CommandPolicy(
             ("privateca", "pools", "describe"),
             _COMMON_DESCRIBE_FLAGS | {"--project", "--location"},
@@ -649,11 +712,7 @@ def _build_command_policies() -> Dict[Tuple[str, ...], _CommandPolicy]:
             1,
             _validate_resource_ref_value,
         ),
-        _CommandPolicy(
-            ("privateca", "templates", "list"),
-            _COMMON_LIST_FLAGS | {"--project", "--location"},
-            0,
-        ),
+        _CommandPolicy(("privateca", "templates", "list"), _COMMON_LIST_FLAGS | {"--project", "--location"}, 0),
         _CommandPolicy(
             ("privateca", "templates", "describe"),
             _COMMON_DESCRIBE_FLAGS | {"--project", "--location"},
@@ -694,22 +753,16 @@ def _build_command_policies() -> Dict[Tuple[str, ...], _CommandPolicy]:
             1,
             _validate_resource_ref_value,
         ),
-        # Resource Hierarchy (Projects, Folders, Organizations)
-        _CommandPolicy(("projects", "list"), _COMMON_LIST_FLAGS, 0),
+        # Scoped Resource Hierarchy Inspection (`projects list` and `organizations list` intentionally excluded: unscoped!)
         _CommandPolicy(("projects", "describe"), _COMMON_DESCRIBE_FLAGS, 1, _validate_project_value),
         _CommandPolicy(("projects", "get-iam-policy"), _COMMON_IAM_FLAGS, 1, _validate_project_value),
         _CommandPolicy(("projects", "get-ancestors"), _COMMON_DESCRIBE_FLAGS, 1, _validate_project_value),
-        _CommandPolicy(
-            ("folders", "list"),
-            _COMMON_LIST_FLAGS | {"--organization", "--folder"},
-            0,
-        ),
+        _CommandPolicy(("folders", "list"), _COMMON_LIST_FLAGS | {"--organization", "--folder"}, 0),
         _CommandPolicy(("folders", "describe"), _COMMON_DESCRIBE_FLAGS, 1, _validate_numeric_id_value),
         _CommandPolicy(("folders", "get-iam-policy"), _COMMON_IAM_FLAGS, 1, _validate_numeric_id_value),
-        _CommandPolicy(("organizations", "list"), _COMMON_LIST_FLAGS, 0),
         _CommandPolicy(("organizations", "describe"), _COMMON_DESCRIBE_FLAGS, 1, _validate_numeric_id_value),
         _CommandPolicy(("organizations", "get-iam-policy"), _COMMON_IAM_FLAGS, 1, _validate_numeric_id_value),
-        # Workload verification groups for MEDIUM-evidence correlation
+        # Workload verification groups (`storage buckets describe` excluded: global bucket namespace bypasses --project!)
         _CommandPolicy(("iam", "service-accounts", "list"), _COMMON_LIST_FLAGS | {"--project"}, 0),
         _CommandPolicy(
             ("iam", "service-accounts", "describe"),
@@ -723,22 +776,14 @@ def _build_command_policies() -> Dict[Tuple[str, ...], _CommandPolicy]:
             1,
             _validate_resource_ref_value,
         ),
-        _CommandPolicy(
-            ("run", "services", "list"),
-            _COMMON_LIST_FLAGS | {"--project", "--region"},
-            0,
-        ),
+        _CommandPolicy(("run", "services", "list"), _COMMON_LIST_FLAGS | {"--project", "--region"}, 0),
         _CommandPolicy(
             ("run", "services", "describe"),
             _COMMON_DESCRIBE_FLAGS | {"--project", "--region"},
             1,
             _validate_resource_ref_value,
         ),
-        _CommandPolicy(
-            ("run", "jobs", "list"),
-            _COMMON_LIST_FLAGS | {"--project", "--region"},
-            0,
-        ),
+        _CommandPolicy(("run", "jobs", "list"), _COMMON_LIST_FLAGS | {"--project", "--region"}, 0),
         _CommandPolicy(
             ("run", "jobs", "describe"),
             _COMMON_DESCRIBE_FLAGS | {"--project", "--region"},
@@ -764,12 +809,6 @@ def _build_command_policies() -> Dict[Tuple[str, ...], _CommandPolicy]:
             _validate_resource_ref_value,
         ),
         _CommandPolicy(("storage", "buckets", "list"), _COMMON_LIST_FLAGS | {"--project"}, 0),
-        _CommandPolicy(
-            ("storage", "buckets", "describe"),
-            _COMMON_DESCRIBE_FLAGS | {"--project"},
-            1,
-            _validate_bucket_positional,
-        ),
     ]
     return {p.command_path: p for p in policies}
 
@@ -779,7 +818,6 @@ ALLOWED_GCLOUD_GROUPS: FrozenSet[str] = frozenset(path[0] for path in _COMMAND_P
 
 # Safe OS/Cloud Run environment variables preserved across sanitized gcloud subprocess invocations
 _SAFE_BASE_ENV_VARS: Tuple[str, ...] = (
-    "PATH",
     "HOME",
     "USER",
     "LOGNAME",
@@ -797,19 +835,115 @@ _SAFE_BASE_ENV_VARS: Tuple[str, ...] = (
 )
 
 
-def _default_connection_template() -> Dict[str, Any]:
+def _principal_matches_rule(user_id: Optional[str], principal_pattern: str) -> bool:
+    if principal_pattern == "*":
+        return True
+    if not _is_authenticated_email_identity(user_id):
+        return False
+    norm_uid = normalize_user_id(user_id)
+    pat = principal_pattern.strip().lower()
+    if pat.startswith("@"):
+        return norm_uid.endswith(pat)
+    return norm_uid == pat
+
+
+def _parse_scoped_allowlist_env(env_var_name: str, user_id: Optional[str]) -> Tuple[bool, FrozenSet[str]]:
+    """Parses comma-separated global or `principal=value` allowlist entries from a server environment variable."""
+    raw = (os.getenv(env_var_name) or "").strip()
+    if not raw:
+        return False, frozenset()
+    matched: Set[str] = set()
+    for item in raw.split(","):
+        token = item.strip()
+        if not token:
+            continue
+        if "=" in token:
+            principal_pat, _, val = token.partition("=")
+            clean_val = val.strip()
+            if clean_val and _principal_matches_rule(user_id, principal_pat):
+                matched.add(clean_val)
+        else:
+            matched.add(token)
+    return True, frozenset(matched)
+
+
+def _load_server_scope_policy(user_id: Optional[str]) -> _ServerScopePolicy:
+    """Loads non-spoofable server-side project/organization/folder authorization rules for `user_id`."""
+    has_proj, projs_set = _parse_scoped_allowlist_env("PQC_ALLOWED_PROJECTS", user_id)
+    has_org, orgs_set = _parse_scoped_allowlist_env("PQC_ALLOWED_ORGANIZATIONS", user_id)
+    has_fld, flds_set = _parse_scoped_allowlist_env("PQC_ALLOWED_FOLDERS", user_id)
+
+    projs = set(projs_set)
+    orgs = {o.replace("organizations/", "") for o in orgs_set}
+    flds = {f.replace("folders/", "") for f in flds_set}
+
+    raw_json = (os.getenv("PQC_TENANT_SCOPE_POLICY") or "").strip()
+    if raw_json:
+        has_proj = True
+        has_org = True
+        has_fld = True
+        try:
+            parsed = json.loads(raw_json)
+            if isinstance(parsed, Mapping):
+                for key, spec in parsed.items():
+                    if _principal_matches_rule(user_id, str(key)) and isinstance(spec, Mapping):
+                        for p in spec.get("projects") or []:
+                            if str(p).strip():
+                                projs.add(str(p).strip().replace("projects/", ""))
+                        for o in spec.get("organizations") or []:
+                            if str(o).strip():
+                                orgs.add(str(o).strip().replace("organizations/", ""))
+                        for fl in spec.get("folders") or []:
+                            if str(fl).strip():
+                                flds.add(str(fl).strip().replace("folders/", ""))
+        except Exception as exc:
+            logger.error("Invalid PQC_TENANT_SCOPE_POLICY JSON configuration; failing closed: %s", type(exc).__name__)
+            return _ServerScopePolicy(True, frozenset(), True, frozenset(), True, frozenset())
+
+    return _ServerScopePolicy(
+        has_project_restriction=has_proj,
+        projects=frozenset(projs),
+        has_org_restriction=has_org,
+        organizations=frozenset(orgs),
+        has_folder_restriction=has_fld,
+        folders=frozenset(flds),
+    )
+
+
+def _default_connection_template(user_id: Optional[str] = None) -> Dict[str, Any]:
+    """Returns default connection state: ADC + server scope ONLY for ADC-authorized admins; `access_token` + empty scope for all others."""
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    if is_adc_authorized_user(user_id):
+        raw_env_mode = (os.getenv("PQC_CONNECTION_MODE") or "adc").strip()
+        try:
+            resolved_mode = normalize_connection_mode(raw_env_mode)
+        except ValueError:
+            resolved_mode = "adc"
+        return {
+            "mode": resolved_mode,
+            "organization_id": os.getenv("GCP_ORGANIZATION_ID", "31564119954"),
+            "project_id": os.getenv("GOOGLE_CLOUD_PROJECT", "pqc-inventory-agent-cd06"),
+            "location": os.getenv("PQC_DEFAULT_LOCATION", "all"),
+            "impersonated_service_account": "",
+            "updated_at": now_iso,
+        }
     return {
-        "mode": os.getenv("PQC_CONNECTION_MODE", "adc"),
-        "organization_id": os.getenv("GCP_ORGANIZATION_ID", "31564119954"),
-        "project_id": os.getenv("GOOGLE_CLOUD_PROJECT", "pqc-inventory-agent-cd06"),
+        "mode": "access_token",
+        "organization_id": "",
+        "project_id": "",
         "location": os.getenv("PQC_DEFAULT_LOCATION", "all"),
-        "impersonated_service_account": os.getenv("PQC_IMPERSONATED_SERVICE_ACCOUNT", ""),
-        "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "impersonated_service_account": "",
+        "updated_at": now_iso,
     }
 
 
-def validate_impersonated_service_account(sa_email: str) -> str:
-    """Validates a target GCP Service Account email and enforces ``PQC_ALLOWED_IMPERSONATION_SERVICE_ACCOUNTS``."""
+def _extract_sa_project(sa_email: str) -> str:
+    m = _EMBEDDED_SA_PROJECT_RE.fullmatch(sa_email.strip())
+    return m.group(1) if m else ""
+
+
+def validate_impersonated_service_account(sa_email: str, *, user_id: Optional[str] = None) -> str:
+    """Validates a target GCP Service Account email and enforces default-deny `PQC_ALLOWED_IMPERSONATION_SERVICE_ACCOUNTS`."""
     clean = str(sa_email or "").strip()
     if not clean:
         return ""
@@ -818,17 +952,37 @@ def validate_impersonated_service_account(sa_email: str) -> str:
             f"Invalid GCP service account principal '{clean}'. Expected '<name>@<project>.iam.gserviceaccount.com'."
         )
     allowlist_raw = (os.getenv("PQC_ALLOWED_IMPERSONATION_SERVICE_ACCOUNTS") or "").strip()
-    if allowlist_raw:
-        allowed_entries = [item.strip().lower() for item in allowlist_raw.split(",") if item.strip()]
-        low = clean.lower()
-        permitted = any(
-            (low == rule) or (rule.startswith("@") and low.endswith(rule))
-            for rule in allowed_entries
+    if not allowlist_raw:
+        raise PermissionError(
+            "Forbidden: Service account impersonation requires PQC_ALLOWED_IMPERSONATION_SERVICE_ACCOUNTS "
+            "to be explicitly configured on the server."
         )
-        if not permitted:
-            raise PermissionError(
-                f"Service account '{clean}' is not in PQC_ALLOWED_IMPERSONATION_SERVICE_ACCOUNTS allowlist."
-            )
+
+    effective_uid = user_id if user_id is not None else get_current_tenant_user()
+    low = clean.lower()
+    permitted = False
+    for raw_entry in allowlist_raw.split(","):
+        entry = raw_entry.strip()
+        if not entry:
+            continue
+        if "=" in entry:
+            principal_pat, _, sa_rule_raw = entry.partition("=")
+            sa_rule = sa_rule_raw.strip().lower()
+            if not sa_rule or not _principal_matches_rule(effective_uid, principal_pat):
+                continue
+            if low == sa_rule or (sa_rule.startswith("@") and low.endswith(sa_rule)):
+                permitted = True
+                break
+        else:
+            sa_rule = entry.lower()
+            if low == sa_rule or (sa_rule.startswith("@") and low.endswith(sa_rule)):
+                permitted = True
+                break
+
+    if not permitted:
+        raise PermissionError(
+            f"Service account '{clean}' is not in PQC_ALLOWED_IMPERSONATION_SERVICE_ACCOUNTS allowlist."
+        )
     return clean
 
 
@@ -844,16 +998,15 @@ _GCLOUD_EXECUTION_LOG: List[Dict[str, Any]] = []
 
 
 def normalize_connection_mode(raw_mode: Optional[str]) -> str:
-    """Normalizes any connection mode string or UI label to ('adc', 'impersonation', 'access_token').
+    """Normalizes a non-empty connection mode string to ('adc', 'impersonation', 'access_token').
 
-    Fails closed with ``ValueError`` if a non-empty unrecognized mode string is supplied, preventing
-    untrusted callers from silently resetting or escalating a connection mode to ``adc``.
+    Fails closed with ``ValueError`` if empty or unrecognized, never defaulting untrusted input to ``adc``.
     """
     if raw_mode is None:
-        return "adc"
+        raise ValueError("Connection mode is required.")
     cleaned = str(raw_mode).strip().lower()
     if not cleaned:
-        return "adc"
+        raise ValueError("Connection mode cannot be empty.")
     resolved = _MODE_ALIASES.get(cleaned)
     if resolved is None:
         raise ValueError(
@@ -875,32 +1028,87 @@ def set_gcp_connection_config(
     oauth_client_id: Optional[str] = None,
     oauth_client_secret: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Updates the active GCP connection configuration in ``pqc_user_connections`` and envelope-encrypts any delegated token."""
+    """Updates a tenant's GCP connection configuration after enforcing ADC, impersonation, and scope authorization.
+
+    Fails closed with ``PermissionError`` or ``ValueError`` BEFORE any database write if unauthorized.
+    """
     from pqc_agent import auth_store, credential_service
 
-    uid = normalize_user_id(user_id or get_current_tenant_user())
-    defaults = _default_connection_template()
+    active_ctx_uid = get_current_tenant_user()
+    uid = normalize_user_id(user_id or active_ctx_uid)
+    if _is_authenticated_email_identity(active_ctx_uid) and uid != active_ctx_uid:
+        raise PermissionError(
+            f"Forbidden: authenticated caller '{active_ctx_uid}' cannot modify connection settings for '{uid}'."
+        )
+
     norm_mode = normalize_connection_mode(mode) if mode is not None else None
+    store = auth_store.get_active_auth_store()
+    existing_row = store.get_user_connection(uid)
+    defaults = _default_connection_template(uid)
+
+    target_mode = norm_mode or (existing_row.get("mode") if existing_row else None) or defaults["mode"]
+    if target_mode == "adc":
+        authorize_adc_mode(uid)
+
+    clean_sa: Optional[str] = None
+    if impersonated_service_account is not None:
+        raw_sa = str(impersonated_service_account).strip()
+        if raw_sa:
+            if not _is_authenticated_email_identity(uid):
+                raise PermissionError("Forbidden: Service account impersonation requires an authenticated user identity.")
+            clean_sa = validate_impersonated_service_account(raw_sa, user_id=uid)
+        else:
+            clean_sa = ""
+
+    if target_mode == "impersonation":
+        if not _is_authenticated_email_identity(uid):
+            raise PermissionError("Forbidden: Service account impersonation requires an authenticated user identity.")
+        effective_sa = (
+            clean_sa
+            if clean_sa is not None
+            else str((existing_row or {}).get("impersonated_service_account") or "").strip()
+        )
+        if not effective_sa:
+            raise ValueError("impersonated_service_account is required when connection mode is 'impersonation'.")
+        validate_impersonated_service_account(effective_sa, user_id=uid)
+
+    server_scope = _load_server_scope_policy(uid)
 
     clean_org: Optional[str] = None
     if organization_id is not None and str(organization_id).strip():
-        clean_org = str(organization_id).strip().replace("organizations/", "")
-        if uid == DEFAULT_TENANT_USER_ID:
-            os.environ["GCP_ORGANIZATION_ID"] = clean_org
+        candidate_org = str(organization_id).strip().replace("organizations/", "")
+        org_err = _validate_numeric_id_value(candidate_org)
+        if org_err:
+            raise ValueError(org_err)
+        if server_scope.has_org_restriction and candidate_org not in server_scope.organizations:
+            raise PermissionError(
+                f"Forbidden: organization '{candidate_org}' is outside the authorized scope for '{uid}'."
+            )
+        clean_org = candidate_org
 
     clean_proj: Optional[str] = None
     if project_id is not None and str(project_id).strip():
-        clean_proj = str(project_id).strip().replace("projects/", "")
+        candidate_proj = str(project_id).strip().replace("projects/", "")
+        proj_err = _validate_project_value(candidate_proj)
+        if proj_err:
+            raise ValueError(proj_err)
+        if server_scope.has_project_restriction and candidate_proj not in server_scope.projects:
+            raise PermissionError(
+                f"Forbidden: project '{candidate_proj}' is outside the authorized scope for '{uid}'."
+            )
+        clean_proj = candidate_proj
+    elif target_mode == "impersonation" and not (existing_row or {}).get("project_id"):
+        sa_for_proj = clean_sa or str((existing_row or {}).get("impersonated_service_account") or "")
+        derived_proj = _extract_sa_project(sa_for_proj)
+        if derived_proj and _validate_project_value(derived_proj) is None:
+            if not server_scope.has_project_restriction or derived_proj in server_scope.projects:
+                clean_proj = derived_proj
 
     clean_loc: Optional[str] = None
     if location is not None and str(location).strip():
         clean_loc = str(location).strip()
 
-    clean_sa: Optional[str] = None
-    if impersonated_service_account is not None:
-        clean_sa = validate_impersonated_service_account(impersonated_service_account)
-
-    auth_store.get_active_auth_store().upsert_user_connection(
+    store.upsert_user_connection(
         user_id=uid,
         mode=norm_mode,
         organization_id=clean_org,
@@ -932,34 +1140,39 @@ def set_gcp_connection_config(
 
 
 def get_gcp_connection_config(mask_token: bool = True, user_id: Optional[str] = None) -> Dict[str, Any]:
-    """Returns the current GCP connection state from the shared database (with masked token by default)."""
+    """Returns the current GCP connection state (never reporting unauthorized `adc` as active)."""
     from pqc_agent import auth_store, credential_service
 
     uid = normalize_user_id(user_id or get_current_tenant_user())
     stored = auth_store.get_active_auth_store().get_user_connection(uid)
-    state = stored if stored is not None else _default_connection_template()
+    defaults = _default_connection_template(uid)
+    state = stored if stored is not None else defaults
 
     raw_token = ""
     token_expires_at: Optional[float] = None
     has_refresh_token = False
     kek_provider: Optional[str] = None
 
-    loaded_cred = credential_service.get_active_credential_service().load_delegated_token(
-        user_id=uid,
-        caller_user_id=uid,
-    )
-    if loaded_cred is not None:
-        raw_token = loaded_cred.access_token
-        token_expires_at = loaded_cred.expires_at
-        has_refresh_token = loaded_cred.has_refresh_token
-        kek_provider = loaded_cred.kek_provider
-    elif uid == DEFAULT_TENANT_USER_ID and os.getenv("PQC_USER_ACCESS_TOKEN", "").strip():
-        raw_token = os.getenv("PQC_USER_ACCESS_TOKEN", "").strip()
+    if _is_authenticated_email_identity(uid) or stored is not None:
+        loaded_cred = credential_service.get_active_credential_service().load_delegated_token(
+            user_id=uid,
+            caller_user_id=uid,
+        )
+        if loaded_cred is not None:
+            raw_token = loaded_cred.access_token
+            token_expires_at = loaded_cred.expires_at
+            has_refresh_token = loaded_cred.has_refresh_token
+            kek_provider = loaded_cred.kek_provider
 
+    adc_allowed = is_adc_authorized_user(uid)
+    raw_stored_mode = state.get("mode")
     try:
-        mode = normalize_connection_mode(state.get("mode"))
+        mode = normalize_connection_mode(raw_stored_mode) if raw_stored_mode else defaults["mode"]
     except ValueError:
-        mode = "adc"
+        mode = "access_token"
+
+    if mode == "adc" and not adc_allowed:
+        mode = "access_token"
 
     has_token = bool(raw_token)
     masked_token = ""
@@ -972,11 +1185,12 @@ def get_gcp_connection_config(mask_token: bool = True, user_id: Optional[str] = 
     return {
         "user_id": uid,
         "mode": mode,
-        "mode_label": CONNECTION_MODES.get(mode, CONNECTION_MODES["adc"]),
+        "mode_label": CONNECTION_MODES.get(mode, CONNECTION_MODES["access_token"]),
+        "adc_authorized": adc_allowed,
         "auth_flow": "oauth2_3lo" if mode == "access_token" else mode,
         "oauth_consent_required": bool(mode == "access_token" and not has_token),
-        "organization_id": state.get("organization_id", "31564119954"),
-        "project_id": state.get("project_id", "pqc-inventory-agent-cd06"),
+        "organization_id": state.get("organization_id", ""),
+        "project_id": state.get("project_id", ""),
         "location": state.get("location", "all"),
         "impersonated_service_account": state.get("impersonated_service_account", ""),
         "has_access_token": has_token,
@@ -1002,12 +1216,27 @@ def _impersonation_lifetime_seconds() -> int:
 
 
 def get_active_gcp_credentials(user_id: Optional[str] = None) -> Any:
-    """Returns google.auth credentials matching the active tenant user's connection mode, or None for Default ADC.
+    """Returns google.auth credentials matching the authorized tenant user's connection mode.
 
-    Fails closed with ``PermissionError`` if ``mode == 'access_token'`` has no valid delegated token or if
-    ``mode == 'impersonation'`` has no valid allowlisted service account, preventing silent fallback to ADC.
+    Fails closed with ``PermissionError`` if caller is unauthenticated, if ``mode == 'adc'`` is unauthorized,
+    if ``mode == 'access_token'`` lacks a valid delegated token, or if ``mode == 'impersonation'`` is unauthorized.
     """
-    conn = get_gcp_connection_config(mask_token=False, user_id=user_id)
+    from pqc_agent import auth_store
+
+    active_ctx_uid = get_current_tenant_user()
+    uid = normalize_user_id(user_id or active_ctx_uid)
+    if _is_authenticated_email_identity(active_ctx_uid) and uid != active_ctx_uid:
+        raise PermissionError("Forbidden: cross-tenant credential resolution denied.")
+    if not _is_authenticated_email_identity(uid):
+        raise PermissionError(
+            "UNAUTHENTICATED_EXECUTION_CONTEXT: An authenticated tenant user identity is required to resolve GCP credentials."
+        )
+
+    raw_row = auth_store.get_active_auth_store().get_user_connection(uid)
+    if raw_row is not None and str(raw_row.get("mode") or "").strip().lower() == "adc":
+        authorize_adc_mode(uid)
+
+    conn = get_gcp_connection_config(mask_token=False, user_id=uid)
     mode = normalize_connection_mode(conn.get("mode"))
     impersonated_sa = (conn.get("impersonated_service_account") or "").strip()
     access_token = (conn.get("access_token_preview") or "").strip()
@@ -1030,7 +1259,7 @@ def get_active_gcp_credentials(user_id: Optional[str] = None) -> Any:
             raise PermissionError(
                 "IMPERSONATION_TARGET_REQUIRED: No impersonated service account configured for mode 'impersonation'."
             )
-        validated_sa = validate_impersonated_service_account(impersonated_sa)
+        validated_sa = validate_impersonated_service_account(impersonated_sa, user_id=uid)
         import google.auth
         from google.auth import impersonated_credentials
 
@@ -1044,26 +1273,76 @@ def get_active_gcp_credentials(user_id: Optional[str] = None) -> Any:
             lifetime=_impersonation_lifetime_seconds(),
         )
 
+    authorize_adc_mode(uid)
+    return None
+
+
+def validate_gcloud_executable_path(candidate: str, *, check_filesystem: bool = True) -> str:
+    """Validates that a `gcloud` binary path is in `TRUSTED_GCLOUD_PATHS` and resolves inside controlled system dirs.
+
+    Rejects relative paths, unexpected paths, symlinks pointing into untrusted/writable directories (e.g. `/tmp`,
+    `/var/tmp`, `/Users`, `/home`), and world-writable binaries or parent directories.
+    """
+    if not isinstance(candidate, str) or not candidate.strip():
+        raise PermissionError("Untrusted gcloud executable: empty path.")
+    clean = candidate.strip()
+    if _CONTROL_CHARS_RE.search(clean) or not clean.startswith("/") or ".." in clean:
+        raise PermissionError(f"Untrusted gcloud executable path '{clean}': absolute canonical path required.")
+    allowed_candidates = set(TRUSTED_GCLOUD_PATHS)
+    if check_filesystem:
+        for p in TRUSTED_GCLOUD_PATHS:
+            if os.path.lexists(p):
+                allowed_candidates.add(os.path.realpath(p))
+    if clean not in allowed_candidates:
+        raise PermissionError(
+            f"Untrusted gcloud executable path '{clean}': not in approved system installation paths."
+        )
+
+    if not check_filesystem:
+        return clean
+
+    if not os.path.isfile(clean) or not os.access(clean, os.X_OK):
+        raise PermissionError(f"Trusted gcloud candidate '{clean}' is not an executable file.")
+
+    real = os.path.realpath(clean)
+    if os.path.basename(real) != "gcloud":
+        raise PermissionError(f"Untrusted gcloud realpath target '{real}': unexpected binary basename.")
+    if not any(real.startswith(prefix) for prefix in TRUSTED_GCLOUD_REALPATH_PREFIXES):
+        raise PermissionError(
+            f"Untrusted gcloud symlink target '{real}': resolves outside controlled installation directories."
+        )
+    if not os.path.isfile(real) or not os.access(real, os.X_OK):
+        raise PermissionError(f"Resolved gcloud target '{real}' is not an executable regular file.")
+
+    file_stat = os.stat(real)
+    if bool(file_stat.st_mode & stat.S_IWOTH):
+        raise PermissionError(f"Untrusted gcloud executable '{real}': binary is world-writable.")
+    parent_dir = os.path.dirname(real)
+    if parent_dir:
+        dir_stat = os.stat(parent_dir)
+        if bool(dir_stat.st_mode & stat.S_IWOTH):
+            raise PermissionError(f"Untrusted gcloud directory '{parent_dir}': directory is world-writable.")
+
+    return real
+
+
+def resolve_trusted_gcloud_binary(
+    candidate_paths: Optional[Sequence[str]] = None,
+) -> Optional[str]:
+    """Resolves `gcloud` strictly from trusted system installation paths (never inspects `PATH` or `~`)."""
+    paths = candidate_paths if candidate_paths is not None else TRUSTED_GCLOUD_PATHS
+    for candidate in paths:
+        try:
+            return validate_gcloud_executable_path(candidate, check_filesystem=True)
+        except PermissionError:
+            continue
+        except OSError:
+            continue
     return None
 
 
 def _resolve_gcloud_binary() -> Optional[str]:
-    """Finds the `gcloud` CLI binary across standard Linux, Cloud Run, and macOS paths."""
-    found = shutil.which("gcloud")
-    if found:
-        return found
-    candidate_paths = [
-        "/usr/bin/gcloud",
-        "/usr/local/bin/gcloud",
-        "/google-cloud-sdk/bin/gcloud",
-        "/opt/google-cloud-sdk/bin/gcloud",
-        os.path.expanduser("~/google-cloud-sdk/bin/gcloud"),
-        "/opt/homebrew/bin/gcloud",
-    ]
-    for path in candidate_paths:
-        if os.path.isfile(path) and os.access(path, os.X_OK):
-            return path
-    return None
+    return resolve_trusted_gcloud_binary()
 
 
 def _is_blocked_flag_name(canon_flag: str) -> bool:
@@ -1106,7 +1385,7 @@ def validate_gcloud_command(command: str) -> Tuple[bool, List[str], str]:
 
     non_flag_tokens: List[str] = []
     parsed_flags: List[Tuple[str, Optional[str]]] = []
-    seen_flags: set[str] = set()
+    seen_flags: Set[str] = set()
 
     idx = 0
     while idx < len(subtokens):
@@ -1222,7 +1501,7 @@ def validate_gcloud_command(command: str) -> Tuple[bool, List[str], str]:
         return (
             False,
             subtokens,
-            "Blocked unapproved gcloud subcommand or verb; command is not in the read-only PQC grammar.",
+            "Blocked unapproved gcloud subcommand or verb; command is not in the safely scoped read-only PQC grammar.",
         )
 
     cmd_len = len(matched_policy.command_path)
@@ -1268,6 +1547,215 @@ def validate_gcloud_command(command: str) -> Tuple[bool, List[str], str]:
     return True, canonical_tokens, "Validated read-only diagnostic gcloud command."
 
 
+def resolve_authorized_tenant_scope(
+    user_id: str,
+    conn_cfg: Mapping[str, Any],
+) -> AuthorizedTenantScope:
+    """Computes the caller's authorized `(projects, organizations, folders)` boundaries."""
+    norm_uid = normalize_user_id(user_id)
+    if not _is_authenticated_email_identity(norm_uid):
+        raise PermissionError("Unauthenticated identity has no authorized GCP resource scope.")
+
+    server_policy = _load_server_scope_policy(norm_uid)
+
+    conn_proj = str(conn_cfg.get("project_id") or "").strip().replace("projects/", "")
+    conn_org = str(conn_cfg.get("organization_id") or "").strip().replace("organizations/", "")
+    mode = str(conn_cfg.get("mode") or "access_token").strip().lower()
+    sa_email = str(conn_cfg.get("impersonated_service_account") or "").strip()
+
+    if mode == "impersonation" and not conn_proj and sa_email:
+        conn_proj = _extract_sa_project(sa_email)
+
+    if server_policy.has_project_restriction:
+        allowed_projects = set(server_policy.projects)
+        if conn_proj and conn_proj not in allowed_projects:
+            allowed_projects.discard(conn_proj)
+    else:
+        allowed_projects = {conn_proj} if (conn_proj and _validate_project_value(conn_proj) is None) else set()
+
+    if server_policy.has_org_restriction:
+        allowed_orgs = set(server_policy.organizations)
+    else:
+        allowed_orgs = {conn_org} if (conn_org and _validate_numeric_id_value(conn_org) is None) else set()
+
+    # Folders are default-deny unless explicitly granted by server-side operator policy.
+    allowed_folders = set(server_policy.folders) if server_policy.has_folder_restriction else set()
+
+    return AuthorizedTenantScope(
+        user_id=norm_uid,
+        projects=frozenset(allowed_projects),
+        organizations=frozenset(allowed_orgs),
+        folders=frozenset(allowed_folders),
+    )
+
+
+def authorize_gcloud_command_scope(
+    raw_command: str,
+    *,
+    user_id: str,
+    conn_cfg: Mapping[str, Any],
+) -> Optional[str]:
+    """Independently validates that `raw_command` accesses ONLY resources within `user_id`'s authorized scope.
+
+    Returns an optional implicit `--project` value to inject when a project-scoped command omitted `--project`,
+    or raises ``PermissionError`` if any referenced project, organization, folder, service account, or unscoped
+    operation violates the caller's tenant boundary.
+    """
+    if not _is_authenticated_email_identity(user_id):
+        raise PermissionError("UNAUTHENTICATED_EXECUTION_CONTEXT: Authenticated tenant user required.")
+
+    authorized = resolve_authorized_tenant_scope(user_id, conn_cfg)
+
+    try:
+        raw_tokens = shlex.split(str(raw_command or "").strip(), posix=True)
+    except ValueError as exc:
+        raise PermissionError(f"Malformed command in scope authorization check: {exc}") from exc
+
+    if not raw_tokens or raw_tokens[0] != "gcloud":
+        raise PermissionError("Executable must be 'gcloud' in scope authorization check.")
+
+    rest = raw_tokens[1:]
+    referenced_projects: Set[str] = set()
+    referenced_orgs: Set[str] = set()
+    referenced_folders: Set[str] = set()
+    non_flags: List[str] = []
+    explicit_project_flag = False
+    explicit_scope_flag = False
+
+    def _collect_embedded_hierarchy_refs(token_val: str) -> None:
+        for pm in _EMBEDDED_PROJECT_RE.finditer(token_val):
+            referenced_projects.add(pm.group(1))
+        for om in _EMBEDDED_ORG_RE.finditer(token_val):
+            referenced_orgs.add(om.group(1))
+        for fm in _EMBEDDED_FOLDER_RE.finditer(token_val):
+            referenced_folders.add(fm.group(1))
+        for sam in _EMBEDDED_SA_PROJECT_RE.finditer(token_val):
+            referenced_projects.add(sam.group(1))
+
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok.startswith("-"):
+            flag_name, has_eq, inline_val = tok.partition("=")
+            canon = flag_name.lower().replace("_", "-")
+            if _is_blocked_flag_name(canon):
+                raise PermissionError(f"Forbidden privilege/scope flag '{flag_name}'.")
+
+            spec = _FLAG_SPECS.get(canon)
+            takes_val = spec.takes_value if spec is not None else has_eq
+            val: Optional[str] = None
+            if takes_val:
+                if has_eq:
+                    val = inline_val
+                    i += 1
+                elif i + 1 < len(rest):
+                    val = rest[i + 1]
+                    i += 2
+                else:
+                    raise PermissionError(f"Missing value for flag '{flag_name}'.")
+            else:
+                i += 1
+
+            if val is not None:
+                _collect_embedded_hierarchy_refs(val)
+                if canon == "--project":
+                    explicit_project_flag = True
+                    referenced_projects.add(val.strip().replace("projects/", ""))
+                elif canon == "--organization":
+                    referenced_orgs.add(val.strip().replace("organizations/", ""))
+                elif canon == "--folder":
+                    referenced_folders.add(val.strip().replace("folders/", ""))
+                elif canon == "--scope":
+                    explicit_scope_flag = True
+                    sval = val.strip()
+                    if sval.startswith("projects/"):
+                        referenced_projects.add(sval[len("projects/"):])
+                    elif sval.startswith("organizations/"):
+                        referenced_orgs.add(sval[len("organizations/"):])
+                    elif sval.startswith("folders/"):
+                        referenced_folders.add(sval[len("folders/"):])
+                    else:
+                        raise PermissionError(f"Unrecognized '--scope' hierarchy '{sval}'.")
+            continue
+
+        _collect_embedded_hierarchy_refs(tok)
+        non_flags.append(tok)
+        i += 1
+
+    # Local `gcloud version` / `gcloud --version` accesses zero GCP resources.
+    if (not non_flags and "--version" in rest) or non_flags == ["version"]:
+        if referenced_projects or referenced_orgs or referenced_folders:
+            raise PermissionError("Unexpected resource scope arguments on 'gcloud version'.")
+        return None
+
+    if not non_flags:
+        raise PermissionError("Command has no target service group for scope verification.")
+
+    top_group = non_flags[0].lower()
+
+    # Explicitly reject unscoped global commands even if command parser were ever bypassed.
+    if tuple(t.lower() for t in non_flags[:2]) in (
+        ("projects", "list"),
+        ("organizations", "list"),
+    ) or tuple(t.lower() for t in non_flags[:3]) == ("storage", "buckets", "describe"):
+        raise PermissionError(
+            f"Forbidden unscoped or globally addressed command 'gcloud {' '.join(non_flags[:3])}'."
+        )
+
+    if top_group == "projects" and len(non_flags) >= 3:
+        referenced_projects.add(non_flags[2].strip().replace("projects/", ""))
+    elif top_group == "organizations" and len(non_flags) >= 3:
+        referenced_orgs.add(non_flags[2].strip().replace("organizations/", ""))
+    elif top_group == "folders":
+        if len(non_flags) >= 2 and non_flags[1].lower() == "list":
+            if not referenced_orgs and not referenced_folders:
+                raise PermissionError("'gcloud folders list' requires an authorized '--organization' or '--folder'.")
+        elif len(non_flags) >= 3:
+            referenced_folders.add(non_flags[2].strip().replace("folders/", ""))
+    elif top_group == "asset":
+        sub = non_flags[1].lower() if len(non_flags) >= 2 else ""
+        if sub in ("search-all-resources", "search-all-iam-policies") and not explicit_scope_flag:
+            raise PermissionError(f"'gcloud asset {sub}' requires an explicit authorized '--scope' flag.")
+        if sub == "list" and not (referenced_projects or referenced_orgs or referenced_folders):
+            raise PermissionError(
+                "'gcloud asset list' requires an explicit authorized '--project', '--organization', or '--folder'."
+            )
+
+    injected_project: Optional[str] = None
+    if top_group in _PROJECT_SCOPED_GROUPS and not explicit_project_flag:
+        conn_proj = str(conn_cfg.get("project_id") or "").strip().replace("projects/", "")
+        default_proj = conn_proj if conn_proj else (next(iter(authorized.projects)) if len(authorized.projects) == 1 else "")
+        if not default_proj:
+            raise PermissionError(
+                f"No authorized GCP project is bound for tenant '{user_id}'; specify an authorized '--project'."
+            )
+        referenced_projects.add(default_proj)
+        injected_project = default_proj
+
+    if not (referenced_projects or referenced_orgs or referenced_folders):
+        raise PermissionError("Command does not specify a safely enforceable GCP project, organization, or folder scope.")
+
+    unauthorized_projects = sorted(p for p in referenced_projects if p not in authorized.projects)
+    if unauthorized_projects:
+        raise PermissionError(
+            f"UNAUTHORIZED_RESOURCE_SCOPE: Project(s) {unauthorized_projects} are outside tenant '{user_id}' authorized scope."
+        )
+
+    unauthorized_orgs = sorted(o for o in referenced_orgs if o not in authorized.organizations)
+    if unauthorized_orgs:
+        raise PermissionError(
+            f"UNAUTHORIZED_RESOURCE_SCOPE: Organization(s) {unauthorized_orgs} are outside tenant '{user_id}' authorized scope."
+        )
+
+    unauthorized_folders = sorted(f for f in referenced_folders if f not in authorized.folders)
+    if unauthorized_folders:
+        raise PermissionError(
+            f"UNAUTHORIZED_RESOURCE_SCOPE: Folder(s) {unauthorized_folders} are outside tenant '{user_id}' authorized scope."
+        )
+
+    return injected_project
+
+
 def _ensure_isolated_gcloud_config_dir(suffix: str) -> str:
     path = os.path.join(tempfile.gettempdir(), f"pqc-gcloud-{suffix}-{os.getuid()}")
     os.makedirs(path, mode=0o700, exist_ok=True)
@@ -1281,30 +1769,25 @@ def _ensure_isolated_gcloud_config_dir(suffix: str) -> str:
 def build_sanitized_gcloud_env(
     *,
     mode: str,
+    user_id: Optional[str] = None,
     project_id: Optional[str] = None,
     has_explicit_project_flag: bool = False,
     access_token: Optional[str] = None,
     impersonated_service_account: Optional[str] = None,
     source_env: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, str]:
-    """Constructs a sanitized subprocess environment from an explicit allowlist.
+    """Constructs a sanitized subprocess environment with pinned system `PATH` and verified mode authorization."""
+    effective_uid = normalize_user_id(user_id or get_current_tenant_user())
+    if not _is_authenticated_email_identity(effective_uid):
+        raise PermissionError("UNAUTHENTICATED_EXECUTION_CONTEXT: Authenticated tenant user required.")
 
-    Unconditionally excludes `CLOUDSDK_API_ENDPOINT_OVERRIDES_*`, `CLOUDSDK_PROXY_*`, `HTTP_PROXY`,
-    `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY` (and lowercase variants), `GCE_METADATA_*`, custom CA/TLS
-    override variables, and ambient `CLOUDSDK_AUTH_*` overrides.
-    """
     src = source_env if source_env is not None else os.environ
-    env: Dict[str, str] = {}
+    env: Dict[str, str] = {"PATH": TRUSTED_SUBPROCESS_PATH}
 
     for key in _SAFE_BASE_ENV_VARS:
         val = src.get(key)
         if val and not _CONTROL_CHARS_RE.search(val):
             env[key] = val
-
-    env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
-    cloudsdk_py = src.get("CLOUDSDK_PYTHON", "").strip()
-    if cloudsdk_py and os.path.isfile(cloudsdk_py) and os.access(cloudsdk_py, os.X_OK):
-        env["CLOUDSDK_PYTHON"] = cloudsdk_py
 
     env["CLOUDSDK_CORE_DISABLE_PROMPTS"] = "1"
     env["CLOUDSDK_CORE_DISABLE_USAGE_REPORTING"] = "true"
@@ -1320,12 +1803,10 @@ def build_sanitized_gcloud_env(
             raise PermissionError(
                 "ACCESS_TOKEN_REQUIRED: Delegated OAuth access token is missing or expired for mode 'access_token'."
             )
-        # Isolate CLOUDSDK_CONFIG to an empty directory and omit GOOGLE_APPLICATION_CREDENTIALS so gcloud
-        # can NEVER fall back to workstation or container ambient credentials.
         env["CLOUDSDK_CONFIG"] = _ensure_isolated_gcloud_config_dir("token-isolated")
         env["CLOUDSDK_AUTH_ACCESS_TOKEN"] = clean_tok
     elif canonical_mode == "impersonation":
-        clean_sa = validate_impersonated_service_account(impersonated_service_account or "")
+        clean_sa = validate_impersonated_service_account(impersonated_service_account or "", user_id=effective_uid)
         if not clean_sa:
             raise PermissionError(
                 "IMPERSONATION_TARGET_REQUIRED: Service account principal is required for mode 'impersonation'."
@@ -1338,7 +1819,7 @@ def build_sanitized_gcloud_env(
             env["CLOUDSDK_CONFIG"] = src_cfg
         env["CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT"] = clean_sa
     else:
-        # Trusted explicit 'adc' mode: preserve Cloud Run ADC / local ADC without endpoint or proxy overrides.
+        authorize_adc_mode(effective_uid)
         gac = src.get("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
         if gac and os.path.isfile(gac):
             env["GOOGLE_APPLICATION_CREDENTIALS"] = gac
@@ -1346,7 +1827,6 @@ def build_sanitized_gcloud_env(
         if src_cfg and os.path.isdir(src_cfg) and _check_common_arg_safety(src_cfg) is None:
             env["CLOUDSDK_CONFIG"] = src_cfg
 
-    # Defense-in-depth post-assertion: ensure zero endpoint override or proxy keys exist.
     for k in list(env.keys()):
         ku = k.upper()
         if (
@@ -1370,16 +1850,13 @@ def _scrub_output(text: Optional[str], *, secret_values: Sequence[str] = ()) -> 
 
 
 def execute_gcloud_command(command: str) -> str:
-    """Executes a strictly validated read-only `gcloud` CLI command using the tenant's active connection mode.
+    """Executes a strictly validated, scope-authorized read-only `gcloud` command for the authenticated tenant."""
+    from pqc_agent import auth_store
 
-    Security invariants:
-    - Validates command group, verb, positional arguments, and per-command flags via `validate_gcloud_command()`.
-    - Sanitizes subprocess environment via `build_sanitized_gcloud_env()`.
-    - Enforces strict tenant isolation in `access_token` mode: never retries with or falls back to server ADC.
-    """
     start_ts = time.time()
+    uid = get_current_tenant_user()
     is_valid, tokens, validation_msg = validate_gcloud_command(command)
-    conn_cfg = get_gcp_connection_config(mask_token=False)
+    conn_cfg = get_gcp_connection_config(mask_token=False, user_id=uid)
     mode = conn_cfg["mode"]
     mode_label = conn_cfg["mode_label"]
     raw_token = (conn_cfg.get("access_token_preview") or "").strip()
@@ -1400,11 +1877,51 @@ def execute_gcloud_command(command: str) -> str:
 
     display_cmd = "gcloud " + " ".join(shlex.quote(t) for t in tokens)
 
-    # Fail closed BEFORE resolving/spawning gcloud if delegated or impersonated credentials are missing/invalid.
+    # 1. Require authenticated tenant identity and verify raw stored ADC/impersonation authorization BEFORE scope/exec
     try:
-        has_project_flag = any(t == "--project" or t.startswith("--project=") for t in tokens)
+        if not _is_authenticated_email_identity(uid):
+            raise PermissionError(
+                "UNAUTHENTICATED_EXECUTION_CONTEXT: execute_gcloud_command requires an authenticated tenant identity."
+            )
+        raw_stored_row = auth_store.get_active_auth_store().get_user_connection(uid)
+        if raw_stored_row is not None and str(raw_stored_row.get("mode") or "").strip().lower() == "adc":
+            authorize_adc_mode(uid)
+        if mode == "adc":
+            authorize_adc_mode(uid)
+        injected_project = authorize_gcloud_command_scope(command, user_id=uid, conn_cfg=conn_cfg)
+    except PermissionError as authz_err:
+        err_str = str(authz_err)
+        if "UNAUTHORIZED_RESOURCE_SCOPE" in err_str:
+            err_code = "UNAUTHORIZED_RESOURCE_SCOPE"
+        elif "UNAUTHENTICATED_EXECUTION_CONTEXT" in err_str:
+            err_code = "UNAUTHENTICATED_EXECUTION_CONTEXT"
+        else:
+            err_code = "ADC_UNAUTHORIZED"
+        denied_scope_payload = {
+            "status": "COMMAND_ERROR",
+            "error_code": err_code,
+            "command_executed": display_cmd,
+            "connection_mode": mode,
+            "connection_mode_label": mode_label,
+            "exit_code": 126,
+            "stdout": "",
+            "stderr": _scrub_output(err_str, secret_values=(raw_token,)),
+            "duration_ms": round((time.time() - start_ts) * 1000, 2),
+        }
+        _record_gcloud_trace(denied_scope_payload)
+        return json.dumps(denied_scope_payload, ensure_ascii=False)
+
+    effective_tokens = list(tokens)
+    if injected_project and not any(t == "--project" or t.startswith("--project=") for t in effective_tokens):
+        effective_tokens.append(f"--project={injected_project}")
+        display_cmd = "gcloud " + " ".join(shlex.quote(t) for t in effective_tokens)
+
+    # 2. Build sanitized subprocess environment & enforce mode-specific credential requirements
+    try:
+        has_project_flag = any(t == "--project" or t.startswith("--project=") for t in effective_tokens)
         env = build_sanitized_gcloud_env(
             mode=mode,
+            user_id=uid,
             project_id=conn_cfg.get("project_id"),
             has_explicit_project_flag=has_project_flag,
             access_token=raw_token if mode == "access_token" else None,
@@ -1416,7 +1933,7 @@ def execute_gcloud_command(command: str) -> str:
         err_code = (
             "ACCESS_TOKEN_REQUIRED"
             if mode == "access_token"
-            else ("IMPERSONATION_ERROR" if mode == "impersonation" else "CREDENTIAL_CONFIG_ERROR")
+            else ("IMPERSONATION_ERROR" if mode == "impersonation" else "ADC_UNAUTHORIZED")
         )
         denied_payload = {
             "status": "COMMAND_ERROR",
@@ -1432,6 +1949,7 @@ def execute_gcloud_command(command: str) -> str:
         _record_gcloud_trace(denied_payload)
         return json.dumps(denied_payload, ensure_ascii=False)
 
+    # 3. Resolve & validate trusted gcloud executable path (never via PATH / shutil.which)
     gcloud_bin = _resolve_gcloud_binary()
     if not gcloud_bin:
         missing_payload = {
@@ -1441,14 +1959,33 @@ def execute_gcloud_command(command: str) -> str:
             "connection_mode_label": mode_label,
             "exit_code": 127,
             "stdout": "",
-            "stderr": "The 'gcloud' CLI binary is not installed on PATH in this environment.",
+            "stderr": "No trusted 'gcloud' CLI binary found in approved system installation directories.",
             "duration_ms": round((time.time() - start_ts) * 1000, 2),
         }
         _record_gcloud_trace(missing_payload)
         return json.dumps(missing_payload, ensure_ascii=False)
 
-    exec_tokens = [gcloud_bin] + list(tokens)
-    if "--quiet" not in tokens:
+    try:
+        # Validate path policy even if `_resolve_gcloud_binary` was monkeypatched; check filesystem if path exists.
+        fs_check = os.path.lexists(gcloud_bin)
+        validated_bin = validate_gcloud_executable_path(gcloud_bin, check_filesystem=fs_check)
+    except PermissionError as bin_err:
+        untrusted_bin_payload = {
+            "status": "COMMAND_ERROR",
+            "error_code": "GCLOUD_UNTRUSTED_EXECUTABLE",
+            "command_executed": display_cmd,
+            "connection_mode": mode,
+            "connection_mode_label": mode_label,
+            "exit_code": 126,
+            "stdout": "",
+            "stderr": _scrub_output(str(bin_err), secret_values=(raw_token,)),
+            "duration_ms": round((time.time() - start_ts) * 1000, 2),
+        }
+        _record_gcloud_trace(untrusted_bin_payload)
+        return json.dumps(untrusted_bin_payload, ensure_ascii=False)
+
+    exec_tokens = [validated_bin] + list(effective_tokens)
+    if "--quiet" not in effective_tokens:
         exec_tokens.append("--quiet")
 
     try:
@@ -1461,51 +1998,11 @@ def execute_gcloud_command(command: str) -> str:
             shell=False,
         )
 
-        # Scope-narrowing helper ONLY when already explicitly running in trusted server 'adc' mode on the
-        # built-in lab org (31564119954 -> folder 534285347409). NEVER runs in 'access_token' or 'impersonation' mode!
-        if (
-            mode == "adc"
-            and proc.returncode != 0
-            and any("31564119954" in t for t in exec_tokens)
-            and any(
-                err_marker in (proc.stderr or "")
-                for err_marker in (
-                    "PERMISSION_DENIED",
-                    "PermissionDenied",
-                    "does not have permission",
-                    "Caller does not have permission",
-                )
-            )
-        ):
-            fb_tokens = [
-                t.replace("organizations/31564119954", "folders/534285347409").replace(
-                    "--organization=31564119954", "--folder=534285347409"
-                )
-                for t in exec_tokens
-            ]
-            if fb_tokens != exec_tokens:
-                fb_proc = subprocess.run(
-                    fb_tokens,
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                    env=env,
-                    shell=False,
-                )
-                if fb_proc.returncode == 0:
-                    proc = fb_proc
-                    tokens = [
-                        t.replace("organizations/31564119954", "folders/534285347409").replace(
-                            "--organization=31564119954", "--folder=534285347409"
-                        )
-                        for t in tokens
-                    ]
-                    display_cmd = "gcloud " + " ".join(shlex.quote(t) for t in tokens)
-
         duration_ms = round((time.time() - start_ts) * 1000, 2)
         result_payload = {
             "status": "SUCCESS" if proc.returncode == 0 else "COMMAND_ERROR",
             "command_executed": display_cmd,
+            "executable_path": validated_bin,
             "connection_mode": mode,
             "connection_mode_label": mode_label,
             "impersonated_service_account": (

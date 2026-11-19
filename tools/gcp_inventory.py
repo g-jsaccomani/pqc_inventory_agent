@@ -188,13 +188,15 @@ def _now_iso() -> str:
 
 
 def _get_client_kwargs() -> Dict[str, Any]:
-    """Returns {'credentials': creds} when the portal is using impersonation or a user access token."""
+    """Returns {'credentials': creds} for the active tenant connection, failing closed on PermissionError."""
     try:
         from tools.gcloud_bridge import get_active_gcp_credentials
 
         creds = get_active_gcp_credentials()
         if creds is not None:
             return {"credentials": creds}
+    except PermissionError:
+        raise
     except Exception:
         pass
     return {}
@@ -206,14 +208,16 @@ def _cache_scope_prefix() -> str:
         from tools.gcloud_bridge import get_gcp_connection_config
 
         cfg = get_gcp_connection_config(mask_token=True)
-        mode = cfg.get("mode", "adc")
+        mode = cfg.get("mode", "access_token")
         if mode == "impersonation":
-            return f"imp:{cfg.get('impersonated_service_account', '')}"
+            return f"imp:{cfg.get('user_id', '')}:{cfg.get('impersonated_service_account', '')}"
         if mode == "access_token":
             return f"tok:{cfg.get('user_id', '')}:{cfg.get('access_token_preview', '')}"
+        if mode == "adc" and cfg.get("adc_authorized"):
+            return f"adc:{cfg.get('user_id', '')}"
     except Exception:
         pass
-    return "adc"
+    return "unconfigured"
 
 
 def _cache_get(key: str) -> Optional[str]:

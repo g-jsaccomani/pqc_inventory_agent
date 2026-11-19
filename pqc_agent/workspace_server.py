@@ -62,14 +62,18 @@ from pqc_agent.portal_ui import PORTAL_HTML
 from pqc_agent.telemetry import LlmCallTelemetryPlugin, capture_llm_calls, summarize_llm_calls
 from tools.calibration_engine import register_uploaded_artifact_for_analysis
 from tools.gcloud_bridge import (
+    TRUSTED_SUBPROCESS_PATH,
+    authorize_adc_mode,
     clear_user_access_token,
     execute_gcloud_command,
     get_gcp_connection_config,
     get_recent_gcloud_traces,
     normalize_connection_mode,
     normalize_user_id,
+    resolve_trusted_gcloud_binary,
     set_current_tenant_user,
     set_gcp_connection_config,
+    validate_impersonated_service_account,
 )
 
 logger = logging.getLogger(__name__)
@@ -641,6 +645,9 @@ def _try_workstation_auto_gcloud_token() -> Optional[str]:
         return None
     if "PYTEST_CURRENT_TEST" in os.environ and os.getenv("PQC_ENABLE_AUTO_GCLOUD_IN_TESTS") != "1":
         return None
+    gcloud_bin = resolve_trusted_gcloud_binary()
+    if not gcloud_bin:
+        return None
     venv_py = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".venv", "bin", "python"))
     candidate_configs: List[Optional[str]] = [
         os.environ.get("CLOUDSDK_CONFIG"),
@@ -655,12 +662,13 @@ def _try_workstation_auto_gcloud_token() -> Optional[str]:
         seen_cfgs.add(key)
         try:
             env = os.environ.copy()
+            env["PATH"] = TRUSTED_SUBPROCESS_PATH
             if os.path.isfile(venv_py) and not env.get("CLOUDSDK_PYTHON"):
                 env["CLOUDSDK_PYTHON"] = venv_py
             if cfg and os.path.isdir(cfg):
                 env["CLOUDSDK_CONFIG"] = cfg
             out = _subprocess.check_output(
-                ["gcloud", "auth", "print-access-token", "--quiet"],
+                [gcloud_bin, "auth", "print-access-token", "--quiet"],
                 env=env,
                 stderr=_subprocess.DEVNULL,
                 text=True,
@@ -965,25 +973,6 @@ def build_gcp_oauth_auth_config(
     )
 
 
-def _is_builtin_demo_scope(target_scope: Optional[str], conn: Optional[Dict[str, Any]] = None) -> bool:
-    """Returns True when `target_scope` and `conn` target the built-in Argolis lab/demo environment
-    (`31564119954` / `pqc-inventory-agent-cd06`), where Cloud Run ADC already holds full read-only permissions."""
-    import re as _re
-
-    raw = str(target_scope or "").strip()
-    if _re.search(r"organizations/(?!31564119954\b)\d+", raw):
-        return False
-    if _re.search(r"projects/(?!pqc-inventory-agent-cd06\b)[a-z0-9-]+", raw):
-        return False
-    if conn and str(conn.get("organization_id") or "") not in ("", "31564119954"):
-        return False
-    if conn and str(conn.get("project_id") or "") not in ("", "pqc-inventory-agent-cd06"):
-        return False
-    if "31564119954" in raw or "pqc-inventory-agent-cd06" in raw or not raw:
-        return True
-    return True
-
-
 class PqcOAuth3LOPlugin(BasePlugin):
     """ADK Plugin that integrates `ToolContext` 3-Legged OAuth (3LO) credentials with GCP discovery tools.
 
@@ -992,10 +981,9 @@ class PqcOAuth3LOPlugin(BasePlugin):
        and the isolated per-user `gcloud_bridge` connection state.
     2. When a user is in 3-Legged OAuth mode (`mode == 'access_token'`) and has not yet granted a token,
        calls `tool_context.request_credential(auth_config)` before the tool executes and emits an interactive
-       In-Chat OAuth 2.0 Consent Card (or auto-heals to `adc` when targeting the built-in demo org `31564119954`).
-    3. When a tool running in default Service Account (`adc`) mode encounters a `403 PermissionDenied` error
-       on an external project/organization, automatically triggers `tool_context.request_credential(auth_config)`
-       so the user can authorize with their own `@google.com` credentials right in the chat.
+       In-Chat OAuth 2.0 Consent Card (never auto-switching to `adc`).
+    3. When a tool encounters a `403 PermissionDenied` error without a delegated token, triggers
+       `tool_context.request_credential(auth_config)` so the user can authorize with their own credentials.
     """
 
     def __init__(self) -> None:
@@ -1057,14 +1045,9 @@ class PqcOAuth3LOPlugin(BasePlugin):
         except Exception as exc:
             logger.debug("ToolContext credential sync skipped: %s", exc)
 
-        # 2. If the user is in 3-Legged OAuth mode ('access_token') and no token is present:
-        #    - For the built-in Argolis lab/demo org (31564119954 / pqc-inventory-agent-cd06), auto-heal to ADC
-        #      so the Cloud Run Service Account executes immediately without blocking the demo.
-        #    - For external organizations/projects, request 3LO OAuth consent.
+        # 2. If the user is in 3-Legged OAuth mode ('access_token') and no token is present,
+        #    always require explicit 3LO OAuth consent — never auto-switch to server ADC.
         if conn.get("mode") == "access_token" and not conn.get("has_access_token"):
-            if _is_builtin_demo_scope(target_scope, conn):
-                set_gcp_connection_config(mode="adc", user_id=uid)
-                return None
             agent_name = getattr(getattr(inv_ctx, "agent", None), "name", None)
             if not isinstance(agent_name, str) or agent_name in ("", "pqc_inventory_agent"):
                 try:
@@ -1153,8 +1136,6 @@ class PqcOAuth3LOPlugin(BasePlugin):
                 or conn.get("organization_id")
                 or "organizations/31564119954"
             )
-            if _is_builtin_demo_scope(target_scope, conn):
-                return None
             auth_config = build_gcp_oauth_auth_config(
                 user_id=uid,
                 session_id=inv_sess,
@@ -2081,8 +2062,6 @@ def create_workspace_app(
             if identity and identity.raw_token:
                 csrf_token = auth_guard.derive_csrf_token(identity.raw_token, _get_auth_secret())
             conn = get_gcp_connection_config(mask_token=True, user_id=uid)
-            if conn.get("mode") == "access_token" and not conn.get("has_access_token") and _is_builtin_demo_scope(None, conn):
-                conn = set_gcp_connection_config(mode="adc", user_id=uid)
             try:
                 sess_resp = await session_service.list_sessions(app_name=APP_NAME, user_id=uid)
                 session_count = len(sess_resp.sessions)
@@ -2240,8 +2219,6 @@ def create_workspace_app(
                 reused_existing = False
             csrf_token = auth_guard.derive_csrf_token(signed_token, _get_auth_secret())
             conn = get_gcp_connection_config(mask_token=True, user_id=uid)
-            if conn.get("mode") == "access_token" and not conn.get("has_access_token") and _is_builtin_demo_scope(None, conn):
-                conn = set_gcp_connection_config(mode="adc", user_id=uid)
             sess_resp = await session_service.list_sessions(app_name=APP_NAME, user_id=uid)
             resp = JSONResponse(
                 content={
@@ -3256,6 +3233,18 @@ async function saveClientId() {{
 
         user_id = activate_request_tenant_user(request, explicit_user_id=user_id)
 
+        if any(x is not None for x in (connection_mode, impersonated_sa, access_token)):
+            try:
+                norm_req_mode = normalize_connection_mode(connection_mode) if connection_mode is not None else None
+                if norm_req_mode == "adc":
+                    authorize_adc_mode(user_id)
+                if impersonated_sa is not None and str(impersonated_sa).strip():
+                    validate_impersonated_service_account(impersonated_sa, user_id=user_id)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except PermissionError as exc:
+                raise HTTPException(status_code=403, detail=str(exc)) from exc
+
         requested_model = model or model_id
         entry = await asyncio.to_thread(registry_obj.resolve, requested_model)
         if entry is None:
@@ -3279,18 +3268,9 @@ async function saveClientId() {{
         model_label = f"{entry['label']} {entry.get('tier', '')}".strip()
 
         if any(x is not None for x in (connection_mode, impersonated_sa, access_token)):
-            effective_mode = connection_mode
-            if (
-                effective_mode
-                and normalize_connection_mode(effective_mode) == "access_token"
-                and not (access_token or "").strip()
-            ):
-                current_conn = get_gcp_connection_config(mask_token=True, user_id=user_id)
-                if not current_conn.get("has_access_token") and _is_builtin_demo_scope(scope, current_conn):
-                    effective_mode = "adc"
             try:
                 set_gcp_connection_config(
-                    mode=effective_mode,
+                    mode=connection_mode,
                     impersonated_service_account=impersonated_sa,
                     access_token=access_token,
                     user_id=user_id,
@@ -3507,6 +3487,8 @@ async function saveClientId() {{
     ) -> Dict[str, Any]:
         uid = activate_request_tenant_user(request, explicit_user_id=payload.user_id)
         try:
+            if payload.mode is not None and normalize_connection_mode(payload.mode) == "adc":
+                authorize_adc_mode(uid)
             return set_gcp_connection_config(
                 mode=payload.mode,
                 organization_id=payload.organization_id,

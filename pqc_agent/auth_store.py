@@ -210,7 +210,7 @@ class UserConnectionRecord(PqcPersistenceBase):
 
     user_id: Mapped[str] = mapped_column(String(320), primary_key=True)
     tenant_domain: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
-    mode: Mapped[str] = mapped_column(String(32), nullable=False, default="adc")
+    mode: Mapped[str] = mapped_column(String(32), nullable=False, default="access_token")
     organization_id: Mapped[str] = mapped_column(String(128), nullable=False)
     project_id: Mapped[str] = mapped_column(String(255), nullable=False)
     location: Mapped[str] = mapped_column(String(128), nullable=False, default="all")
@@ -1427,9 +1427,11 @@ class DistributedAuthStore:
                 row = UserConnectionRecord(
                     user_id=clean_uid,
                     tenant_domain=domain,
-                    mode=str(mode or defs.get("mode") or "adc"),
-                    organization_id=str(organization_id or defs.get("organization_id") or "31564119954"),
-                    project_id=str(project_id or defs.get("project_id") or "pqc-inventory-agent-cd06"),
+                    mode=str(mode or defs.get("mode") or "access_token"),
+                    organization_id=str(
+                        organization_id if organization_id is not None else (defs.get("organization_id") or "")
+                    ),
+                    project_id=str(project_id if project_id is not None else (defs.get("project_id") or "")),
                     location=str(location or defs.get("location") or "all"),
                     impersonated_service_account=str(
                         impersonated_service_account
