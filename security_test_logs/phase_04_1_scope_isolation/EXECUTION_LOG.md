@@ -35,14 +35,25 @@
   - Enforced `_get_client_kwargs(scope_uri=scope_uri)` before `_cache_get()` and SDK client construction across `collect_tls_policies`, `_discover_key_rings_via_cai`, and `collect_kms_import_jobs`.
 
 ### 4. Security Testing & Full Safe Regressions (2026-11-19 18:19–18:25 -03)
-- Authored `tests/test_phase4_scope_isolation.py` covering all 8 mandatory Phase 4.1 security requirements (9 parametrized test cases, 100% offline/mocked).
-- Executed targeted Phase 4.1 suite: `9 passed, 0 failed, 0 skipped` (`1.40s`).
+- Authored `tests/test_phase4_scope_isolation.py` covering all 8 mandatory Phase 4.1 security requirements (9 collected test cases; Cloud Asset Inventory and Cloud KMS clients mocked).
+- Two early runs of the new file failed on test-harness defects and were fixed in the test file only (no implementation file changed after the first test run): wrong constructor keyword arguments in the shared fixture (`8 failed, 1 passed`), and later an over-broad substring assertion added to test 04 (`1 failed, 8 passed`).
+- Recorded targeted Phase 4.1 suite result: `9 passed, 0 failed, 0 skipped` (`1.40s`).
 - Executed existing CAI/inventory suites (`test_pqc_inventory.py`, `test_phase3_scorecard_correctness.py`): `34 passed, 1 skipped, 0 failed` (`11.12s`).
-- Executed Phase 3 ADC, egress, and auth suites: `41 passed`, `181 passed`, `30 passed` (`0 failed`).
+- A first combined invocation of the Phase 3 ADC, egress, and auth suites in one pytest process reported `1 failed, 251 passed` (test-order sensitivity; see `TEST_RESULTS.md`). Run as three separate invocations they reported `41 passed`, `181 passed`, `30 passed` (`0 failed`).
 - Executed full safe local regression suite (`.venv/bin/pytest -v -rs`): `352 passed, 4 skipped, 0 failed` (`64.24s`).
 - Executed `compileall` (`PASS`), `git diff --check` (`PASS`), and branch-diff secret & sensitive-identifier scan (caught and sanitized local filesystem path in `EXECUTION_LOG.md`, re-verified `0 findings`).
+- All counts in this section are recorded results of that single local run; they are an execution report and have not been independently reproduced.
 
 ### 5. Cloud & Infrastructure Integrity Confirmation
-- Zero live Google Cloud APIs called.
-- Zero Cloud SQL, Vertex AI, Cloud Build, KMS, IAM, or deployment operations executed.
+- No cloud resource was provisioned, modified, or deployed; no Cloud SQL, Cloud Build, IAM, or deployment command was run, and the live PostgreSQL, Vertex AI, and Docker tests were skipped.
+- Outbound network traffic was not instrumented during the regression runs. The recorded full-suite log contains a `google.auth` end-user-credential warning (see the provenance section of `TEST_RESULTS.md`), so an absolute "zero live API calls" statement is not supported for the full suite.
 - Zero Phase 3 evidence files modified; `main` remains untouched at `7f91cae13060b8fb8ceed9ac689981527c00df9f`.
+
+### 6. Commit and Push (2026-11-19 18:26 -03)
+- Staged only the 3 implementation files, the new test file, and the 7 evidence files; committed as `5f325a5be161fc204efdc36d4c59a09559494e62` (`fix(security): enforce explicit CAI scope isolation`).
+- Pushed with `git push -u origin security-hardening/phase-04-scope-isolation` (no force-push); the remote branch was verified at the same SHA.
+
+### 7. Documentation Finalization (2026-11-19 18:32 -03, documentation-only)
+- Verified preconditions: branch `security-hardening/phase-04-scope-isolation` at `5f325a5be161fc204efdc36d4c59a09559494e62`, `main` at `7f91cae13060b8fb8ceed9ac689981527c00df9f`, no tracked or staged modifications.
+- Corrected the test 08 name and authentication wording in `TEST_PLAN.md`; replaced the stale "ready for commit" handoff in `EXECUTION_CHECKPOINT.md`; labelled all test counts as recorded, not independently reproduced; corrected the test-order observation (invocation order, the cited symbol, and the inferred status of "pre-existing"); narrowed the cloud-safety wording to what was observed; recorded the collector-authorization workflow impact and the absence of a CI status as limitations.
+- No tests were run in this step, and no source file, test file, or cloud resource was changed.

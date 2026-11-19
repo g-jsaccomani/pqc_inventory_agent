@@ -2,13 +2,14 @@
 
 ## Overview
 
-This directory contains the complete, reproducible security discovery, design, verification, and checkpoint evidence for **Phase 4.1 (`P4.1`)**: removing the legacy hardcoded Functional Lab Cloud Asset Inventory (CAI) scope fallback (`DEFAULT_FUNCTIONAL_LAB_FALLBACK_SCOPES` / `_cai_search_all_resources_with_fallback`) and enforcing strict, explicit, authorized CAI/KMS scope boundaries.
+This directory contains the security discovery, design, verification, and checkpoint evidence (including the commands used, so the validation can be re-run) for **Phase 4.1 (`P4.1`)**: removing the legacy hardcoded Functional Lab Cloud Asset Inventory (CAI) scope fallback (`DEFAULT_FUNCTIONAL_LAB_FALLBACK_SCOPES` / `_cai_search_all_resources_with_fallback`) and enforcing strict, explicit, authorized CAI/KMS scope boundaries.
 
 ## Git Context
 
 - **Branch:** `security-hardening/phase-04-scope-isolation`
 - **Base (`origin/main`):** `7f91cae13060b8fb8ceed9ac689981527c00df9f` (Phase 3 merge commit)
-- **Live Cloud Resources Touched:** **None** (`0` live GCP API calls, `0` Vertex AI calls, `0` PostgreSQL/Cloud Build/IAM/deployment operations).
+- **Implementation Commit:** `5f325a5be161fc204efdc36d4c59a09559494e62` (`fix(security): enforce explicit CAI scope isolation`), pushed to `origin/security-hardening/phase-04-scope-isolation`
+- **Cloud Resources Provisioned or Modified:** **None.** No PostgreSQL, Cloud Build, IAM, or deployment operation was run. Outbound network traffic during test runs was not instrumented (see the provenance section of `TEST_RESULTS.md`).
 
 ## Files in This Evidence Bundle
 
@@ -25,3 +26,5 @@ This directory contains the complete, reproducible security discovery, design, v
 ## Status
 
 `PASS — PHASE 4.1 READY FOR REVIEW`
+
+The test counts in this bundle (targeted `9 passed`; existing CAI/inventory suites `34 passed, 1 skipped`; full safe suite `352 passed, 4 skipped, 0 failed`) are recorded results of one local execution. They are an execution report, not an independently reproduced result, and no automated CI status exists for the implementation commit.
