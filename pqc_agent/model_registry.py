@@ -67,30 +67,47 @@ def _extra_candidates_from_env() -> List[Dict[str, Any]]:
 
 
 def vertex_generate_probe(model: str, thinking_level: Optional[str]) -> ProbeResult:
-    """Sends one minimal real request to Vertex AI to verify that `model` answers in this project."""
+    """Sends one minimal real request to Vertex AI with explicit timeout and bounded transient retry."""
     from google import genai
     from google.genai import errors as genai_errors
     from google.genai import types
 
+    from pqc_agent import resilience
+
     ensure_vertex_location_for_gemini()
+    probe_timeout = resilience.vertex_probe_timeout_seconds()
+    http_opts = resilience.build_vertex_http_options(probe_timeout)
     client = genai.Client(
         vertexai=True,
         project=os.getenv("GOOGLE_CLOUD_PROJECT"),
         location=os.getenv("GOOGLE_CLOUD_LOCATION", "global"),
+        http_options=http_opts,
     )
-    config_kwargs: Dict[str, Any] = {"max_output_tokens": 512}
+    config_kwargs: Dict[str, Any] = {
+        "max_output_tokens": 512,
+        "http_options": http_opts,
+    }
     if thinking_level:
         config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=thinking_level)
-    try:
-        resp = client.models.generate_content(
+    gen_cfg = types.GenerateContentConfig(**config_kwargs)
+
+    def _do_probe() -> Any:
+        return client.models.generate_content(
             model=model,
             contents="Reply with the single word OK.",
-            config=types.GenerateContentConfig(**config_kwargs),
+            config=gen_cfg,
+        )
+
+    try:
+        resp = resilience.call_with_retry_sync(
+            _do_probe,
+            max_attempts=resilience.vertex_max_attempts(),
+            deadline_seconds=probe_timeout * 2.0,
         )
         return True, {"model_version": getattr(resp, "model_version", None)}
     except genai_errors.APIError as exc:
         return False, {"error_code": exc.code, "error_status": exc.status, "error": str(exc.message or exc)[:240]}
-    except Exception as exc:  # network / auth errors
+    except Exception as exc:  # network / auth / timeout errors
         return False, {"error": f"{type(exc).__name__}: {str(exc)[:240]}"}
 
 

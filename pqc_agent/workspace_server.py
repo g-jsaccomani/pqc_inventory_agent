@@ -55,7 +55,7 @@ from google.adk.tools.tool_context import ToolContext
 from google.genai import types
 from pydantic import BaseModel, ConfigDict
 
-from pqc_agent import auth_guard, auth_store, credential_service, egress_guard, upload_validator
+from pqc_agent import auth_guard, auth_store, credential_service, egress_guard, resilience, upload_validator
 from pqc_agent.agent import create_pqc_agent
 from pqc_agent.model_registry import ModelRegistry
 from pqc_agent.portal_ui import PORTAL_HTML
@@ -3355,52 +3355,166 @@ async function saveClientId() {{
         message_parts.append(types.Part.from_text(text=augmented_text))
         new_message = types.Content(role="user", parts=message_parts)
 
+        breaker = resilience.get_vertex_circuit_breaker()
+        try:
+            breaker.before_call(entry["model"])
+        except resilience.CircuitBreakerOpenError as cb_err:
+            now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            retry_after_secs = max(1, int(round(cb_err.retry_after_seconds)))
+            return JSONResponse(
+                status_code=503,
+                headers={"Retry-After": str(retry_after_secs)},
+                content={
+                    "session_id": session_id,
+                    "user_id": user_id,
+                    "scope": scope,
+                    "status": "MODEL_ERROR",
+                    "model_id": entry["id"],
+                    "model_label": model_label,
+                    "runtime_model": entry["model"],
+                    "thinking_level": entry.get("thinking_level"),
+                    "response": "",
+                    "error": {
+                        "code": "MODEL_CIRCUIT_OPEN",
+                        "message": str(cb_err),
+                        "retry_after_seconds": round(cb_err.retry_after_seconds, 2),
+                    },
+                    "oauth_consent_required": None,
+                    "oauth_consent_cards": [],
+                    "served_by": _compact_served_by(summarize_llm_calls([])),
+                    "uploaded_artifacts": saved_artifacts_meta,
+                    "tool_calls": [],
+                    "tool_traces": [],
+                    "connection": get_gcp_connection_config(mask_token=True, user_id=user_id),
+                    "updated_at": now_iso,
+                },
+            )
+
         runner = _get_runner(entry["model"], entry.get("thinking_level"))
         tool_calls_trace: List[Dict[str, Any]] = []
         error_events: List[Dict[str, Any]] = []
         final_text_parts: List[str] = []
         turn_consent_cards: List[Dict[str, Any]] = []
         invocation_id: Optional[str] = None
+        turn_timed_out = False
+        turn_timeout = resilience.agent_turn_timeout_seconds()
+        max_attempts = resilience.vertex_max_attempts()
+        turn_start = time.monotonic()
         consent_ctx_token = _TURN_OAUTH_CONSENT_CARDS.set(turn_consent_cards)
 
         with capture_llm_calls() as ledger:
             try:
-                async for event in runner.run_async(user_id=user_id, session_id=session_id, new_message=new_message):
-                    invocation_id = invocation_id or getattr(event, "invocation_id", None)
-                    if getattr(event, "error_code", None):
-                        error_events.append({"code": event.error_code, "message": getattr(event, "error_message", None)})
+                for attempt in range(max_attempts):
+                    tool_calls_trace.clear()
+                    error_events.clear()
+                    final_text_parts.clear()
+                    turn_consent_cards.clear()
+                    invocation_id = None
+
+                    remaining = turn_timeout - (time.monotonic() - turn_start)
+                    if remaining <= 0.01:
+                        turn_timed_out = True
+                        error_events.append(
+                            {
+                                "code": "MODEL_TIMEOUT",
+                                "message": f"Model turn exceeded wall-clock timeout of {turn_timeout:.1f}s.",
+                            }
+                        )
+                        breaker.record_failure(entry["model"], is_transient=True)
+                        break
+
                     try:
-                        for fc in event.get_function_calls() or []:
-                            name = getattr(fc, "name", "tool")
-                            tool_calls_trace.append(
-                                {
-                                    "id": getattr(fc, "id", None) or str(uuid.uuid4()),
-                                    "name": name,
-                                    "kind": (
-                                        "oauth_consent_request"
-                                        if name == "adk_request_credential"
-                                        else ("specialist_agent" if name.endswith("_agent") else "tool")
-                                    ),
-                                    "args": dict(getattr(fc, "args", {}) or {}),
-                                    "status": "CONSENT_REQUIRED" if name == "adk_request_credential" else "EXECUTED",
-                                }
-                            )
-                        for fr in event.get_function_responses() or []:
-                            resp_val = getattr(fr, "response", None)
-                            preview = json.dumps(resp_val, ensure_ascii=False, default=str)[:800] if resp_val is not None else ""
-                            for tc in reversed(tool_calls_trace):
-                                if tc["name"] == getattr(fr, "name", "") and "output_preview" not in tc:
-                                    tc["output_preview"] = preview
-                                    break
-                    except Exception:
-                        pass
-                    if event.is_final_response() and event.content and event.content.parts:
-                        for part in event.content.parts:
-                            if getattr(part, "text", None) and not getattr(part, "thought", False):
-                                final_text_parts.append(part.text)
-            except Exception as exc:
-                logger.warning("Model turn failed on '%s': %s: %s", entry["model"], type(exc).__name__, exc)
-                error_events.append({"code": type(exc).__name__, "message": str(exc)[:600]})
+                        async with asyncio.timeout(remaining):
+                            async for event in runner.run_async(
+                                user_id=user_id, session_id=session_id, new_message=new_message
+                            ):
+                                invocation_id = invocation_id or getattr(event, "invocation_id", None)
+                                if getattr(event, "error_code", None):
+                                    error_events.append(
+                                        {"code": event.error_code, "message": getattr(event, "error_message", None)}
+                                    )
+                                try:
+                                    for fc in event.get_function_calls() or []:
+                                        name = getattr(fc, "name", "tool")
+                                        tool_calls_trace.append(
+                                            {
+                                                "id": getattr(fc, "id", None) or str(uuid.uuid4()),
+                                                "name": name,
+                                                "kind": (
+                                                    "oauth_consent_request"
+                                                    if name == "adk_request_credential"
+                                                    else ("specialist_agent" if name.endswith("_agent") else "tool")
+                                                ),
+                                                "args": dict(getattr(fc, "args", {}) or {}),
+                                                "status": "CONSENT_REQUIRED" if name == "adk_request_credential" else "EXECUTED",
+                                            }
+                                        )
+                                    for fr in event.get_function_responses() or []:
+                                        resp_val = getattr(fr, "response", None)
+                                        preview = (
+                                            json.dumps(resp_val, ensure_ascii=False, default=str)[:800]
+                                            if resp_val is not None
+                                            else ""
+                                        )
+                                        for tc in reversed(tool_calls_trace):
+                                            if tc["name"] == getattr(fr, "name", "") and "output_preview" not in tc:
+                                                tc["output_preview"] = preview
+                                                break
+                                except Exception:
+                                    pass
+                                if event.is_final_response() and event.content and event.content.parts:
+                                    for part in event.content.parts:
+                                        if getattr(part, "text", None) and not getattr(part, "thought", False):
+                                            final_text_parts.append(part.text)
+                    except (TimeoutError, asyncio.TimeoutError):
+                        turn_timed_out = True
+                        logger.warning("Model turn timed out on '%s' after %.2fs.", entry["model"], turn_timeout)
+                        error_events.append(
+                            {
+                                "code": "MODEL_TIMEOUT",
+                                "message": f"Model turn exceeded wall-clock timeout of {turn_timeout:.1f}s.",
+                            }
+                        )
+                        breaker.record_failure(entry["model"], is_transient=True)
+                        break
+                    except Exception as exc:
+                        is_transient = resilience.is_transient_vertex_error(exc)
+                        logger.warning(
+                            "Model turn failed on '%s' (attempt %d/%d, transient=%s): %s: %s",
+                            entry["model"],
+                            attempt + 1,
+                            max_attempts,
+                            is_transient,
+                            type(exc).__name__,
+                            exc,
+                        )
+                        error_events.append({"code": type(exc).__name__, "message": str(exc)[:600]})
+                        if is_transient and attempt + 1 < max_attempts:
+                            rem_after = turn_timeout - (time.monotonic() - turn_start)
+                            if rem_after > 0.05:
+                                delay = resilience.compute_backoff_delay(attempt, remaining_budget=rem_after)
+                                if delay > 0:
+                                    await asyncio.sleep(delay)
+                                continue
+                        breaker.record_failure(entry["model"], is_transient=is_transient)
+                        break
+
+                    if final_text_parts or turn_consent_cards:
+                        breaker.record_success(entry["model"])
+                        break
+
+                    if error_events:
+                        last_err = error_events[-1]
+                        is_transient = resilience.is_transient_vertex_error(last_err)
+                        if is_transient and attempt + 1 < max_attempts:
+                            rem_after = turn_timeout - (time.monotonic() - turn_start)
+                            if rem_after > 0.05:
+                                delay = resilience.compute_backoff_delay(attempt, remaining_budget=rem_after)
+                                if delay > 0:
+                                    await asyncio.sleep(delay)
+                                continue
+                        breaker.record_failure(entry["model"], is_transient=is_transient)
+                    break
             finally:
                 _TURN_OAUTH_CONSENT_CARDS.reset(consent_ctx_token)
 
@@ -3478,7 +3592,8 @@ async function saveClientId() {{
             "connection": get_gcp_connection_config(mask_token=True, user_id=user_id),
             "updated_at": now_iso,
         }
-        return JSONResponse(status_code=200 if status in ("OK", "OAUTH_CONSENT_REQUIRED") else 502, content=payload)
+        http_status = 200 if status in ("OK", "OAUTH_CONSENT_REQUIRED") else (504 if turn_timed_out else 502)
+        return JSONResponse(status_code=http_status, content=payload)
 
     # =========================================================================
     # gcloud CLI and dynamic credential bridge (isolated per tenant user)

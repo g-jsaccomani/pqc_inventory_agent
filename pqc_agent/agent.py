@@ -226,7 +226,12 @@ SPECIALIST_INSTRUCTIONS: Dict[str, str] = {
 
 def build_generate_content_config(model_name: str, thinking_level: Optional[str]) -> types.GenerateContentConfig:
     """Generation settings shared by every agent in the tree."""
-    kwargs: Dict[str, Any] = {"max_output_tokens": MAX_OUTPUT_TOKENS}
+    from pqc_agent import resilience
+
+    kwargs: Dict[str, Any] = {
+        "max_output_tokens": MAX_OUTPUT_TOKENS,
+        "http_options": resilience.build_vertex_http_options(resilience.vertex_request_timeout_seconds()),
+    }
     if not model_name.startswith("gemini-3"):
         # Gemini 3 models are tuned for the default temperature; older models get a low temperature.
         kwargs["temperature"] = 0.2
