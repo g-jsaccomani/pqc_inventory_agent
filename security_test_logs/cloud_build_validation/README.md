@@ -3,16 +3,16 @@
 This directory stores the evidence and instructions for running real Docker build and runtime hardening checks (Phase 3.5 / `P3-04`) on Google Cloud Build without requiring a local Docker daemon.
 
 ## Target Isolated GCP Project
-- **Project ID:** `pqc-inventory-agent-validation` (`678301206512`)
-- **Parent Folder:** `folders/534285347409` (`fldr-functional-lab`, organization `organizations/31564119954`)
+- **Project ID:** `pqc-inventory-agent-validation`
+- **Parent Hierarchy:** The functional-lab parent folder under the designated organization
 - **Region:** `us-central1`
 - **Machine Type:** `E2_STANDARD_2` (default worker pool, `900s` timeout, `CLOUD_LOGGING_ONLY`)
-- **Execution Service Account:** `678301206512-compute@developer.gserviceaccount.com`
+- **Execution Identity:** The dedicated Cloud Build execution service account
   - Least-privilege IAM bindings: `roles/logging.logWriter` and `roles/storage.objectViewer` only.
 
 ## Exact Command to Rerun Validation
 
-From the repository root on the target branch:
+Ensure your active `gcloud` CLI profile is authenticated to an authorized account for `pqc-inventory-agent-validation`, then run from the repository root on the target branch:
 
 ```bash
 gcloud config set project pqc-inventory-agent-validation
@@ -23,20 +23,6 @@ gcloud builds submit \
   --region=us-central1 \
   .
 ```
-
-> **Note for Google Corp Workstations:** If your default `~/.config/gcloud` profile uses corp credentials (`@google.com`) rather than your Argolis admin identity (`admin@jsaccomani.altostrat.com`), run with the isolated Argolis config profile:
-> ```bash
-> env -u CLOUDSDK_INTERNAL_USER \
->   -u CLOUDSDK_CONTEXT_AWARE_USE_ECP_HTTP_PROXY \
->   -u CLOUDSDK_CONTEXT_AWARE_USE_CLIENT_CERTIFICATE \
->   -u CLOUDSDK_CONTEXT_AWARE_USE_MTLS_FOR_GRPC \
->   CLOUDSDK_CONFIG="$HOME/.config/gcloud-argolis" \
->   gcloud builds submit \
->     --project=pqc-inventory-agent-validation \
->     --config=cloudbuild.docker-validation.yaml \
->     --region=us-central1 \
->     .
-> ```
 
 ### Viewing Build Logs (`CLOUD_LOGGING_ONLY`)
 Because `cloudbuild.docker-validation.yaml` uses `logging: CLOUD_LOGGING_ONLY`, stream logs directly via `gcloud beta builds submit` or inspect a completed build with:
