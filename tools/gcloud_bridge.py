@@ -1589,6 +1589,66 @@ def resolve_authorized_tenant_scope(
     )
 
 
+def authorize_gcp_scope(
+    scope_uri: str,
+    *,
+    user_id: Optional[str] = None,
+    conn_cfg: Optional[Mapping[str, Any]] = None,
+) -> str:
+    """Validates that `scope_uri` (`organizations/<id>`, `folders/<id>`, or `projects/<id>`) is authorized for the caller.
+
+    Reuses the canonical tenant scope boundary (`resolve_authorized_tenant_scope`) and deny-by-default ADC
+    authorization (`authorize_adc_mode`) so Python SDK and Cloud Asset Inventory collectors enforce the same
+    multi-tenant isolation rules as `authorize_gcloud_command_scope`.
+    """
+    from pqc_agent import auth_store
+
+    active_ctx_uid = get_current_tenant_user()
+    uid = normalize_user_id(user_id or active_ctx_uid)
+    if _is_authenticated_email_identity(active_ctx_uid) and uid != active_ctx_uid:
+        raise PermissionError("Forbidden: cross-tenant scope authorization denied.")
+    if not _is_authenticated_email_identity(uid):
+        raise PermissionError(
+            "UNAUTHENTICATED_EXECUTION_CONTEXT: An authenticated tenant user identity is required to query GCP scopes."
+        )
+
+    raw_row = auth_store.get_active_auth_store().get_user_connection(uid)
+    if raw_row is not None and str(raw_row.get("mode") or "").strip().lower() == "adc":
+        authorize_adc_mode(uid)
+
+    effective_conn = conn_cfg if conn_cfg is not None else get_gcp_connection_config(mask_token=True, user_id=uid)
+    if str(effective_conn.get("mode") or "").strip().lower() == "adc":
+        authorize_adc_mode(uid)
+
+    clean_scope = str(scope_uri or "").strip()
+    scope_err = _validate_scope_value(clean_scope)
+    if scope_err is not None:
+        raise PermissionError(f"UNAUTHORIZED_RESOURCE_SCOPE: {scope_err}")
+
+    authorized = resolve_authorized_tenant_scope(uid, effective_conn)
+    kind, _, identifier = clean_scope.partition("/")
+
+    if kind == "organizations":
+        if identifier not in authorized.organizations:
+            raise PermissionError(
+                f"UNAUTHORIZED_RESOURCE_SCOPE: Organization '{identifier}' is outside tenant '{uid}' authorized scope."
+            )
+    elif kind == "folders":
+        if identifier not in authorized.folders:
+            raise PermissionError(
+                f"UNAUTHORIZED_RESOURCE_SCOPE: Folder '{identifier}' is outside tenant '{uid}' authorized scope."
+            )
+    elif kind == "projects":
+        if identifier not in authorized.projects:
+            raise PermissionError(
+                f"UNAUTHORIZED_RESOURCE_SCOPE: Project '{identifier}' is outside tenant '{uid}' authorized scope."
+            )
+    else:
+        raise PermissionError(f"UNAUTHORIZED_RESOURCE_SCOPE: Unrecognized GCP scope '{clean_scope}'.")
+
+    return clean_scope
+
+
 def authorize_gcloud_command_scope(
     raw_command: str,
     *,

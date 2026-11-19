@@ -70,8 +70,6 @@ ORG_MODE_TOKENS = {
     "default",
     "all",
     "*",
-    DEFAULT_ORGANIZATION_ID.lower(),
-    f"organizations/{DEFAULT_ORGANIZATION_ID}".lower(),
     DEFAULT_ORGANIZATION_NAME.lower(),
 }
 
@@ -189,18 +187,20 @@ def _now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat()
 
 
-def _get_client_kwargs() -> Dict[str, Any]:
-    """Returns {'credentials': creds} for the active tenant connection, failing closed on PermissionError."""
-    try:
-        from tools.gcloud_bridge import get_active_gcp_credentials
+def _get_client_kwargs(scope_uri: Optional[str] = None) -> Dict[str, Any]:
+    """Returns {'credentials': creds} for the active tenant connection after enforcing scope and credential authz.
 
-        creds = get_active_gcp_credentials()
-        if creds is not None:
-            return {"credentials": creds}
-    except PermissionError:
-        raise
-    except Exception:
-        pass
+    Fails closed on ``PermissionError`` or ``ValueError`` (unauthenticated caller, unauthorized ADC mode,
+    missing delegated token, or caller-supplied scope outside the tenant's authorized boundary). Never
+    silently degrades to empty kwargs / ambient ADC.
+    """
+    from tools.gcloud_bridge import authorize_gcp_scope, get_active_gcp_credentials
+
+    if scope_uri is not None:
+        authorize_gcp_scope(scope_uri)
+    creds = get_active_gcp_credentials()
+    if creds is not None:
+        return {"credentials": creds}
     return {}
 
 
@@ -281,7 +281,7 @@ def _resolve_scope(target: Optional[str] = None) -> Tuple[str, str, str]:
     if lower in ORG_MODE_TOKENS:
         return ("ORG", f"organizations/{active_org}", active_org)
     if lower.startswith("organizations/"):
-        org_id = raw.split("/", 1)[1].strip() or active_org
+        org_id = raw.split("/", 1)[1].strip()
         return ("ORG", f"organizations/{org_id}", org_id)
     if raw.isdigit() and len(raw) >= 8:
         return ("ORG", f"organizations/{raw}", raw)
@@ -653,63 +653,42 @@ def _scan_kms_location(
         return [f.result() for f in futures]
 
 
-DEFAULT_FUNCTIONAL_LAB_FALLBACK_SCOPES: Tuple[str, ...] = (
-    "folders/534285347409",
-    "projects/pqc-inventory-agent-cd06",
-    "projects/pqc-inventory-agent-dev",
-)
-
-
-def _cai_search_all_resources_with_fallback(
+def _cai_search_all_resources(
     cai_client: Any,
     scope_uri: str,
     asset_types: List[str],
     read_mask: Optional[str] = None,
     page_size: int = 500,
 ) -> List[Any]:
-    """Queries Cloud Asset Inventory `search_all_resources` for `scope_uri`.
-    When `scope_uri` is `organizations/31564119954` and the runtime service account is scoped to the Functional Lab
-    folder (`folders/534285347409`) + host project (`projects/pqc-inventory-agent-cd06`), transparently falls back
-    to querying those scopes and deduplicating resources by `name`."""
+    """Queries Cloud Asset Inventory `search_all_resources` strictly for the explicitly supplied `scope_uri`.
+
+    Never falls back to alternative organizations, folders, or projects when the request fails;
+    any exception raised by Cloud Asset Inventory is propagated to the caller intact.
+    """
+    clean_scope = str(scope_uri or "").strip()
+    if not clean_scope:
+        raise ValueError("Cloud Asset Inventory scope_uri must be a non-empty explicit scope.")
     req: Dict[str, Any] = {
-        "scope": scope_uri,
+        "scope": clean_scope,
         "asset_types": list(asset_types),
         "page_size": page_size,
     }
     if read_mask:
         req["read_mask"] = read_mask
-    try:
-        return list(cai_client.search_all_resources(request=req))
-    except Exception as primary_exc:
-        if scope_uri != f"organizations/{DEFAULT_ORGANIZATION_ID}":
-            raise
-        combined: List[Any] = []
-        seen_names: Set[str] = set()
-        any_succeeded = False
-        for fb_scope in DEFAULT_FUNCTIONAL_LAB_FALLBACK_SCOPES:
-            fb_req = dict(req, scope=fb_scope)
-            try:
-                for item in cai_client.search_all_resources(request=fb_req):
-                    any_succeeded = True
-                    item_name = getattr(item, "name", "")
-                    if item_name and item_name in seen_names:
-                        continue
-                    if item_name:
-                        seen_names.add(item_name)
-                    combined.append(item)
-            except Exception:
-                continue
-        if any_succeeded:
-            return combined
-        raise primary_exc
+    return list(cai_client.search_all_resources(request=req))
 
 
-def _discover_kms_targets_via_cai(scope_uri: str, errors: List[str]) -> List[Tuple[str, str]]:
+def _discover_kms_targets_via_cai(
+    scope_uri: str,
+    errors: List[str],
+    client_kwargs: Optional[Dict[str, Any]] = None,
+) -> List[Tuple[str, str]]:
     """Discovers (project_id, location) pairs that contain KeyRings/CryptoKeys inside the scope."""
     targets: Set[Tuple[str, str]] = set()
+    kwargs = client_kwargs if client_kwargs is not None else _get_client_kwargs(scope_uri=scope_uri)
     try:
-        cai_client = asset_v1.AssetServiceClient(**_get_client_kwargs())
-        response = _cai_search_all_resources_with_fallback(
+        cai_client = asset_v1.AssetServiceClient(**kwargs)
+        response = _cai_search_all_resources(
             cai_client=cai_client,
             scope_uri=scope_uri,
             asset_types=["cloudkms.googleapis.com/KeyRing", "cloudkms.googleapis.com/CryptoKey"],
@@ -786,11 +765,11 @@ def collect_kms_inventory(
     loc = (location or "all").strip()
     simulated = simulation_requested(clean_id)
     cache_key = f"kms:{scope_uri}:{loc.lower()}:{simulated}"
-    cached = _cache_get(cache_key)
-    if cached:
-        return cached
 
     if simulated:
+        cached = _cache_get(cache_key)
+        if cached:
+            return cached
         keys = [
             build_key_record(project_id=clean_id, enabled_version_ids=["1"], data_source=SIMULATED_DATA_SOURCE, **raw)
             for raw in mock_data.get_simulated_kms_raw_keys(clean_id, loc)
@@ -814,8 +793,12 @@ def collect_kms_inventory(
     skipped: List[str] = []
     keys: List[Dict[str, Any]] = []
     try:
-        client = kms_v1.KeyManagementServiceClient(**_get_client_kwargs())
-        targets = _discover_kms_targets_via_cai(scope_uri, errors)
+        client_kwargs = _get_client_kwargs(scope_uri=scope_uri)
+        cached = _cache_get(cache_key)
+        if cached:
+            return cached
+        client = kms_v1.KeyManagementServiceClient(**client_kwargs)
+        targets = _discover_kms_targets_via_cai(scope_uri, errors, client_kwargs=client_kwargs)
         if loc.lower() not in ("all", "*", ""):
             if mode == "PROJECT":
                 targets = [(clean_id, loc)]
@@ -849,7 +832,7 @@ def collect_kms_inventory(
     payload = {
         "scope": scope_uri,
         "scope_mode": mode,
-        "organization_domain": DEFAULT_ORGANIZATION_NAME if mode == "ORG" else None,
+        "organization_domain": DEFAULT_ORGANIZATION_NAME if (mode == "ORG" and clean_id == DEFAULT_ORGANIZATION_ID) else None,
         "data_source": LIVE_DATA_SOURCE,
         "generated_at": _now_iso(),
         **_inventory_summary(keys),
@@ -861,6 +844,7 @@ def collect_kms_inventory(
     if not keys and errors:
         payload["error"] = "No keys could be read; see collection_errors."
         payload["required_roles"] = REQUIRED_READ_ROLES
+        return _compact_json(payload)
     return _cache_put(cache_key, _compact_json(payload))
 
 
@@ -932,19 +916,23 @@ def collect_workload_evidence(scope: str = f"organizations/{DEFAULT_ORGANIZATION
     mode, scope_uri, clean_id = _resolve_scope(scope)
     simulated = simulation_requested(clean_id)
     cache_key = f"workloads:{scope_uri}:{simulated}"
-    cached = _cache_get(cache_key)
-    if cached:
-        return cached
 
     if simulated:
+        cached = _cache_get(cache_key)
+        if cached:
+            return cached
         raw = mock_data.get_simulated_workload_evidence(clean_id)["workloads"]
         payload = _build_workload_evidence_payload(mode, scope_uri, raw, SIMULATED_DATA_SOURCE, [])
         return _cache_put(cache_key, _compact_json(payload))
 
     raw_workloads: List[Dict[str, Any]] = []
     try:
-        cai_client = asset_v1.AssetServiceClient(**_get_client_kwargs())
-        response = _cai_search_all_resources_with_fallback(
+        client_kwargs = _get_client_kwargs(scope_uri=scope_uri)
+        cached = _cache_get(cache_key)
+        if cached:
+            return cached
+        cai_client = asset_v1.AssetServiceClient(**client_kwargs)
+        response = _cai_search_all_resources(
             cai_client=cai_client,
             scope_uri=scope_uri,
             asset_types=WORKLOAD_ASSET_TYPES,
@@ -1018,11 +1006,11 @@ def discover_all_crypto_assets(scope: str = f"organizations/{DEFAULT_ORGANIZATIO
     mode, scope_uri, clean_id = _resolve_scope(scope)
     simulated = simulation_requested(clean_id)
     cache_key = f"cai-crypto:{scope_uri}:{simulated}"
-    cached = _cache_get(cache_key)
-    if cached:
-        return cached
 
     if simulated:
+        cached = _cache_get(cache_key)
+        if cached:
+            return cached
         payload = {
             "scope": scope_uri,
             "scope_mode": mode,
@@ -1036,8 +1024,12 @@ def discover_all_crypto_assets(scope: str = f"organizations/{DEFAULT_ORGANIZATIO
 
     assets: List[Dict[str, Any]] = []
     try:
-        cai_client = asset_v1.AssetServiceClient(**_get_client_kwargs())
-        response = _cai_search_all_resources_with_fallback(
+        client_kwargs = _get_client_kwargs(scope_uri=scope_uri)
+        cached = _cache_get(cache_key)
+        if cached:
+            return cached
+        cai_client = asset_v1.AssetServiceClient(**client_kwargs)
+        response = _cai_search_all_resources(
             cai_client=cai_client,
             scope_uri=scope_uri,
             asset_types=CRYPTO_ASSET_TYPES,
