@@ -13,18 +13,30 @@ The calibration ledger is persisted transactionally in PostgreSQL (`pqc_calibrat
 
 from __future__ import annotations
 
+from collections import OrderedDict
 import csv
 import datetime
 import io
 import json
 import os
+import threading
+import time
 from typing import Any, Dict, List, Optional
+
+from pqc_agent import upload_validator
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MAX_ARTIFACT_CHARS = int(os.getenv("PQC_MAX_ARTIFACT_CHARS", "60000"))
 
-# Session-scoped cache of text extracted from uploaded files (filled by the portal upload endpoint).
-_UPLOADED_ARTIFACT_CACHE: Dict[str, Dict[str, Any]] = {}
+DEFAULT_UPLOAD_CACHE_MAX_ENTRIES = 128
+DEFAULT_UPLOAD_CACHE_MAX_BYTES = 32 * 1024 * 1024  # 32 MiB extracted text budget
+DEFAULT_UPLOAD_CACHE_TTL_SECONDS = 3600.0
+
+# Tenant- and session-scoped bounded LRU cache of extracted uploaded artifact text.
+_UPLOAD_CACHE_LOCK = threading.RLock()
+_UPLOADED_ARTIFACT_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+_UPLOADED_ARTIFACT_LATEST: Dict[str, str] = {}
+_UPLOADED_ARTIFACT_CACHE_BYTES: int = 0
 
 # Default sector baselines. These are ASSUMPTIONS that must be validated with stakeholders.
 SECTOR_CALIBRATION_PROFILES: Dict[str, Dict[str, Any]] = {
@@ -212,75 +224,88 @@ def get_historical_calibration_profile(scope: str = "organizations/default") -> 
 
 
 # ---------------------------------------------------------------------------
-# Uploaded artifacts: raw extraction only (the agent interprets the content)
+# Uploaded artifacts: validated extraction & tenant-isolated bounded LRU cache
 # ---------------------------------------------------------------------------
 
 
-def extract_text_from_uploaded_bytes(filename: str, raw_bytes: bytes, mime_type: str = "") -> str:
-    """Extracts human-readable text or X.509 metadata from PDF, DOCX, PEM/CRT, CSV, JSON, MD or TXT bytes."""
-    ext = os.path.splitext(filename or "")[1].lower()
-
-    if ext == ".pdf" or mime_type == "application/pdf":
-        try:
-            from pypdf import PdfReader
-
-            reader = PdfReader(io.BytesIO(raw_bytes))
-            extracted = "\n".join(page.extract_text() or "" for page in reader.pages).strip()
-            if extracted:
-                return extracted
-        except Exception:
-            pass
-
-    if ext == ".docx" or "officedocument.wordprocessingml" in (mime_type or ""):
-        try:
-            import docx
-
-            document = docx.Document(io.BytesIO(raw_bytes))
-            parts: List[str] = [p.text for p in document.paragraphs if p.text.strip()]
-            for table in document.tables:
-                for row in table.rows:
-                    cells = [c.text.strip() for c in row.cells if c.text.strip()]
-                    if cells:
-                        parts.append(" | ".join(cells))
-            extracted = "\n".join(parts).strip()
-            if extracted:
-                return extracted
-        except Exception:
-            pass
-
-    if ext in (".pem", ".crt", ".cer") or b"-----BEGIN CERTIFICATE-----" in raw_bytes:
-        try:
-            from cryptography import x509
-            from cryptography.hazmat.primitives.asymmetric import dsa, ec, ed25519, rsa
-
-            cert = x509.load_pem_x509_certificate(raw_bytes)
-            pub = cert.public_key()
-            if isinstance(pub, rsa.RSAPublicKey):
-                algo_desc = f"RSA_{pub.key_size}"
-            elif isinstance(pub, ec.EllipticCurvePublicKey):
-                algo_desc = f"ECDSA_{pub.curve.name.upper()}"
-            elif isinstance(pub, ed25519.Ed25519PublicKey):
-                algo_desc = "ED25519"
-            elif isinstance(pub, dsa.DSAPublicKey):
-                algo_desc = f"DSA_{pub.key_size}"
-            else:
-                algo_desc = type(pub).__name__
-            return (
-                "X509_CERTIFICATE_METADATA:\n"
-                f"subject={cert.subject.rfc4514_string()}\n"
-                f"issuer={cert.issuer.rfc4514_string()}\n"
-                f"public_key_algorithm={algo_desc}\n"
-                f"signature_algorithm={cert.signature_algorithm_oid._name}\n"
-                f"not_valid_before={cert.not_valid_before_utc.isoformat()}\n"
-                f"not_valid_after={cert.not_valid_after_utc.isoformat()}\n"
-            )
-        except Exception:
-            pass
-
+def _upload_cache_max_entries() -> int:
+    raw = (os.getenv("PQC_UPLOAD_CACHE_MAX_ENTRIES") or "").strip()
     try:
-        return raw_bytes.decode("utf-8")
-    except UnicodeDecodeError:
-        return raw_bytes.decode("latin-1", errors="replace")
+        return max(1, int(raw)) if raw else DEFAULT_UPLOAD_CACHE_MAX_ENTRIES
+    except ValueError:
+        return DEFAULT_UPLOAD_CACHE_MAX_ENTRIES
+
+
+def _upload_cache_max_bytes() -> int:
+    raw = (os.getenv("PQC_UPLOAD_CACHE_MAX_BYTES") or "").strip()
+    try:
+        return max(1024, int(raw)) if raw else DEFAULT_UPLOAD_CACHE_MAX_BYTES
+    except ValueError:
+        return DEFAULT_UPLOAD_CACHE_MAX_BYTES
+
+
+def _upload_cache_ttl_seconds() -> float:
+    raw = (os.getenv("PQC_UPLOAD_CACHE_TTL_SECONDS") or "").strip()
+    try:
+        return max(1.0, float(raw)) if raw else DEFAULT_UPLOAD_CACHE_TTL_SECONDS
+    except ValueError:
+        return DEFAULT_UPLOAD_CACHE_TTL_SECONDS
+
+
+def _resolve_cache_tenant_user(user_id: Optional[str] = None) -> str:
+    from tools.gcloud_bridge import get_current_tenant_user, normalize_user_id
+
+    return normalize_user_id(user_id or get_current_tenant_user())
+
+
+def _evict_cache_key_unlocked(cache_key: str) -> None:
+    global _UPLOADED_ARTIFACT_CACHE_BYTES
+    removed = _UPLOADED_ARTIFACT_CACHE.pop(cache_key, None)
+    if removed is not None:
+        _UPLOADED_ARTIFACT_CACHE_BYTES = max(
+            0, _UPLOADED_ARTIFACT_CACHE_BYTES - int(removed.get("_cached_text_bytes", 0))
+        )
+        latest_scope = f"{removed.get('user_id', '')}:{removed.get('session_id', '')}"
+        if _UPLOADED_ARTIFACT_LATEST.get(latest_scope) == cache_key:
+            _UPLOADED_ARTIFACT_LATEST.pop(latest_scope, None)
+
+
+def _prune_upload_cache_unlocked(now_monotonic: Optional[float] = None) -> None:
+    now = now_monotonic if now_monotonic is not None else time.monotonic()
+    ttl = _upload_cache_ttl_seconds()
+    expired_keys = [
+        k for k, rec in _UPLOADED_ARTIFACT_CACHE.items() if (now - float(rec.get("_stored_at_monotonic", 0.0))) > ttl
+    ]
+    for k in expired_keys:
+        _evict_cache_key_unlocked(k)
+
+    max_entries = _upload_cache_max_entries()
+    max_bytes = _upload_cache_max_bytes()
+    while len(_UPLOADED_ARTIFACT_CACHE) > max_entries or (
+        _UPLOADED_ARTIFACT_CACHE_BYTES > max_bytes and len(_UPLOADED_ARTIFACT_CACHE) > 0
+    ):
+        oldest_key = next(iter(_UPLOADED_ARTIFACT_CACHE))
+        _evict_cache_key_unlocked(oldest_key)
+
+
+def clear_uploaded_artifact_cache() -> None:
+    """Clears all cached uploaded artifact text entries (used in tests and cleanup)."""
+    global _UPLOADED_ARTIFACT_CACHE_BYTES
+    with _UPLOAD_CACHE_LOCK:
+        _UPLOADED_ARTIFACT_CACHE.clear()
+        _UPLOADED_ARTIFACT_LATEST.clear()
+        _UPLOADED_ARTIFACT_CACHE_BYTES = 0
+
+
+def extract_text_from_uploaded_bytes(filename: str, raw_bytes: bytes, mime_type: str = "") -> str:
+    """Validates magic bytes/structure and extracts bounded text or X.509 metadata (zero latin-1 fallback)."""
+    validated = upload_validator.validate_and_extract_upload(
+        filename=filename,
+        raw_bytes=raw_bytes,
+        declared_mime=mime_type,
+        enforce_size_limit=True,
+    )
+    return validated.extracted_text
 
 
 def register_uploaded_artifact_for_analysis(
@@ -288,19 +313,88 @@ def register_uploaded_artifact_for_analysis(
     raw_bytes: bytes,
     mime_type: str = "application/octet-stream",
     session_id: str = "default",
+    *,
+    user_id: Optional[str] = None,
+    extracted_text: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Caches the text extracted from an uploaded file, scoped to the conversation session."""
+    """Caches validated uploaded artifact text partitioned strictly by `(user_id, session_id, sanitized_filename)`."""
+    global _UPLOADED_ARTIFACT_CACHE_BYTES
+
+    uid = _resolve_cache_tenant_user(user_id)
+    safe_session = str(session_id or "default").strip() or "default"
+
+    if extracted_text is None:
+        validated = upload_validator.validate_and_extract_upload(
+            filename=filename,
+            raw_bytes=raw_bytes,
+            declared_mime=mime_type,
+            enforce_size_limit=True,
+        )
+        safe_name = validated.sanitized_filename
+        resolved_mime = validated.canonical_mime
+        text_val = validated.extracted_text
+    else:
+        safe_name = upload_validator.sanitize_upload_filename(filename, require_allowed_extension=True)
+        resolved_mime = mime_type
+        text_val = str(extracted_text)[: upload_validator.max_extracted_text_chars()]
+
+    text_bytes_len = len(text_val.encode("utf-8", errors="ignore"))
+    cache_key = f"{uid}:{safe_session}:{safe_name}"
+    latest_scope = f"{uid}:{safe_session}"
+    now_mono = time.monotonic()
+
     record = {
-        "filename": filename,
-        "mime_type": mime_type,
+        "user_id": uid,
+        "filename": safe_name,
+        "mime_type": resolved_mime,
         "size_bytes": len(raw_bytes),
-        "session_id": session_id,
-        "extracted_text": extract_text_from_uploaded_bytes(filename, raw_bytes, mime_type),
+        "session_id": safe_session,
+        "extracted_text": text_val,
         "uploaded_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "_stored_at_monotonic": now_mono,
+        "_cached_text_bytes": text_bytes_len,
     }
-    _UPLOADED_ARTIFACT_CACHE[f"{session_id}:{filename}"] = record
-    _UPLOADED_ARTIFACT_CACHE[f"{session_id}:latest"] = record
-    return record
+
+    with _UPLOAD_CACHE_LOCK:
+        _prune_upload_cache_unlocked(now_mono)
+        if cache_key in _UPLOADED_ARTIFACT_CACHE:
+            _evict_cache_key_unlocked(cache_key)
+        _UPLOADED_ARTIFACT_CACHE[cache_key] = record
+        _UPLOADED_ARTIFACT_CACHE.move_to_end(cache_key)
+        _UPLOADED_ARTIFACT_CACHE_BYTES += text_bytes_len
+        _UPLOADED_ARTIFACT_LATEST[latest_scope] = cache_key
+        _prune_upload_cache_unlocked(now_mono)
+
+    return {
+        "user_id": uid,
+        "filename": safe_name,
+        "mime_type": resolved_mime,
+        "size_bytes": len(raw_bytes),
+        "session_id": safe_session,
+        "extracted_text": text_val,
+        "uploaded_at_utc": record["uploaded_at_utc"],
+    }
+
+
+def _lookup_cached_artifact(user_id: str, session_id: str, artifact_name: str = "") -> Optional[Dict[str, Any]]:
+    now_mono = time.monotonic()
+    with _UPLOAD_CACHE_LOCK:
+        _prune_upload_cache_unlocked(now_mono)
+        if artifact_name:
+            try:
+                safe_name = upload_validator.sanitize_upload_filename(artifact_name, require_allowed_extension=False)
+            except upload_validator.UploadValidationError:
+                return None
+            cache_key = f"{user_id}:{session_id}:{safe_name}"
+        else:
+            cache_key = _UPLOADED_ARTIFACT_LATEST.get(f"{user_id}:{session_id}", "")
+        if not cache_key:
+            return None
+        rec = _UPLOADED_ARTIFACT_CACHE.get(cache_key)
+        if rec is None:
+            return None
+        _UPLOADED_ARTIFACT_CACHE.move_to_end(cache_key)
+        return dict(rec)
 
 
 def _csv_preview(text: str, max_rows: int = 50) -> Optional[Dict[str, Any]]:
@@ -332,13 +426,29 @@ async def read_uploaded_artifact(artifact_name: str = "", tool_context: Any = No
         JSON with `artifact_name`, `extracted_text` (truncated if very large), optional `csv_preview` and `source`.
     """
     session_id = "default"
+    ctx_user_id: Optional[str] = None
     if tool_context is not None:
         try:
-            session_id = tool_context.session.id
+            session_id = str(getattr(getattr(tool_context, "session", None), "id", None) or "default")
         except Exception:
             session_id = "default"
+        try:
+            inv_ctx = getattr(tool_context, "_invocation_context", None)
+            ctx_user_id = (
+                getattr(inv_ctx, "user_id", None)
+                or getattr(tool_context, "user_id", None)
+                or getattr(getattr(tool_context, "session", None), "user_id", None)
+            )
+        except Exception:
+            ctx_user_id = None
 
+    uid = _resolve_cache_tenant_user(ctx_user_id)
     name = (artifact_name or "").strip()
+    if name:
+        try:
+            name = upload_validator.sanitize_upload_filename(name, require_allowed_extension=False)
+        except upload_validator.UploadValidationError:
+            name = ""
     text: Optional[str] = None
     source = None
 
@@ -359,7 +469,7 @@ async def read_uploaded_artifact(artifact_name: str = "", tool_context: Any = No
             text = None
 
     if text is None:
-        cached = _UPLOADED_ARTIFACT_CACHE.get(f"{session_id}:{name or 'latest'}")
+        cached = _lookup_cached_artifact(uid, session_id, name)
         if cached:
             name = cached["filename"]
             text = cached["extracted_text"]
