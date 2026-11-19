@@ -16,6 +16,7 @@ import asyncio
 import json
 import os
 import threading
+import time
 from typing import Any, Dict, Optional
 
 from dotenv import load_dotenv
@@ -77,7 +78,24 @@ async def run_adk_agent_turn(
     from google.adk.runners import Runner
     from google.genai import types
 
+    from pqc_agent import resilience
     from pqc_agent.telemetry import LlmCallTelemetryPlugin, capture_llm_calls, summarize_llm_calls
+
+    breaker = resilience.get_vertex_circuit_breaker()
+    try:
+        breaker.before_call(model_name)
+    except resilience.CircuitBreakerOpenError as cb_err:
+        return {
+            "session_id": session_id or "",
+            "status": "MODEL_ERROR",
+            "response": "",
+            "error": {
+                "code": "MODEL_CIRCUIT_OPEN",
+                "message": str(cb_err),
+                "retry_after_seconds": round(cb_err.retry_after_seconds, 2),
+            },
+            "served_by": summarize_llm_calls([]),
+        }
 
     ws_app = get_workspace_app()
     sess_service = ws_app.state.session_service
@@ -102,17 +120,65 @@ async def run_adk_agent_turn(
         session = await sess_service.create_session(app_name="pqc_agent", user_id=user_id)
 
     content = types.Content(role="user", parts=[types.Part.from_text(text=prompt)])
-    text_parts = []
+    text_parts: list[str] = []
     error: Optional[Dict[str, Any]] = None
+    turn_timeout = resilience.agent_turn_timeout_seconds()
+    max_attempts = resilience.vertex_max_attempts()
+    turn_start = time.monotonic()
+
     with capture_llm_calls() as ledger:
-        try:
-            async for event in runner.run_async(user_id=user_id, session_id=session.id, new_message=content):
-                if getattr(event, "error_code", None):
-                    error = {"code": event.error_code, "message": event.error_message}
-                if event.is_final_response() and event.content and event.content.parts:
-                    text_parts.extend(p.text for p in event.content.parts if p.text and not getattr(p, "thought", False))
-        except Exception as exc:
-            error = {"code": type(exc).__name__, "message": str(exc)}
+        for attempt in range(max_attempts):
+            text_parts.clear()
+            error = None
+            remaining = turn_timeout - (time.monotonic() - turn_start)
+            if remaining <= 0.01:
+                error = {
+                    "code": "MODEL_TIMEOUT",
+                    "message": f"Agent turn exceeded wall-clock timeout of {turn_timeout:.1f}s.",
+                }
+                breaker.record_failure(model_name, is_transient=True)
+                break
+            try:
+                async with asyncio.timeout(remaining):
+                    async for event in runner.run_async(user_id=user_id, session_id=session.id, new_message=content):
+                        if getattr(event, "error_code", None):
+                            error = {"code": event.error_code, "message": event.error_message}
+                        if event.is_final_response() and event.content and event.content.parts:
+                            text_parts.extend(p.text for p in event.content.parts if p.text and not getattr(p, "thought", False))
+            except (TimeoutError, asyncio.TimeoutError):
+                error = {
+                    "code": "MODEL_TIMEOUT",
+                    "message": f"Agent turn exceeded wall-clock timeout of {turn_timeout:.1f}s.",
+                }
+                breaker.record_failure(model_name, is_transient=True)
+                break
+            except Exception as exc:
+                is_transient = resilience.is_transient_vertex_error(exc)
+                error = {"code": type(exc).__name__, "message": str(exc)[:600]}
+                if is_transient and attempt + 1 < max_attempts:
+                    rem_after = turn_timeout - (time.monotonic() - turn_start)
+                    delay = resilience.compute_backoff_delay(attempt, remaining_budget=rem_after)
+                    if rem_after > 0.05:
+                        if delay > 0:
+                            await asyncio.sleep(delay)
+                        continue
+                breaker.record_failure(model_name, is_transient=is_transient)
+                break
+
+            if text_parts:
+                breaker.record_success(model_name)
+                break
+            if error is not None:
+                is_transient = resilience.is_transient_vertex_error(error)
+                if is_transient and attempt + 1 < max_attempts:
+                    rem_after = turn_timeout - (time.monotonic() - turn_start)
+                    if rem_after > 0.05:
+                        delay = resilience.compute_backoff_delay(attempt, remaining_budget=rem_after)
+                        if delay > 0:
+                            await asyncio.sleep(delay)
+                        continue
+                breaker.record_failure(model_name, is_transient=is_transient)
+            break
 
     answer = "\n".join(text_parts).strip()
     return {

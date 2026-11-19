@@ -49,7 +49,7 @@ from google.adk.auth.auth_credential import AuthCredential, AuthCredentialTypes,
 from google.adk.auth.auth_tool import AuthConfig
 from google.adk.auth.credential_service.base_credential_service import BaseCredentialService
 
-from pqc_agent import auth_guard, auth_store
+from pqc_agent import auth_guard, auth_store, egress_guard
 
 logger = logging.getLogger(__name__)
 
@@ -233,7 +233,12 @@ def _default_oauth_refresh_exchange(
         data=data,
         headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=8) as resp:
+    with egress_guard.safe_urlopen(
+        req,
+        timeout=8.0,
+        max_bytes=egress_guard.DEFAULT_MAX_RESPONSE_BYTES,
+        allowed_hosts=egress_guard.GOOGLE_OAUTH_ALLOWED_HOSTS,
+    ) as resp:
         parsed = json.loads(resp.read().decode("utf-8"))
     return parsed if isinstance(parsed, dict) and parsed.get("access_token") else None
 

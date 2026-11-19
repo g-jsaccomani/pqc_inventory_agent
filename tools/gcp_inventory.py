@@ -156,6 +156,8 @@ QUANTUM_STATUS_RANK = {
 
 ASYMMETRIC_FAMILIES = {"CLASSICAL_RSA", "CLASSICAL_ECC", "PQC_KEM", "HYBRID_PQC_KEM", "PQC_SIGNATURE"}
 SYMMETRIC_FAMILIES = {"SYMMETRIC_AES_256", "SYMMETRIC_AES_128", "MAC_HMAC"}
+ASYMMETRIC_PURPOSES = {"ASYMMETRIC_SIGN", "ASYMMETRIC_DECRYPT", "KEY_ENCAPSULATION"}
+SYMMETRIC_PURPOSES = {"ENCRYPT_DECRYPT", "MAC", "RAW_ENCRYPT_DECRYPT"}
 
 WORKLOAD_ASSET_TYPES = [
     "run.googleapis.com/Service",
@@ -188,13 +190,15 @@ def _now_iso() -> str:
 
 
 def _get_client_kwargs() -> Dict[str, Any]:
-    """Returns {'credentials': creds} when the portal is using impersonation or a user access token."""
+    """Returns {'credentials': creds} for the active tenant connection, failing closed on PermissionError."""
     try:
         from tools.gcloud_bridge import get_active_gcp_credentials
 
         creds = get_active_gcp_credentials()
         if creds is not None:
             return {"credentials": creds}
+    except PermissionError:
+        raise
     except Exception:
         pass
     return {}
@@ -206,14 +210,16 @@ def _cache_scope_prefix() -> str:
         from tools.gcloud_bridge import get_gcp_connection_config
 
         cfg = get_gcp_connection_config(mask_token=True)
-        mode = cfg.get("mode", "adc")
+        mode = cfg.get("mode", "access_token")
         if mode == "impersonation":
-            return f"imp:{cfg.get('impersonated_service_account', '')}"
+            return f"imp:{cfg.get('user_id', '')}:{cfg.get('impersonated_service_account', '')}"
         if mode == "access_token":
             return f"tok:{cfg.get('user_id', '')}:{cfg.get('access_token_preview', '')}"
+        if mode == "adc" and cfg.get("adc_authorized"):
+            return f"adc:{cfg.get('user_id', '')}"
     except Exception:
         pass
-    return "adc"
+    return "unconfigured"
 
 
 def _cache_get(key: str) -> Optional[str]:
@@ -481,9 +487,17 @@ def build_key_record(
     version_algos = sorted({a.upper() for a in (enabled_version_algorithms or []) if a})
     primary = (primary_state or "NO_PRIMARY").upper()
 
+    activity_assumed_due_to_version_error = False
     if versions_listing_error:
-        # Version listing failed: derive activity from the primary version state and say so explicitly.
-        is_active = primary == "ENABLED"
+        # Version listing failed: asymmetric keys never populate `key.primary` (`NO_PRIMARY`).
+        # Conservatively treat non-disabled/non-destroyed keys as active rather than silently dropping them.
+        if primary in ("DESTROYED", "DESTROY_SCHEDULED", "DISABLED"):
+            is_active = False
+        elif primary == "ENABLED":
+            is_active = True
+        else:
+            is_active = True
+            activity_assumed_due_to_version_error = True
     else:
         is_active = bool(enabled_version_ids) and primary not in ("DESTROYED", "DESTROY_SCHEDULED", "DISABLED")
 
@@ -526,6 +540,7 @@ def build_key_record(
     }
     if versions_listing_error:
         record["versions_listing_error"] = versions_listing_error
+        record["activity_assumed_due_to_version_error"] = activity_assumed_due_to_version_error
     if iam_listing_error:
         record["iam_listing_error"] = iam_listing_error
     return record
@@ -1083,37 +1098,69 @@ SCORECARD_WEIGHTS = {
 
 
 def compute_scorecard_from_keys(keys: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Computes KMS posture KPIs from factual key records. Pure arithmetic, fully reproducible."""
+    """Computes KMS posture KPIs from factual key records with exhaustive denominator partitioning.
+
+    Every active key is partitioned into exactly one of:
+    - `asym` (known asymmetric family, or unknown family with an asymmetric KMS purpose)
+    - `sym` (known symmetric/MAC family, Cloud EKM `EXTERNAL_KEY_MANAGER`, or unknown family with symmetric purpose)
+    - `uncategorized` (active keys whose algorithm family AND purpose are unrecognized; these penalize maturity so
+      unreviewed keys can never be silently dropped to inflate maturity to 100.0%).
+    """
     active = [k for k in keys if k.get("is_active")]
 
     def family(k: Dict[str, Any]) -> str:
-        return k["algorithm_facts"]["algorithm_family"]
+        return str((k.get("algorithm_facts") or {}).get("algorithm_family") or "UNKNOWN").upper()
 
     def status(k: Dict[str, Any]) -> str:
-        return k["algorithm_facts"]["quantum_status"]
+        return str((k.get("algorithm_facts") or {}).get("quantum_status") or "UNKNOWN_REQUIRES_REVIEW").upper()
 
-    asym = [k for k in active if family(k) in ASYMMETRIC_FAMILIES]
+    def purpose(k: Dict[str, Any]) -> str:
+        return str(k.get("purpose") or "UNKNOWN").upper()
+
+    asym: List[Dict[str, Any]] = []
+    sym: List[Dict[str, Any]] = []
+    uncategorized: List[Dict[str, Any]] = []
+
+    for k in active:
+        fam = family(k)
+        purp = purpose(k)
+        if fam in ASYMMETRIC_FAMILIES:
+            asym.append(k)
+        elif fam in SYMMETRIC_FAMILIES or fam == "EXTERNAL_KEY_MANAGER":
+            sym.append(k)
+        elif purp in ASYMMETRIC_PURPOSES:
+            asym.append(k)
+        elif purp in SYMMETRIC_PURPOSES:
+            sym.append(k)
+        else:
+            uncategorized.append(k)
+
     asym_pqc = [k for k in asym if status(k) == "QUANTUM_SAFE_PQC"]
-    sym = [k for k in active if family(k) in SYMMETRIC_FAMILIES]
     sym_resistant = [k for k in sym if status(k) == "QUANTUM_RESISTANT_SYMMETRIC"]
-    sym_encrypt = [k for k in sym if k.get("purpose") == "ENCRYPT_DECRYPT"]
+    ekm_keys = [k for k in sym if family(k) == "EXTERNAL_KEY_MANAGER"]
+    # Cloud EKM keys rotate in the external key manager rather than via GCP KMS rotation_period;
+    # all Google-managed ENCRYPT_DECRYPT keys (including unknown-algorithm ones) are included conservatively.
+    sym_encrypt = [k for k in sym if purpose(k) == "ENCRYPT_DECRYPT" and family(k) != "EXTERNAL_KEY_MANAGER"]
     sym_rotated = [k for k in sym_encrypt if k.get("hygiene_flags", {}).get("rotation_within_90_days")]
     quantum_safe = [k for k in active if status(k) in ("QUANTUM_SAFE_PQC", "QUANTUM_RESISTANT_SYMMETRIC")]
     unknown = [k for k in active if status(k) == "UNKNOWN_REQUIRES_REVIEW"]
+    assumed_active_err = [k for k in active if k.get("activity_assumed_due_to_version_error")]
 
     metrics = {
         "asymmetric_pqc_migration": _ratio_metric(
-            len(asym_pqc), len(asym), "Active asymmetric keys using a post-quantum algorithm / all active asymmetric keys."
+            len(asym_pqc),
+            len(asym),
+            "Active asymmetric keys using a post-quantum algorithm / all active asymmetric keys (including unreviewed asymmetric keys).",
         ),
         "symmetric_quantum_resistance": _ratio_metric(
             len(sym_resistant),
             len(sym),
-            "Active symmetric/MAC keys with >= 128-bit post-quantum security / all active symmetric/MAC keys.",
+            "Active symmetric/MAC keys with >= 128-bit post-quantum security / all active symmetric, MAC, and Cloud EKM keys.",
         ),
         "symmetric_rotation_hygiene": _ratio_metric(
             len(sym_rotated),
             len(sym_encrypt),
-            "Active ENCRYPT_DECRYPT symmetric keys with automatic rotation <= 90 days / all active ENCRYPT_DECRYPT keys.",
+            "Active Google-managed ENCRYPT_DECRYPT symmetric keys with automatic rotation <= 90 days / all active Google-managed ENCRYPT_DECRYPT keys (Cloud EKM keys rotate externally and are tracked in counts.active_ekm_keys).",
         ),
         "algorithmic_quantum_safe": _ratio_metric(
             len(quantum_safe), len(active), "Active keys whose algorithm is post-quantum or quantum-resistant / all active keys."
@@ -1122,15 +1169,26 @@ def compute_scorecard_from_keys(keys: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     available = {name: w for name, w in SCORECARD_WEIGHTS.items() if metrics[name]["denominator"]}
     weight_sum = sum(available.values())
-    weighted_value = (
-        round(sum(metrics[n]["value_pct"] * w for n, w in available.items()) / weight_sum, 1) if weight_sum else None
-    )
+    if weight_sum:
+        raw_weighted = sum(metrics[n]["value_pct"] * w for n, w in available.items()) / weight_sum
+        if uncategorized and active:
+            classified_ratio = (len(active) - len(uncategorized)) / len(active)
+            weighted_value: Optional[float] = round(raw_weighted * classified_ratio, 1)
+        else:
+            weighted_value = round(raw_weighted, 1)
+    elif uncategorized:
+        weighted_value = 0.0
+    else:
+        weighted_value = None
+
     metrics["weighted_kms_pqc_maturity"] = {
         "value_pct": weighted_value,
         "weights_used": {n: round(w / weight_sum, 3) for n, w in available.items()} if weight_sum else {},
+        "uncategorized_penalty_applied": bool(uncategorized),
         "definition": (
             "Weighted average of the KMS KPIs above (methodology weights 60% asymmetric PQC migration, "
-            "25% symmetric quantum resistance, 15% rotation hygiene), renormalized over KPIs that apply in this scope."
+            "25% symmetric quantum resistance, 15% rotation hygiene), renormalized over applicable KPIs and "
+            "penalized proportionally when active keys have unrecognized purpose and algorithm."
         ),
     }
     return {
@@ -1142,9 +1200,13 @@ def compute_scorecard_from_keys(keys: List[Dict[str, Any]]) -> Dict[str, Any]:
             "active_asymmetric_pqc_keys": len(asym_pqc),
             "active_shor_vulnerable_keys": len([k for k in asym if status(k) == "QUANTUM_VULNERABLE_SHOR"]),
             "active_symmetric_or_mac_keys": len(sym),
+            "active_ekm_keys": len(ekm_keys),
+            "active_uncategorized_keys": len(uncategorized),
             "active_symmetric_below_pq_target": len([k for k in sym if status(k) == "BELOW_PQ_SECURITY_TARGET"]),
             "active_symmetric_encrypt_keys_without_90d_rotation": len(sym_encrypt) - len(sym_rotated),
             "active_keys_unknown_requires_review": len(unknown),
+            "active_keys_assumed_active_due_to_version_error": len(assumed_active_err),
+            "partition_check_sum": len(asym) + len(sym) + len(uncategorized),
         },
     }
 
@@ -1157,8 +1219,9 @@ def compute_pqc_scorecard(
     """Computes the auditable PQC posture scorecard (deterministic arithmetic, explicit numerators/denominators).
 
     KMS KPIs come from `collect_kms_inventory`. When `include_network_and_byok` is true it also computes the share
-    of HTTPS/SSL target proxies that require TLS 1.3 and the share of active KMS import jobs that use post-quantum
-    HPKE wrapping. The tool does not interpret the numbers; the agent explains them.
+    of HTTPS/SSL target proxies that require TLS 1.3 (and explicitly tracks PQC-ready TLS 1.3 excluding `DEFERRED`)
+    and the share of active KMS import jobs that use post-quantum HPKE wrapping. The tool does not interpret the
+    numbers; the agent explains them.
 
     Args:
         scope: 'organizations/<id>', 'folders/<id>', 'projects/<id>' or a bare project ID.
@@ -1166,11 +1229,20 @@ def compute_pqc_scorecard(
         include_network_and_byok: Also compute TLS and BYOK import-job KPIs.
 
     Returns:
-        JSON with `metrics` (value_pct, numerator, denominator, definition), `counts` and `data_sources`.
+        JSON with `metrics` (value_pct, numerator, denominator, definition), `counts`, `completeness_status`,
+        `inventory_complete`, and `data_sources`.
     """
     inventory = json.loads(collect_kms_inventory(scope=scope, location=location))
     if inventory.get("error") and not inventory.get("keys"):
-        return _compact_json({"scope": inventory.get("scope"), "error": inventory["error"], "required_roles": REQUIRED_READ_ROLES})
+        return _compact_json(
+            {
+                "scope": inventory.get("scope"),
+                "error": inventory["error"],
+                "inventory_complete": False,
+                "completeness_status": "COLLECTION_FAILED",
+                "required_roles": REQUIRED_READ_ROLES,
+            }
+        )
 
     result = compute_scorecard_from_keys(inventory.get("keys", []))
     result.update(
@@ -1193,9 +1265,25 @@ def compute_pqc_scorecard(
         else:
             proxies = tls.get("target_proxies", [])
             tls13 = [p for p in proxies if p.get("effective_requires_tls_1_3")]
+            tls13_pqc_ready = [
+                p
+                for p in proxies
+                if p.get("effective_requires_tls_1_3") and not p.get("effective_post_quantum_key_exchange_deferred")
+            ]
+            tls13_deferred = [
+                p
+                for p in proxies
+                if p.get("effective_requires_tls_1_3") and p.get("effective_post_quantum_key_exchange_deferred")
+            ]
             result["metrics"]["https_proxies_requiring_tls_1_3"] = _ratio_metric(
                 len(tls13), len(proxies), "HTTPS/SSL target proxies whose effective SSL policy requires TLS 1.3 / all target proxies."
             )
+            result["metrics"]["https_proxies_pqc_ready_tls_1_3"] = _ratio_metric(
+                len(tls13_pqc_ready),
+                len(proxies),
+                "HTTPS/SSL target proxies requiring TLS 1.3 without postQuantumKeyExchange=DEFERRED / all target proxies.",
+            )
+            result["counts"]["https_proxies_tls_1_3_with_pqc_deferred"] = len(tls13_deferred)
             result["data_sources"]["tls_policies"] = tls.get("data_source")
 
         ij = json.loads(collect_kms_import_jobs(scope=scope, location=location))
@@ -1208,6 +1296,19 @@ def compute_pqc_scorecard(
                 len(pqc_jobs), len(active_jobs), "Active KMS import jobs using post-quantum HPKE wrapping / all active import jobs."
             )
             result["data_sources"]["kms_import_jobs"] = ij.get("data_source")
+
+    has_partial_errors = bool(result["collection_errors"]) or (
+        result["counts"].get("active_keys_assumed_active_due_to_version_error", 0) > 0
+    )
+    if has_partial_errors:
+        result["inventory_complete"] = False
+        result["completeness_status"] = "PARTIAL_WITH_ERRORS"
+    elif result["counts"]["active_keys"] == 0 and result["counts"]["inactive_keys"] == 0:
+        result["inventory_complete"] = True
+        result["completeness_status"] = "EMPTY_SCOPE"
+    else:
+        result["inventory_complete"] = True
+        result["completeness_status"] = "COMPLETE"
 
     return _compact_json(result)
 

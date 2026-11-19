@@ -804,12 +804,14 @@ def test_auto_signin_account_switcher_and_partitioned_tenant_storage(tmp_path, m
         assert bob_token
 
         # Create a session for Bob and update Bob's connection
+        monkeypatch.setenv("PQC_ALLOWED_IMPERSONATION_SERVICE_ACCOUNTS", "emea@p.iam.gserviceaccount.com")
         bob_sess = client.post("/api/sessions", headers=_hdr(bob_token), json={"title": "EMEA Banking PQC"}).json()
-        client.post(
+        bob_conn_res = client.post(
             "/api/connection",
             headers=_hdr(bob_token),
             json={"mode": "impersonation", "organization_id": "222222222", "impersonated_service_account": "emea@p.iam.gserviceaccount.com"},
         )
+        assert bob_conn_res.status_code == 200
 
         # Verify authoritative records live in transactional DB tables and zero JSON dual-writes occur on disk
         from pqc_agent import auth_store
@@ -835,7 +837,8 @@ def test_auto_signin_account_switcher_and_partitioned_tenant_storage(tmp_path, m
         assert sw_data["authenticated"] is True
         assert sw_data["user_id"] == ALICE
         assert sw_data["user"]["region"] == "LATAM"
-        assert sw_data["connection"]["organization_id"] == "31564119954"
+        assert sw_data["connection"]["mode"] == "access_token"
+        assert sw_data["connection"]["organization_id"] == ""
 
 
 # ---------------------------------------------------------------------------------------------------------------

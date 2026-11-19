@@ -210,7 +210,7 @@ class UserConnectionRecord(PqcPersistenceBase):
 
     user_id: Mapped[str] = mapped_column(String(320), primary_key=True)
     tenant_domain: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
-    mode: Mapped[str] = mapped_column(String(32), nullable=False, default="adc")
+    mode: Mapped[str] = mapped_column(String(32), nullable=False, default="access_token")
     organization_id: Mapped[str] = mapped_column(String(128), nullable=False)
     project_id: Mapped[str] = mapped_column(String(255), nullable=False)
     location: Mapped[str] = mapped_column(String(128), nullable=False, default="all")
@@ -1351,6 +1351,16 @@ class DistributedAuthStore:
             row = db.scalars(stmt).one_or_none()
             return self._session_metadata_to_dict(row) if row is not None else None
 
+    def is_session_owned_by_other_user(self, session_id: str, *, user_id: str) -> bool:
+        """Returns True if ``session_id`` already exists in session metadata and belongs to a different user."""
+        clean_sid = str(session_id or "").strip()
+        clean_uid = str(user_id or "").strip().lower()
+        if not clean_sid or not clean_uid:
+            return False
+        with self._session_factory() as db:
+            row = db.get(SessionMetadataRecord, clean_sid)
+            return row is not None and row.user_id.lower() != clean_uid
+
     def list_user_session_metadata(self, user_id: str) -> Dict[str, Dict[str, Any]]:
         """Returns ``{session_id: metadata_dict}`` owned exclusively by ``user_id``."""
         clean_uid = str(user_id or "").strip().lower()
@@ -1427,9 +1437,11 @@ class DistributedAuthStore:
                 row = UserConnectionRecord(
                     user_id=clean_uid,
                     tenant_domain=domain,
-                    mode=str(mode or defs.get("mode") or "adc"),
-                    organization_id=str(organization_id or defs.get("organization_id") or "31564119954"),
-                    project_id=str(project_id or defs.get("project_id") or "pqc-inventory-agent-cd06"),
+                    mode=str(mode or defs.get("mode") or "access_token"),
+                    organization_id=str(
+                        organization_id if organization_id is not None else (defs.get("organization_id") or "")
+                    ),
+                    project_id=str(project_id if project_id is not None else (defs.get("project_id") or "")),
                     location=str(location or defs.get("location") or "all"),
                     impersonated_service_account=str(
                         impersonated_service_account

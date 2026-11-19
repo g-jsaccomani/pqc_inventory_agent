@@ -1,0 +1,139 @@
+# One-time / on-demand GCP Cloud Build Docker validation for Phase 3.5 (P3-04).
+#
+# Security & safety guarantees:
+# - Builds the repository's actual Dockerfile using an ephemeral local tag tied to $BUILD_ID.
+# - Verifies non-root execution (UID/GID 10001, user pqcapp), --read-only rootfs migration help,
+#   in-container /app immutability, and executes both existing Docker-gated pytest regression tests.
+# - NEVER pushes any container image to Artifact Registry or Docker Hub (no `images:` section).
+# - NEVER deploys Cloud Run, Cloud SQL, Vertex AI, KMS, or any runtime infrastructure.
+# - Removes ephemeral local images via EXIT trap (on both success and failure).
+
+timeout: 900s
+
+options:
+  machineType: E2_STANDARD_2
+  logging: CLOUD_LOGGING_ONLY
+
+steps:
+  - id: docker-build-and-runtime-validation
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args:
+      - -euo
+      - pipefail
+      - -c
+      - |
+        IMAGE="pqc-inventory-agent:cb-$BUILD_ID"
+        RUNNER_IMAGE="pqc-pytest-runner:cb-$BUILD_ID"
+        HARNESS_DIR="/tmp/cb-docker-cli-$BUILD_ID"
+
+        cleanup() {
+          echo "=== CLEANUP: Removing ephemeral local Docker images ==="
+          docker rmi -f "$$IMAGE" "$$RUNNER_IMAGE" \
+            "pqc-inventory-agent:p3-04-nonroot-smoke" \
+            "pqc-inventory-agent:pre-merge-hotfix-smoke" >/dev/null 2>&1 || true
+          rm -rf "$$HARNESS_DIR" >/dev/null 2>&1 || true
+        }
+        trap cleanup EXIT
+
+        echo "=== STEP 1: Building repository Docker image ($$IMAGE) ==="
+        docker build -t "$$IMAGE" .
+
+        echo "=== CHECK A: Non-root execution (expected UID=10001, GID=10001, user=pqcapp) ==="
+        UID_OUT="$$(docker run --rm --entrypoint id "$$IMAGE" -u | tr -d '[:space:]')"
+        GID_OUT="$$(docker run --rm --entrypoint id "$$IMAGE" -g | tr -d '[:space:]')"
+        USER_OUT="$$(docker run --rm --entrypoint id "$$IMAGE" -un | tr -d '[:space:]')"
+        echo "Effective container identity: uid=$$UID_OUT gid=$$GID_OUT user=$$USER_OUT"
+        if [ "$$UID_OUT" != "10001" ]; then
+          echo "FAIL: Expected effective UID 10001, got '$$UID_OUT'" >&2
+          exit 1
+        fi
+        if [ "$$GID_OUT" != "10001" ]; then
+          echo "FAIL: Expected effective GID 10001, got '$$GID_OUT'" >&2
+          exit 1
+        fi
+        if [ "$$USER_OUT" != "pqcapp" ]; then
+          echo "FAIL: Expected effective username pqcapp, got '$$USER_OUT'" >&2
+          exit 1
+        fi
+        echo "PASS: Check A (UID 10001 / GID 10001 / user pqcapp verified)"
+
+        echo "=== CHECK B: Read-only root filesystem + scripts/run_db_migrations.py --help ==="
+        RO_OUT="$$(docker run --rm \
+          --read-only \
+          --tmpfs /tmp:rw,noexec,nosuid \
+          --entrypoint python \
+          "$$IMAGE" \
+          scripts/run_db_migrations.py --help)"
+        printf '%s\n' "$$RO_OUT"
+        if ! printf '%s\n' "$$RO_OUT" | grep -q -- '--require-postgres'; then
+          echo "FAIL: Expected --require-postgres in scripts/run_db_migrations.py --help output" >&2
+          exit 1
+        fi
+        echo "PASS: Check B (--read-only rootfs migration help exited 0 with --require-postgres)"
+
+        echo "=== CHECK B2: In-container /app write-denial & writable /tmp fallback under --read-only ==="
+        docker run --rm \
+          --read-only \
+          --tmpfs /tmp:rw,noexec,nosuid \
+          --entrypoint python \
+          "$$IMAGE" \
+          -c '
+        import errno, os, pathlib, stat
+        from tools import report_exporter
+
+        assert os.geteuid() == 10001, f"Expected euid 10001, got {os.geteuid()}"
+        for target in ("/app/main.py", "/app/pqc_agent/rogue.py"):
+            try:
+                pathlib.Path(target).write_text("tamper", encoding="utf-8")
+            except (PermissionError, OSError) as exc:
+                assert exc.errno in (errno.EACCES, errno.EPERM, errno.EROFS), f"Unexpected errno: {exc}"
+            else:
+                raise AssertionError(f"Write to {target} unexpectedly succeeded!")
+
+        out_dir = report_exporter._ensure_writable_output_dir()
+        assert str(out_dir).startswith("/tmp/"), f"Expected export dir under /tmp, got {out_dir}"
+        assert out_dir.is_dir()
+        probe = out_dir / "ro_probe.txt"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        print(f"PASS: /app immutable (EACCES/EROFS) and export dir writable at {out_dir} (mode={oct(stat.S_IMODE(out_dir.stat().st_mode))})")
+        '
+
+        echo "=== CHECK C: Existing live Docker pytest regression tests ==="
+        SELF_CID=""
+        for cid in $$(docker ps -q); do
+          if docker inspect --format '{{range .Mounts}}{{.Destination}} {{end}}' "$$cid" | grep -qw '/workspace'; then
+            SELF_CID="$$cid"
+            break
+          fi
+        done
+        if [ -z "$$SELF_CID" ]; then
+          SELF_CID="$$(hostname)"
+        fi
+        echo "Resolved Cloud Build step container for /workspace volume sharing: $$SELF_CID"
+
+        mkdir -p "$$HARNESS_DIR"
+        DOCKER_BIN="$$(command -v docker)"
+        cp "$$DOCKER_BIN" "$$HARNESS_DIR/docker"
+        chmod 0755 "$$HARNESS_DIR/docker"
+        cat > "$$HARNESS_DIR/Dockerfile" <<EOF
+        FROM $$IMAGE
+        USER 0:0
+        COPY docker /usr/local/bin/docker
+        EOF
+        docker build -q -t "$$RUNNER_IMAGE" "$$HARNESS_DIR" >/dev/null
+        docker run --rm --entrypoint /usr/local/bin/docker "$$RUNNER_IMAGE" --version
+
+        docker run --rm \
+          --volumes-from "$$SELF_CID" \
+          -v /var/run/docker.sock:/var/run/docker.sock \
+          -w /workspace \
+          -e PYTHONPATH=/workspace \
+          --entrypoint pytest \
+          "$$RUNNER_IMAGE" \
+          -v -rs \
+          tests/test_phase3_container_hardening.py::test_p3_04_live_docker_non_root_uid_and_read_only_migration_help \
+          tests/test_pre_merge_hotfix.py::test_pre_merge_01_live_docker_build_and_container_smoke
+
+        echo "PASS: All mandatory Cloud Build Docker validation checks (A, B, B2, C) succeeded; zero images published, zero deployments performed."

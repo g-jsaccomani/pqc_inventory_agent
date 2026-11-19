@@ -1966,9 +1966,9 @@ PORTAL_HTML = r"""<!DOCTYPE html>
           <div class="conn-field">
             <label for="conn-mode-select">Auth Mode</label>
             <select id="conn-mode-select" onchange="toggleConnectionModeFields()">
-              <option value="adc">Service Account (Default ADC)</option>
+              <option value="access_token" selected>OAuth 2.0 (3LO — Act on behalf of User)</option>
               <option value="impersonation">Service Account Impersonation</option>
-              <option value="access_token">OAuth 2.0 (3LO — Act on behalf of User)</option>
+              <option value="adc">Service Account (Trusted Admin ADC)</option>
             </select>
           </div>
           <div class="conn-field">
@@ -3030,9 +3030,9 @@ PORTAL_HTML = r"""<!DOCTYPE html>
 
     function applyConnectionConfigToUI(cfg) {
       if (!cfg) return;
-      document.getElementById("conn-mode-select").value = cfg.mode || "adc";
-      document.getElementById("conn-org-input").value = cfg.organization_id || "31564119954";
-      document.getElementById("conn-proj-input").value = cfg.project_id || "pqc-inventory-agent-cd06";
+      document.getElementById("conn-mode-select").value = cfg.mode || "access_token";
+      document.getElementById("conn-org-input").value = cfg.organization_id || "";
+      document.getElementById("conn-proj-input").value = cfg.project_id || "";
       document.getElementById("conn-sa-input").value = cfg.impersonated_service_account || "";
       toggleConnectionModeFields();
       updateHeaderConnectionBadge(cfg);

@@ -69,10 +69,19 @@ from starlette.requests import HTTPConnection
 from starlette.responses import JSONResponse
 from starlette.websockets import WebSocketClose
 
+import urllib.error
+import urllib.request
+
+from pqc_agent import egress_guard
+
 try:  # google-auth is a transitive dependency of google-adk / google-cloud-*; keep the import failure explicit.
+    from google.auth import exceptions as _google_auth_exceptions
+    from google.auth import transport as _google_auth_transport
     import google.auth.transport.requests as _google_auth_requests
     from google.oauth2 import id_token as google_id_token
 except Exception:  # pragma: no cover - only when google-auth[requests] is missing
+    _google_auth_exceptions = None  # type: ignore[assignment]
+    _google_auth_transport = None  # type: ignore[assignment]
     _google_auth_requests = None  # type: ignore[assignment]
     google_id_token = None  # type: ignore[assignment]
 
@@ -408,31 +417,130 @@ def verify_signed_payload(
 # =============================================================================
 # Cloud IAP signed-header verification
 # =============================================================================
-if _google_auth_requests is not None:
+if (
+    _google_auth_requests is not None
+    and _google_auth_transport is not None
+    and _google_auth_exceptions is not None
+):
+
+    class _SafeGoogleAuthResponse(_google_auth_transport.Response):  # type: ignore[misc,name-defined]
+        """``google.auth.transport.Response`` backed by a bounded ``egress_guard.safe_urlopen`` payload."""
+
+        def __init__(self, status: int, headers: Mapping[str, str], data: bytes) -> None:
+            self._status = int(status)
+            self._headers = dict(headers)
+            self._data = bytes(data)
+
+        @property
+        def status(self) -> int:
+            return self._status
+
+        @property
+        def headers(self) -> Mapping[str, str]:
+            return self._headers
+
+        @property
+        def data(self) -> bytes:
+            return self._data
 
     class _CertCachingRequest(_google_auth_requests.Request):  # type: ignore[misc,name-defined]
-        """``google.auth.transport.requests.Request`` that caches successful GETs of public key documents.
+        """``google.auth.transport.requests.Request`` enforcing ``egress_guard.safe_urlopen`` for JWKS retrieval.
 
-        ``id_token.verify_token`` downloads the signing keys on every call; IAP rotates them rarely, so caching them
-        for an hour keeps per-request verification local (signature check only).
+        Enforces HTTPS-only, explicit Google/IAP JWKS hostname allowlist (``GOOGLE_JWKS_ALLOWED_HOSTS``),
+        DNS/IP destination validation, disabled HTTP redirects, verified TLS, explicit finite timeout,
+        and a 64 KiB response size ceiling while caching successful ``200 OK`` public key documents.
+        Never invokes the underlying ``requests.Session`` transport.
         """
 
-        def __init__(self, ttl_seconds: float = 3600.0) -> None:
+        def __init__(
+            self,
+            ttl_seconds: float = 3600.0,
+            *,
+            max_bytes: int = egress_guard.DEFAULT_MAX_RESPONSE_BYTES,
+            allowed_hosts: FrozenSet[str] = egress_guard.GOOGLE_JWKS_ALLOWED_HOSTS,
+            dns_resolver: Optional[egress_guard.DnsResolver] = None,
+            opener: Optional[urllib.request.OpenerDirector] = None,
+        ) -> None:
             super().__init__()
             self._ttl_seconds = ttl_seconds
-            self._cache: Dict[str, Tuple[float, Any]] = {}
+            self._max_bytes = max_bytes
+            self._allowed_hosts = frozenset(allowed_hosts)
+            self._dns_resolver = dns_resolver
+            self._opener = opener
+            self._cache: Dict[str, Tuple[float, _SafeGoogleAuthResponse]] = {}
             self._cache_lock = threading.Lock()
 
+        def _execute_safe(
+            self,
+            url: str,
+            *,
+            method: str,
+            body: Optional[bytes],
+            headers: Optional[Mapping[str, str]],
+            timeout: float,
+        ) -> _SafeGoogleAuthResponse:
+            upper_method = str(method or "GET").upper()
+            if upper_method != "GET" or body is not None:
+                raise _google_auth_exceptions.TransportError(
+                    "JWKS certificate transport permits bodyless GET requests only."
+                )
+            req_headers = {"Accept": "application/json"}
+            if headers:
+                for k, v in headers.items():
+                    req_headers[str(k)] = str(v)
+            req = urllib.request.Request(url, headers=req_headers, method="GET")
+            try:
+                with egress_guard.safe_urlopen(
+                    req,
+                    timeout=float(timeout),
+                    max_bytes=self._max_bytes,
+                    allowed_hosts=self._allowed_hosts,
+                    dns_resolver=self._dns_resolver,
+                    opener=self._opener,
+                ) as resp:
+                    return _SafeGoogleAuthResponse(
+                        status=resp.status,
+                        headers=resp.headers,
+                        data=resp.read(),
+                    )
+            except egress_guard.EgressError as exc:
+                raise _google_auth_exceptions.TransportError(
+                    f"Blocked JWKS HTTP request by egress policy: {egress_guard.redact_sensitive_text(exc)}"
+                ) from exc
+            except urllib.error.HTTPError as http_err:
+                if 300 <= int(http_err.code) < 400:
+                    raise _google_auth_exceptions.TransportError(
+                        f"Blocked HTTP {http_err.code} redirect during JWKS retrieval."
+                    ) from http_err
+                hdrs = dict(http_err.headers.items()) if getattr(http_err, "headers", None) else {}
+                return _SafeGoogleAuthResponse(status=int(http_err.code), headers=hdrs, data=b"")
+            except Exception as exc:
+                raise _google_auth_exceptions.TransportError(
+                    f"JWKS retrieval transport error: {egress_guard.redact_sensitive_text(exc)}"
+                ) from exc
+
         def __call__(self, url, method="GET", body=None, headers=None, timeout=None, **kwargs):  # type: ignore[override]
-            effective_timeout = timeout if timeout is not None else 10
+            effective_timeout = float(timeout) if timeout is not None else 10.0
             if str(method).upper() != "GET" or body is not None:
-                return super().__call__(url, method=method, body=body, headers=headers, timeout=effective_timeout, **kwargs)
+                return self._execute_safe(
+                    url,
+                    method=method,
+                    body=body,
+                    headers=headers,
+                    timeout=effective_timeout,
+                )
             now = time.time()
             with self._cache_lock:
                 hit = self._cache.get(url)
             if hit and hit[0] > now:
                 return hit[1]
-            response = super().__call__(url, method=method, body=body, headers=headers, timeout=effective_timeout, **kwargs)
+            response = self._execute_safe(
+                url,
+                method=method,
+                body=None,
+                headers=headers,
+                timeout=effective_timeout,
+            )
             if getattr(response, "status", None) == 200:
                 with self._cache_lock:
                     self._cache[url] = (now + self._ttl_seconds, response)
