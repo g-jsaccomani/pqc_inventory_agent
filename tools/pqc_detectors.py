@@ -99,10 +99,15 @@ def _policy_record(
     }
 
 
-def _fetch_compute_pq_key_exchange(project_id: str, location: str, policy_name: str) -> Optional[str]:
+def _fetch_compute_pq_key_exchange(
+    project_id: str,
+    location: str,
+    policy_name: str,
+    client_kwargs: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
     """Queries Compute Engine SslPolicies API directly when Cloud Asset Inventory omits postQuantumKeyExchange."""
     try:
-        kwargs = _get_client_kwargs()
+        kwargs = client_kwargs if client_kwargs is not None else _get_client_kwargs(scope_uri=f"projects/{project_id}")
         loc = (location or "global").lower()
         if loc == "global":
             client = compute_v1.SslPoliciesClient(**kwargs)
@@ -236,7 +241,7 @@ def collect_tls_policies(scope: str = f"organizations/{DEFAULT_ORGANIZATION_ID}"
                 loc = item.location or "global"
                 raw_pq = attrs.get("postQuantumKeyExchange") or attrs.get("post_quantum_key_exchange")
                 if not raw_pq:
-                    raw_pq = _fetch_compute_pq_key_exchange(proj, loc, name) or "DEFAULT"
+                    raw_pq = _fetch_compute_pq_key_exchange(proj, loc, name, client_kwargs=client_kwargs) or "DEFAULT"
                 policies.append(
                     _policy_record(
                         name,

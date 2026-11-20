@@ -336,6 +336,10 @@ class _ServerScopePolicy:
     has_folder_restriction: bool
     folders: FrozenSet[str]
 
+    @property
+    def has_any_restriction(self) -> bool:
+        return bool(self.has_project_restriction or self.has_org_restriction or self.has_folder_restriction)
+
 
 def _check_common_arg_safety(value: str) -> Optional[str]:
     if not value:
@@ -873,7 +877,7 @@ def _load_server_scope_policy(user_id: Optional[str]) -> _ServerScopePolicy:
     has_org, orgs_set = _parse_scoped_allowlist_env("PQC_ALLOWED_ORGANIZATIONS", user_id)
     has_fld, flds_set = _parse_scoped_allowlist_env("PQC_ALLOWED_FOLDERS", user_id)
 
-    projs = set(projs_set)
+    projs = {p.replace("projects/", "") for p in projs_set}
     orgs = {o.replace("organizations/", "") for o in orgs_set}
     flds = {f.replace("folders/", "") for f in flds_set}
 
@@ -910,27 +914,64 @@ def _load_server_scope_policy(user_id: Optional[str]) -> _ServerScopePolicy:
     )
 
 
+def resolve_server_bound_defaults(user_id: Optional[str]) -> Tuple[str, str, str]:
+    """Returns unambiguous `(org_id, project_id, active_scope_uri)` derived strictly from server scope policy."""
+    if not _is_authenticated_email_identity(user_id):
+        return "", "", ""
+    policy = _load_server_scope_policy(user_id)
+    if not policy.has_any_restriction:
+        return "", "", ""
+
+    valid_orgs = sorted(o for o in policy.organizations if _validate_numeric_id_value(o) is None)
+    valid_projs = sorted(p for p in policy.projects if _validate_project_value(p) is None)
+    valid_folders = sorted(f for f in policy.folders if _validate_numeric_id_value(f) is None)
+
+    default_org = valid_orgs[0] if len(valid_orgs) == 1 else ""
+    default_proj = valid_projs[0] if len(valid_projs) == 1 else ""
+    default_folder = valid_folders[0] if len(valid_folders) == 1 else ""
+
+    if default_org:
+        active_uri = f"organizations/{default_org}"
+    elif default_proj:
+        active_uri = f"projects/{default_proj}"
+    elif default_folder:
+        active_uri = f"folders/{default_folder}"
+    else:
+        active_uri = ""
+    return default_org, default_proj, active_uri
+
+
 def _default_connection_template(user_id: Optional[str] = None) -> Dict[str, Any]:
-    """Returns default connection state: ADC + server scope ONLY for ADC-authorized admins; `access_token` + empty scope for all others."""
+    """Returns default connection state: ADC + server scope ONLY for ADC-authorized admins; `access_token` + server-bound scope (or empty) for all others."""
     now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    policy = _load_server_scope_policy(user_id) if _is_authenticated_email_identity(user_id) else None
+    srv_org, srv_proj, _ = resolve_server_bound_defaults(user_id)
     if is_adc_authorized_user(user_id):
         raw_env_mode = (os.getenv("PQC_CONNECTION_MODE") or "adc").strip()
         try:
             resolved_mode = normalize_connection_mode(raw_env_mode)
         except ValueError:
             resolved_mode = "adc"
+        if policy is not None and policy.has_any_restriction:
+            env_org = os.getenv("GCP_ORGANIZATION_ID", "31564119954").strip().replace("organizations/", "")
+            env_proj = os.getenv("GOOGLE_CLOUD_PROJECT", "pqc-inventory-agent-cd06").strip().replace("projects/", "")
+            admin_org = env_org if env_org in policy.organizations else srv_org
+            admin_proj = env_proj if env_proj in policy.projects else srv_proj
+        else:
+            admin_org = os.getenv("GCP_ORGANIZATION_ID", "31564119954")
+            admin_proj = os.getenv("GOOGLE_CLOUD_PROJECT", "pqc-inventory-agent-cd06")
         return {
             "mode": resolved_mode,
-            "organization_id": os.getenv("GCP_ORGANIZATION_ID", "31564119954"),
-            "project_id": os.getenv("GOOGLE_CLOUD_PROJECT", "pqc-inventory-agent-cd06"),
+            "organization_id": admin_org,
+            "project_id": admin_proj,
             "location": os.getenv("PQC_DEFAULT_LOCATION", "all"),
             "impersonated_service_account": "",
             "updated_at": now_iso,
         }
     return {
         "mode": "access_token",
-        "organization_id": "",
-        "project_id": "",
+        "organization_id": srv_org,
+        "project_id": srv_proj,
         "location": os.getenv("PQC_DEFAULT_LOCATION", "all"),
         "impersonated_service_account": "",
         "updated_at": now_iso,
@@ -1015,6 +1056,14 @@ def normalize_connection_mode(raw_mode: Optional[str]) -> str:
     return resolved
 
 
+def _validate_delegated_access_token_syntax(token: str) -> Optional[str]:
+    if not token:
+        return None
+    if len(token) < 6 or not token.isascii() or _CONTROL_CHARS_RE.search(token) or any(ch.isspace() for ch in token):
+        return "ACCESS_TOKEN_INVALID: Delegated OAuth access token is malformed."
+    return None
+
+
 def set_gcp_connection_config(
     mode: Optional[str] = None,
     organization_id: Optional[str] = None,
@@ -1032,7 +1081,7 @@ def set_gcp_connection_config(
 
     Fails closed with ``PermissionError`` or ``ValueError`` BEFORE any database write if unauthorized.
     """
-    from pqc_agent import auth_store, credential_service
+    from pqc_agent import auth_guard, auth_store, credential_service
 
     active_ctx_uid = get_current_tenant_user()
     uid = normalize_user_id(user_id or active_ctx_uid)
@@ -1073,6 +1122,10 @@ def set_gcp_connection_config(
         validate_impersonated_service_account(effective_sa, user_id=uid)
 
     server_scope = _load_server_scope_policy(uid)
+    adc_admin = is_adc_authorized_user(uid)
+    in_prod = auth_guard.is_production_environment()
+    existing_org = str((existing_row or {}).get("organization_id") or "").strip().replace("organizations/", "")
+    existing_proj = str((existing_row or {}).get("project_id") or "").strip().replace("projects/", "")
 
     clean_org: Optional[str] = None
     if organization_id is not None and str(organization_id).strip():
@@ -1080,10 +1133,28 @@ def set_gcp_connection_config(
         org_err = _validate_numeric_id_value(candidate_org)
         if org_err:
             raise ValueError(org_err)
-        if server_scope.has_org_restriction and candidate_org not in server_scope.organizations:
-            raise PermissionError(
-                f"Forbidden: organization '{candidate_org}' is outside the authorized scope for '{uid}'."
-            )
+        if server_scope.has_any_restriction:
+            if candidate_org not in server_scope.organizations:
+                raise PermissionError(
+                    f"UNAUTHORIZED_RESOURCE_SCOPE: Organization '{candidate_org}' is outside the server-authorized scope for '{uid}'."
+                )
+        elif not adc_admin:
+            if in_prod:
+                raise PermissionError(
+                    f"UNAUTHORIZED_RESOURCE_SCOPE (MISSING_AUTHORIZED_SCOPE): Tenant '{uid}' cannot self-bind "
+                    "organization scope in production without a server-side tenant scope policy "
+                    "(PQC_TENANT_SCOPE_POLICY or PQC_ALLOWED_ORGANIZATIONS)."
+                )
+            if existing_org and candidate_org != existing_org:
+                raise PermissionError(
+                    f"UNAUTHORIZED_RESOURCE_SCOPE: Tenant '{uid}' cannot change its bound organization "
+                    f"from '{existing_org}' to '{candidate_org}' via request payload."
+                )
+            if not existing_org and existing_proj:
+                raise PermissionError(
+                    f"UNAUTHORIZED_RESOURCE_SCOPE: Tenant '{uid}' is bound to project '{existing_proj}' and cannot "
+                    f"self-bind organization '{candidate_org}' without a server-side tenant scope policy."
+                )
         clean_org = candidate_org
 
     clean_proj: Optional[str] = None
@@ -1092,17 +1163,63 @@ def set_gcp_connection_config(
         proj_err = _validate_project_value(candidate_proj)
         if proj_err:
             raise ValueError(proj_err)
-        if server_scope.has_project_restriction and candidate_proj not in server_scope.projects:
-            raise PermissionError(
-                f"Forbidden: project '{candidate_proj}' is outside the authorized scope for '{uid}'."
-            )
+        if server_scope.has_any_restriction:
+            if candidate_proj not in server_scope.projects:
+                raise PermissionError(
+                    f"UNAUTHORIZED_RESOURCE_SCOPE: Project '{candidate_proj}' is outside the server-authorized scope for '{uid}'."
+                )
+        elif not adc_admin:
+            if in_prod:
+                raise PermissionError(
+                    f"UNAUTHORIZED_RESOURCE_SCOPE (MISSING_AUTHORIZED_SCOPE): Tenant '{uid}' cannot self-bind "
+                    "project scope in production without a server-side tenant scope policy "
+                    "(PQC_TENANT_SCOPE_POLICY or PQC_ALLOWED_PROJECTS)."
+                )
+            if existing_proj and candidate_proj != existing_proj:
+                raise PermissionError(
+                    f"UNAUTHORIZED_RESOURCE_SCOPE: Tenant '{uid}' cannot change its bound project "
+                    f"from '{existing_proj}' to '{candidate_proj}' via request payload."
+                )
+            if not existing_proj and existing_org:
+                raise PermissionError(
+                    f"UNAUTHORIZED_RESOURCE_SCOPE: Tenant '{uid}' is bound to organization '{existing_org}' and cannot "
+                    f"self-bind project '{candidate_proj}' without a server-side tenant scope policy."
+                )
         clean_proj = candidate_proj
-    elif target_mode == "impersonation" and not (existing_row or {}).get("project_id"):
+    elif target_mode == "impersonation" and not existing_proj:
         sa_for_proj = clean_sa or str((existing_row or {}).get("impersonated_service_account") or "")
         derived_proj = _extract_sa_project(sa_for_proj)
         if derived_proj and _validate_project_value(derived_proj) is None:
-            if not server_scope.has_project_restriction or derived_proj in server_scope.projects:
+            if not server_scope.has_any_restriction or derived_proj in server_scope.projects:
                 clean_proj = derived_proj
+
+    # Server-side scope auto-binding: when server policy unambiguously defines a single org/project for this tenant,
+    # bind it server-side so delegated tokens work seamlessly without requiring client-supplied scope parameters.
+    if server_scope.has_any_restriction:
+        srv_org, srv_proj, _ = resolve_server_bound_defaults(uid)
+        if clean_org is None and srv_org:
+            clean_org = srv_org
+        if clean_proj is None and srv_proj:
+            clean_proj = srv_proj
+
+    # Validate delegated token syntax & TTL BEFORE writing connection state to the database.
+    validated_token: Optional[str] = None
+    if access_token is not None:
+        tok = str(access_token).strip()
+        if tok.lower().startswith("bearer "):
+            tok = tok[7:].strip()
+        if tok:
+            tok_err = _validate_delegated_access_token_syntax(tok)
+            if tok_err:
+                raise ValueError(tok_err)
+            if access_token_expires_in is not None:
+                try:
+                    ttl_val = float(access_token_expires_in)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("Invalid delegated OAuth access token expiration.") from exc
+                if ttl_val <= 0:
+                    raise ValueError("ACCESS_TOKEN_EXPIRED: Delegated OAuth access token is already expired.")
+        validated_token = tok
 
     clean_loc: Optional[str] = None
     if location is not None and str(location).strip():
@@ -1118,15 +1235,12 @@ def set_gcp_connection_config(
         defaults=defaults,
     )
 
-    if access_token is not None:
-        tok = str(access_token).strip()
-        if tok.lower().startswith("bearer "):
-            tok = tok[7:].strip()
+    if validated_token is not None:
         cred_svc = credential_service.get_active_credential_service()
-        if tok:
+        if validated_token:
             cred_svc.store_delegated_token(
                 user_id=uid,
-                access_token=tok,
+                access_token=validated_token,
                 refresh_token=refresh_token,
                 expires_in=access_token_expires_in,
                 client_id=oauth_client_id or "",
@@ -1140,8 +1254,8 @@ def set_gcp_connection_config(
 
 
 def get_gcp_connection_config(mask_token: bool = True, user_id: Optional[str] = None) -> Dict[str, Any]:
-    """Returns the current GCP connection state (never reporting unauthorized `adc` as active)."""
-    from pqc_agent import auth_store, credential_service
+    """Returns the current GCP connection state (never reporting unauthorized `adc` or unauthorized scopes as active)."""
+    from pqc_agent import auth_guard, auth_store, credential_service
 
     uid = normalize_user_id(user_id or get_current_tenant_user())
     stored = auth_store.get_active_auth_store().get_user_connection(uid)
@@ -1153,7 +1267,8 @@ def get_gcp_connection_config(mask_token: bool = True, user_id: Optional[str] = 
     has_refresh_token = False
     kek_provider: Optional[str] = None
 
-    if _is_authenticated_email_identity(uid) or stored is not None:
+    is_auth_email = _is_authenticated_email_identity(uid)
+    if is_auth_email or stored is not None:
         loaded_cred = credential_service.get_active_credential_service().load_delegated_token(
             user_id=uid,
             caller_user_id=uid,
@@ -1174,6 +1289,52 @@ def get_gcp_connection_config(mask_token: bool = True, user_id: Optional[str] = 
     if mode == "adc" and not adc_allowed:
         mode = "access_token"
 
+    effective_org = str(state.get("organization_id") or "").strip().replace("organizations/", "")
+    effective_proj = str(state.get("project_id") or "").strip().replace("projects/", "")
+    server_policy = _load_server_scope_policy(uid) if is_auth_email else _ServerScopePolicy(
+        False, frozenset(), False, frozenset(), False, frozenset()
+    )
+    authorized_orgs: List[str] = []
+    authorized_projs: List[str] = []
+    authorized_folders: List[str] = []
+
+    if is_auth_email:
+        if server_policy.has_any_restriction:
+            srv_org, srv_proj, _ = resolve_server_bound_defaults(uid)
+            if effective_org not in server_policy.organizations:
+                effective_org = srv_org
+            if effective_proj not in server_policy.projects:
+                effective_proj = srv_proj
+        elif auth_guard.is_production_environment() and not adc_allowed:
+            effective_org = ""
+            effective_proj = ""
+
+        authz_scope = resolve_authorized_tenant_scope(
+            uid,
+            {
+                **state,
+                "mode": mode,
+                "organization_id": effective_org,
+                "project_id": effective_proj,
+            },
+        )
+        authorized_orgs = sorted(authz_scope.organizations)
+        authorized_projs = sorted(authz_scope.projects)
+        authorized_folders = sorted(authz_scope.folders)
+
+    if effective_org:
+        active_scope_uri = f"organizations/{effective_org}"
+    elif effective_proj:
+        active_scope_uri = f"projects/{effective_proj}"
+    elif len(authorized_orgs) == 1:
+        active_scope_uri = f"organizations/{authorized_orgs[0]}"
+    elif len(authorized_projs) == 1:
+        active_scope_uri = f"projects/{authorized_projs[0]}"
+    elif len(authorized_folders) == 1:
+        active_scope_uri = f"folders/{authorized_folders[0]}"
+    else:
+        active_scope_uri = ""
+
     has_token = bool(raw_token)
     masked_token = ""
     if has_token:
@@ -1189,8 +1350,15 @@ def get_gcp_connection_config(mask_token: bool = True, user_id: Optional[str] = 
         "adc_authorized": adc_allowed,
         "auth_flow": "oauth2_3lo" if mode == "access_token" else mode,
         "oauth_consent_required": bool(mode == "access_token" and not has_token),
-        "organization_id": state.get("organization_id", ""),
-        "project_id": state.get("project_id", ""),
+        "organization_id": effective_org,
+        "project_id": effective_proj,
+        "active_scope_uri": active_scope_uri,
+        "scope_bound_by_server": bool(server_policy.has_any_restriction),
+        "authorized_scope": {
+            "organizations": authorized_orgs,
+            "projects": authorized_projs,
+            "folders": authorized_folders,
+        },
         "location": state.get("location", "all"),
         "impersonated_service_account": state.get("impersonated_service_account", ""),
         "has_access_token": has_token,
@@ -1219,9 +1387,9 @@ def get_active_gcp_credentials(user_id: Optional[str] = None) -> Any:
     """Returns google.auth credentials matching the authorized tenant user's connection mode.
 
     Fails closed with ``PermissionError`` if caller is unauthenticated, if ``mode == 'adc'`` is unauthorized,
-    if ``mode == 'access_token'`` lacks a valid delegated token, or if ``mode == 'impersonation'`` is unauthorized.
+    if ``mode == 'access_token'`` lacks a valid unexpired delegated token, or if ``mode == 'impersonation'`` is unauthorized.
     """
-    from pqc_agent import auth_store
+    from pqc_agent import auth_store, credential_service
 
     active_ctx_uid = get_current_tenant_user()
     uid = normalize_user_id(user_id or active_ctx_uid)
@@ -1239,18 +1407,31 @@ def get_active_gcp_credentials(user_id: Optional[str] = None) -> Any:
     conn = get_gcp_connection_config(mask_token=False, user_id=uid)
     mode = normalize_connection_mode(conn.get("mode"))
     impersonated_sa = (conn.get("impersonated_service_account") or "").strip()
-    access_token = (conn.get("access_token_preview") or "").strip()
     quota_project = (conn.get("project_id") or "").strip() or None
 
     if mode == "access_token":
+        loaded_cred = credential_service.get_active_credential_service().load_delegated_token(
+            user_id=uid,
+            caller_user_id=uid,
+        )
+        access_token = (loaded_cred.access_token if loaded_cred is not None else "").strip()
         if not access_token:
             raise PermissionError(
-                "ACCESS_TOKEN_REQUIRED: Delegated OAuth access token is missing or expired for mode 'access_token'."
+                "ACCESS_TOKEN_REQUIRED: Delegated OAuth access token is missing, revoked, or expired for mode 'access_token'."
             )
+        tok_err = _validate_delegated_access_token_syntax(access_token)
+        if tok_err:
+            raise PermissionError(tok_err)
+        expiry_dt = (
+            datetime.datetime.fromtimestamp(loaded_cred.expires_at, tz=datetime.timezone.utc).replace(tzinfo=None)
+            if (loaded_cred is not None and loaded_cred.expires_at)
+            else None
+        )
         from google.oauth2 import credentials as oauth2_credentials
 
         return oauth2_credentials.Credentials(
             token=access_token,
+            expiry=expiry_dt,
             quota_project_id=quota_project,
         )
 
@@ -1551,12 +1732,39 @@ def resolve_authorized_tenant_scope(
     user_id: str,
     conn_cfg: Mapping[str, Any],
 ) -> AuthorizedTenantScope:
-    """Computes the caller's authorized `(projects, organizations, folders)` boundaries."""
+    """Computes the caller's authorized `(projects, organizations, folders)` boundaries.
+
+    Security invariants:
+    1. Whenever ANY server-side scope policy env var (`PQC_ALLOWED_PROJECTS`, `PQC_ALLOWED_ORGANIZATIONS`,
+       `PQC_ALLOWED_FOLDERS`, or `PQC_TENANT_SCOPE_POLICY`) is configured, the server policy is the SOLE
+       authoritative boundary across ALL scope dimensions (unmentioned dimensions fail closed to empty sets).
+    2. In production (`K_SERVICE` / `PQC_PRODUCTION_MODE=true` / `PQC_ENV=production`), non-admin delegated-token
+       tenants never obtain scope from client-supplied connection payloads when no server scope policy is configured.
+    3. Folders are default-deny unless explicitly granted by server policy.
+    """
+    from pqc_agent import auth_guard
+
     norm_uid = normalize_user_id(user_id)
     if not _is_authenticated_email_identity(norm_uid):
         raise PermissionError("Unauthenticated identity has no authorized GCP resource scope.")
 
     server_policy = _load_server_scope_policy(norm_uid)
+
+    if server_policy.has_any_restriction:
+        return AuthorizedTenantScope(
+            user_id=norm_uid,
+            projects=frozenset(p for p in server_policy.projects if _validate_project_value(p) is None),
+            organizations=frozenset(o for o in server_policy.organizations if _validate_numeric_id_value(o) is None),
+            folders=frozenset(f for f in server_policy.folders if _validate_numeric_id_value(f) is None),
+        )
+
+    if auth_guard.is_production_environment() and not is_adc_authorized_user(norm_uid):
+        return AuthorizedTenantScope(
+            user_id=norm_uid,
+            projects=frozenset(),
+            organizations=frozenset(),
+            folders=frozenset(),
+        )
 
     conn_proj = str(conn_cfg.get("project_id") or "").strip().replace("projects/", "")
     conn_org = str(conn_cfg.get("organization_id") or "").strip().replace("organizations/", "")
@@ -1566,26 +1774,14 @@ def resolve_authorized_tenant_scope(
     if mode == "impersonation" and not conn_proj and sa_email:
         conn_proj = _extract_sa_project(sa_email)
 
-    if server_policy.has_project_restriction:
-        allowed_projects = set(server_policy.projects)
-        if conn_proj and conn_proj not in allowed_projects:
-            allowed_projects.discard(conn_proj)
-    else:
-        allowed_projects = {conn_proj} if (conn_proj and _validate_project_value(conn_proj) is None) else set()
-
-    if server_policy.has_org_restriction:
-        allowed_orgs = set(server_policy.organizations)
-    else:
-        allowed_orgs = {conn_org} if (conn_org and _validate_numeric_id_value(conn_org) is None) else set()
-
-    # Folders are default-deny unless explicitly granted by server-side operator policy.
-    allowed_folders = set(server_policy.folders) if server_policy.has_folder_restriction else set()
+    allowed_projects = {conn_proj} if (conn_proj and _validate_project_value(conn_proj) is None) else set()
+    allowed_orgs = {conn_org} if (conn_org and _validate_numeric_id_value(conn_org) is None) else set()
 
     return AuthorizedTenantScope(
         user_id=norm_uid,
         projects=frozenset(allowed_projects),
         organizations=frozenset(allowed_orgs),
-        folders=frozenset(allowed_folders),
+        folders=frozenset(),
     )
 
 
@@ -1620,12 +1816,31 @@ def authorize_gcp_scope(
     if str(effective_conn.get("mode") or "").strip().lower() == "adc":
         authorize_adc_mode(uid)
 
+    authorized = resolve_authorized_tenant_scope(uid, effective_conn)
     clean_scope = str(scope_uri or "").strip()
+
+    if not clean_scope:
+        if not (authorized.organizations or authorized.projects or authorized.folders):
+            raise PermissionError(
+                f"UNAUTHORIZED_RESOURCE_SCOPE (MISSING_AUTHORIZED_SCOPE): No authorized GCP organization, project, "
+                f"or folder scope is bound for tenant '{uid}'. Configure a server-side tenant scope policy "
+                "(PQC_TENANT_SCOPE_POLICY, PQC_ALLOWED_ORGANIZATIONS, or PQC_ALLOWED_PROJECTS) before running live scans."
+            )
+        raise PermissionError(
+            f"UNAUTHORIZED_RESOURCE_SCOPE (MISSING_AUTHORIZED_SCOPE): Explicit GCP scope is required for tenant '{uid}'."
+        )
+
     scope_err = _validate_scope_value(clean_scope)
     if scope_err is not None:
         raise PermissionError(f"UNAUTHORIZED_RESOURCE_SCOPE: {scope_err}")
 
-    authorized = resolve_authorized_tenant_scope(uid, effective_conn)
+    if not (authorized.organizations or authorized.projects or authorized.folders):
+        raise PermissionError(
+            f"UNAUTHORIZED_RESOURCE_SCOPE (MISSING_AUTHORIZED_SCOPE): No authorized GCP organization, project, "
+            f"or folder scope is bound for tenant '{uid}'. Configure a server-side tenant scope policy "
+            "(PQC_TENANT_SCOPE_POLICY, PQC_ALLOWED_ORGANIZATIONS, or PQC_ALLOWED_PROJECTS) before running live scans."
+        )
+
     kind, _, identifier = clean_scope.partition("/")
 
     if kind == "organizations":

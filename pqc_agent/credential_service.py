@@ -303,6 +303,12 @@ class EncryptedDatabaseCredentialService(BaseCredentialService):
         if not clean_access:
             self.revoke_delegated_tokens(user_id=clean_uid, credential_key=credential_key, reason="cleared")
             return None
+        if (
+            len(clean_access) < 6
+            or not clean_access.isascii()
+            or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in clean_access)
+        ):
+            raise ValueError("ACCESS_TOKEN_INVALID: Delegated OAuth access token is malformed.")
 
         tenant = auth_store.extract_tenant_domain(clean_uid)
         cred_id = build_credential_id(app_name, tenant, clean_uid, credential_key)
@@ -310,7 +316,12 @@ class EncryptedDatabaseCredentialService(BaseCredentialService):
         aad_hash = hashlib.sha256(aad).hexdigest()
 
         now = time.time()
-        ttl = float(expires_in) if (expires_in is not None and float(expires_in) > 0) else self._default_ttl_seconds()
+        if expires_in is not None:
+            ttl = float(expires_in)
+            if ttl <= 0:
+                raise ValueError("ACCESS_TOKEN_EXPIRED: Delegated OAuth access token is already expired (expires_in <= 0).")
+        else:
+            ttl = self._default_ttl_seconds()
         expires_at = now + ttl
         clean_refresh = str(refresh_token or "").strip() or None
 

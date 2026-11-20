@@ -259,27 +259,64 @@ def _is_internal_runtime_tenant_project(proj_id: str) -> bool:
     return bool(re.match(r"^project-[0-9a-f]{6,}-[0-9a-f]{4}-", clean))
 
 
-def _active_tenant_org_id() -> str:
-    """Returns the active tenant user's configured Organization ID, falling back to DEFAULT_ORGANIZATION_ID."""
-    try:
-        from tools.gcloud_bridge import get_gcp_connection_config
+def _active_tenant_default_scope() -> Tuple[str, str, str]:
+    """Resolves the active tenant's server-bound default `(mode, scope_uri, clean_id)`.
 
-        org = (get_gcp_connection_config(mask_token=True).get("organization_id") or "").strip()
-        if org:
-            return org.replace("organizations/", "")
+    - For an authenticated tenant user: resolves strictly from the tenant's authorized connection (`organizations/<id>`,
+      `projects/<id>`, or `folders/<id>`). Never silently substitutes `DEFAULT_ORGANIZATION_ID` when the tenant has
+      no bound scope (returns `("UNBOUND", "", "")` so `authorize_gcp_scope()` fails closed with `MISSING_AUTHORIZED_SCOPE`).
+    - For unauthenticated unit-test/CLI helper calls (no email identity in context): preserves `DEFAULT_ORGANIZATION_ID`.
+    """
+    try:
+        from tools.gcloud_bridge import (
+            _is_authenticated_email_identity,
+            get_current_tenant_user,
+            get_gcp_connection_config,
+        )
+
+        active_uid = get_current_tenant_user()
+        if _is_authenticated_email_identity(active_uid):
+            conn = get_gcp_connection_config(mask_token=True, user_id=active_uid)
+            org = (conn.get("organization_id") or "").strip().replace("organizations/", "")
+            if org:
+                return ("ORG", f"organizations/{org}", org)
+            proj = (conn.get("project_id") or "").strip().replace("projects/", "")
+            if proj:
+                return ("PROJECT", f"projects/{proj}", proj)
+            active_uri = (conn.get("active_scope_uri") or "").strip()
+            if active_uri.startswith("organizations/"):
+                oid = active_uri.split("/", 1)[1].strip()
+                if oid:
+                    return ("ORG", active_uri, oid)
+            if active_uri.startswith("projects/"):
+                pid = active_uri.split("/", 1)[1].strip()
+                if pid:
+                    return ("PROJECT", active_uri, pid)
+            if active_uri.startswith("folders/"):
+                fid = active_uri.split("/", 1)[1].strip()
+                if fid:
+                    return ("FOLDER", active_uri, fid)
+            return ("UNBOUND", "", "")
     except Exception:
         pass
-    return DEFAULT_ORGANIZATION_ID
+    return ("ORG", f"organizations/{DEFAULT_ORGANIZATION_ID}", DEFAULT_ORGANIZATION_ID)
+
+
+def _active_tenant_org_id() -> str:
+    """Returns the active tenant user's configured Organization ID (empty string if an authenticated tenant has none)."""
+    mode, _, clean_id = _active_tenant_default_scope()
+    if mode == "ORG":
+        return clean_id
+    return ""
 
 
 def _resolve_scope(target: Optional[str] = None) -> Tuple[str, str, str]:
     """Resolves the requested scope into (mode, scope_uri, clean_id)."""
     raw = (target or "").strip()
     lower = raw.lower()
-    active_org = _active_tenant_org_id()
 
     if lower in ORG_MODE_TOKENS:
-        return ("ORG", f"organizations/{active_org}", active_org)
+        return _active_tenant_default_scope()
     if lower.startswith("organizations/"):
         org_id = raw.split("/", 1)[1].strip()
         return ("ORG", f"organizations/{org_id}", org_id)
@@ -291,8 +328,8 @@ def _resolve_scope(target: Optional[str] = None) -> Tuple[str, str, str]:
 
     proj_id = raw.split("/", 1)[1].strip() if lower.startswith("projects/") else raw
     if _is_internal_runtime_tenant_project(proj_id):
-        logger.info("Redirecting internal runtime tenant project '%s' to the configured organization.", proj_id)
-        return ("ORG", f"organizations/{active_org}", active_org)
+        logger.info("Redirecting internal runtime tenant project '%s' to the configured tenant scope.", proj_id)
+        return _active_tenant_default_scope()
     return ("PROJECT", f"projects/{proj_id}", proj_id)
 
 
