@@ -63,9 +63,13 @@ from pqc_agent.telemetry import LlmCallTelemetryPlugin, capture_llm_calls, summa
 from tools.calibration_engine import register_uploaded_artifact_for_analysis
 from tools.gcloud_bridge import (
     TRUSTED_SUBPROCESS_PATH,
+    _is_authenticated_email_identity,
     authorize_adc_mode,
+    authorize_gcp_scope,
     clear_user_access_token,
+    enter_http_request_tenant_context,
     execute_gcloud_command,
+    exit_http_request_tenant_context,
     get_gcp_connection_config,
     get_recent_gcloud_traces,
     normalize_connection_mode,
@@ -931,11 +935,13 @@ def build_oauth_authorize_uri(
     redirect_uri: Optional[str] = None,
 ) -> str:
     """Builds the 3-Legged OAuth (3LO) authorization URI for the user/session."""
-    params = {
+    params: Dict[str, str] = {
         "user_id": normalize_user_id(user_id),
         "session_id": session_id or "",
-        "scope": target_scope or "organizations/31564119954",
     }
+    clean_scope = str(target_scope or "").strip()
+    if clean_scope:
+        params["scope"] = clean_scope
     if redirect_uri:
         params["redirect_uri"] = redirect_uri
     return f"/api/auth/oauth/authorize?{urllib.parse.urlencode(params)}"
@@ -975,17 +981,55 @@ def build_gcp_oauth_auth_config(
     )
 
 
+def _resolve_and_authorize_request_scope(
+    uid: str,
+    requested_scope: Optional[str],
+    *,
+    allow_unbound_non_scan: bool = True,
+) -> str:
+    """Resolves a request scope server-side and rejects unauthorized client-supplied scope overrides.
+
+    - Omitted/blank scope resolves to the tenant's server-bound `active_scope_uri` (empty string when unbound).
+    - Explicit simulation/demo scopes are preserved verbatim.
+    - Whenever a server scope policy is active, a tenant scope is already bound, or running in production, any
+      non-demo client-supplied scope is validated via `authorize_gcp_scope()` before acceptance (raising `PermissionError`).
+    """
+    from tools.gcp_inventory import _resolve_scope, simulation_requested
+
+    conn = get_gcp_connection_config(mask_token=True, user_id=uid)
+    active_uri = str(conn.get("active_scope_uri") or "").strip()
+    raw = str(requested_scope or "").strip()
+    if not raw:
+        if not active_uri and not allow_unbound_non_scan:
+            return authorize_gcp_scope("", user_id=uid)
+        return active_uri
+
+    _, scope_uri, clean_id = _resolve_scope(raw)
+    if simulation_requested(clean_id):
+        return scope_uri
+
+    authz_map = conn.get("authorized_scope") or {}
+    has_bound_scope = bool(
+        authz_map.get("organizations") or authz_map.get("projects") or authz_map.get("folders")
+    )
+    server_bound = bool(conn.get("scope_bound_by_server"))
+    if server_bound or has_bound_scope or auth_guard.is_production_environment() or not allow_unbound_non_scan:
+        return authorize_gcp_scope(scope_uri, user_id=uid)
+    return scope_uri
+
+
 class PqcOAuth3LOPlugin(BasePlugin):
     """ADK Plugin that integrates `ToolContext` 3-Legged OAuth (3LO) credentials with GCP discovery tools.
 
     Responsibilities:
-    1. Synchronizes delegated OAuth 2.0 tokens between ADK's `ToolContext` (in-memory credential service)
+    1. Synchronizes delegated OAuth 2.0 tokens between ADK's `ToolContext` (encrypted database credential service)
        and the isolated per-user `gcloud_bridge` connection state.
-    2. When a user is in 3-Legged OAuth mode (`mode == 'access_token'`) and has not yet granted a token,
+    2. Enforces tenant scope authorization before emitting OAuth consent prompts or executing protected tools.
+    3. When a user is in 3-Legged OAuth mode (`mode == 'access_token'`) and has not yet granted a token,
        calls `tool_context.request_credential(auth_config)` before the tool executes and emits an interactive
        In-Chat OAuth 2.0 Consent Card (never auto-switching to `adc`).
-    3. When a tool encounters a `403 PermissionDenied` error without a delegated token, triggers
-       `tool_context.request_credential(auth_config)` so the user can authorize with their own credentials.
+    4. When a tool encounters a `403 PermissionDenied` error without a delegated token (never on scope-isolation
+       or ADC-authorization denials), triggers `tool_context.request_credential(auth_config)`.
     """
 
     def __init__(self) -> None:
@@ -1008,13 +1052,40 @@ class PqcOAuth3LOPlugin(BasePlugin):
         if tool.name not in PROTECTED_GCP_TOOLS:
             return None
 
-        target_scope = str(
-            (tool_args or {}).get("scope")
-            or (tool_args or {}).get("project_id")
-            or (tool_args or {}).get("command")
-            or "organizations/31564119954"
-        )
+        if not _is_authenticated_email_identity(uid):
+            return {
+                "status": "SCOPE_AUTHORIZATION_DENIED",
+                "scope": str((tool_args or {}).get("scope") or (tool_args or {}).get("project_id") or ""),
+                "error": (
+                    "UNAUTHENTICATED_EXECUTION_CONTEXT: An authenticated tenant user identity is required "
+                    f"before invoking protected tool '{tool.name}'."
+                ),
+            }
+
         conn = get_gcp_connection_config(mask_token=False, user_id=uid)
+        raw_tool_scope = (tool_args or {}).get("scope") or (tool_args or {}).get("project_id")
+        resolved_tool_scope = ""
+        if tool.name != "execute_gcloud_command":
+            try:
+                resolved_tool_scope = _resolve_and_authorize_request_scope(
+                    uid,
+                    str(raw_tool_scope) if raw_tool_scope is not None else None,
+                    allow_unbound_non_scan=False,
+                )
+            except PermissionError as scope_err:
+                return {
+                    "status": "SCOPE_AUTHORIZATION_DENIED",
+                    "scope": str(raw_tool_scope or ""),
+                    "error": str(scope_err),
+                }
+
+        target_scope = str(
+            resolved_tool_scope
+            or raw_tool_scope
+            or (tool_args or {}).get("command")
+            or conn.get("active_scope_uri")
+            or ""
+        )
         auth_config = build_gcp_oauth_auth_config(
             user_id=uid,
             session_id=inv_sess,
@@ -1120,6 +1191,12 @@ class PqcOAuth3LOPlugin(BasePlugin):
         conn = get_gcp_connection_config(mask_token=False, user_id=uid)
 
         serialized = json.dumps(result, ensure_ascii=False, default=str) if result is not None else ""
+        if any(
+            block_marker in serialized
+            for block_marker in ("UNAUTHORIZED_RESOURCE_SCOPE", "MISSING_AUTHORIZED_SCOPE", "ADC_UNAUTHORIZED")
+        ):
+            return None
+
         permission_failure = any(
             marker in serialized
             for marker in (
@@ -1135,8 +1212,8 @@ class PqcOAuth3LOPlugin(BasePlugin):
                 (tool_args or {}).get("scope")
                 or (tool_args or {}).get("project_id")
                 or (tool_args or {}).get("command")
-                or conn.get("organization_id")
-                or "organizations/31564119954"
+                or conn.get("active_scope_uri")
+                or ""
             )
             auth_config = build_gcp_oauth_auth_config(
                 user_id=uid,
@@ -1644,9 +1721,11 @@ def create_workspace_app(
                 return
             store_tok = auth_store.set_active_auth_store(self._store)
             cred_tok = credential_service.set_active_credential_service(self._cred_svc)
+            tenant_tokens = enter_http_request_tenant_context()
             try:
                 await self.app(scope, receive, send)
             finally:
+                exit_http_request_tenant_context(tenant_tokens)
                 credential_service.reset_active_credential_service(cred_tok)
                 auth_store.reset_active_auth_store(store_tok)
 
@@ -1673,34 +1752,6 @@ def create_workspace_app(
         verify_models_on_startup = os.getenv("PQC_MODEL_VERIFICATION_ON_STARTUP", "true").strip().lower() == "true"
     if verify_models_on_startup:
         registry_obj.start_background_verification()
-
-        def _warm_inventory_cache() -> None:
-            try:
-                from tools.gcp_inventory import (
-                    DEFAULT_ORGANIZATION_ID,
-                    collect_kms_inventory,
-                    collect_workload_evidence,
-                    compute_pqc_scorecard,
-                    discover_all_crypto_assets,
-                )
-                from tools.pqc_detectors import collect_kms_import_jobs, collect_tls_policies
-
-                default_scope = f"organizations/{DEFAULT_ORGANIZATION_ID}"
-                with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
-                    futs = [
-                        pool.submit(collect_kms_inventory, default_scope),
-                        pool.submit(collect_workload_evidence, default_scope),
-                        pool.submit(collect_tls_policies, default_scope),
-                        pool.submit(collect_kms_import_jobs, default_scope),
-                        pool.submit(discover_all_crypto_assets, default_scope),
-                    ]
-                    concurrent.futures.wait(futs, timeout=45)
-                compute_pqc_scorecard(default_scope)
-                logger.info("Pre-warmed live GCP PQC inventory cache for %s.", default_scope)
-            except Exception as exc:
-                logger.debug("Background inventory cache warm-up skipped: %s", exc)
-
-        threading.Thread(target=_warm_inventory_cache, name="pqc-inventory-warmup", daemon=True).start()
 
     telemetry_plugin = LlmCallTelemetryPlugin()
     oauth_3lo_plugin = PqcOAuth3LOPlugin()
@@ -1954,7 +2005,12 @@ def create_workspace_app(
         uid = profile["user_id"]
         set_current_tenant_user(uid)
         if gcp_access_token:
-            _bind_delegated_gcp_token(uid, gcp_access_token, gcp_access_token_expires_in)
+            try:
+                _bind_delegated_gcp_token(uid, gcp_access_token, gcp_access_token_expires_in)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except PermissionError as exc:
+                raise HTTPException(status_code=403, detail=str(exc)) from exc
         signed_token = sign_tenant_session_token(profile)
         csrf_token = auth_guard.derive_csrf_token(signed_token, _get_auth_secret())
         sess_resp = await session_service.list_sessions(app_name=APP_NAME, user_id=uid)
@@ -2534,7 +2590,7 @@ window.addEventListener('load', () => {{
         request: Request,
         user_id: Optional[str] = Query(default=None),
         session_id: Optional[str] = Query(default=None),
-        scope: Optional[str] = Query(default="organizations/31564119954"),
+        scope: Optional[str] = Query(default=None),
         redirect_uri: Optional[str] = Query(default=None),
         response_type: Optional[str] = Query(default=None),
         format: Optional[str] = Query(default=None),
@@ -2552,7 +2608,10 @@ window.addEventListener('load', () => {{
         oauth_cfg = load_oauth_client_config()
         client_id = (oauth_cfg.get("client_id") or "").strip()
         has_secret = bool((oauth_cfg.get("client_secret") or "").strip())
-        target_scope = scope or "organizations/31564119954"
+        try:
+            target_scope = _resolve_and_authorize_request_scope(uid, scope, allow_unbound_non_scan=True)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
         tx = auth_store.get_active_auth_store().create_oauth_transaction(
             flow_mode="3lo",
             redirect_uri=cb_uri,
@@ -2961,18 +3020,42 @@ async function saveClientId() {{
                     ),
                 )
 
-        conn = _bind_delegated_gcp_token(
-            uid,
-            tok_data["access_token"],
-            tok_data.get("expires_in"),
-            refresh_token=tok_data.get("refresh_token"),
-        )
+        try:
+            resolved_cb_scope = _resolve_and_authorize_request_scope(
+                uid, tx.target_scope, allow_unbound_non_scan=True
+            )
+            conn = _bind_delegated_gcp_token(
+                uid,
+                tok_data["access_token"],
+                tok_data.get("expires_in"),
+                refresh_token=tok_data.get("refresh_token"),
+            )
+        except PermissionError as exc:
+            return HTMLResponse(
+                status_code=403,
+                content=_oauth_popup_result_html(
+                    message_type,
+                    {"authenticated": False, "status": "UNAUTHORIZED_RESOURCE_SCOPE", "detail": str(exc)},
+                    str(exc),
+                    ok=False,
+                ),
+            )
+        except ValueError as exc:
+            return HTMLResponse(
+                status_code=400,
+                content=_oauth_popup_result_html(
+                    message_type,
+                    {"authenticated": False, "status": "INVALID_TOKEN", "detail": str(exc)},
+                    str(exc),
+                    ok=False,
+                ),
+            )
         result_payload = {
             "status": "AUTHORIZED",
             "authenticated": True,
             "user_id": uid,
             "session_id": tx.app_session_id or None,
-            "target_scope": tx.target_scope,
+            "target_scope": resolved_cb_scope or tx.target_scope,
             "credential_key": GCP_OAUTH_CREDENTIAL_KEY,
             "token_storage": "encrypted_db_envelope",
             "connection": conn,
@@ -3006,10 +3089,21 @@ async function saveClientId() {{
             info, err_msg = await asyncio.to_thread(_verify_google_oauth_or_id_token, None, raw_token)
             if not info:
                 raise HTTPException(status_code=401, detail=err_msg or "Invalid Google OAuth access token.")
-            verified_email = info["email"]
+            verified_email = normalize_user_id(info["email"])
+            if verified_email != uid:
+                raise HTTPException(status_code=403, detail=auth_guard.USER_MISMATCH_DETAIL)
             expires_in = info.get("expires_in")
 
-        conn = _bind_delegated_gcp_token(uid, raw_token, expires_in)
+        try:
+            resolved_target_scope = _resolve_and_authorize_request_scope(
+                uid, payload.target_scope, allow_unbound_non_scan=True
+            )
+            conn = _bind_delegated_gcp_token(uid, raw_token, expires_in)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+
         session_found = False
         if payload.session_id:
             sess, _ = await _locate_session(payload.session_id, uid)
@@ -3026,7 +3120,7 @@ async function saveClientId() {{
             "token_storage": "encrypted_db_envelope",
             "credential_key": GCP_OAUTH_CREDENTIAL_KEY,
             "tool_name": payload.tool_name,
-            "target_scope": payload.target_scope,
+            "target_scope": resolved_target_scope or payload.target_scope,
             "connection": conn,
         }
 
@@ -3073,7 +3167,7 @@ async function saveClientId() {{
                     "updated_at": iso_updated,
                     "timestamp": float(upd_ts),
                     "message_count": msg_count,
-                    "scope": extra.get("scope") or state_dict.get("scope", "organizations/31564119954"),
+                    "scope": extra.get("scope") or state_dict.get("scope", ""),
                 }
             )
         items.sort(key=lambda x: x["timestamp"], reverse=True)
@@ -3087,8 +3181,10 @@ async function saveClientId() {{
         req = payload or CreateSessionPayload()
         user_id = activate_request_tenant_user(request, explicit_user_id=req.user_id)
         title = (req.title or "New PQC Assessment").strip()
-        conn_org = get_gcp_connection_config(mask_token=True, user_id=user_id).get("organization_id", "31564119954")
-        scope = (req.scope or f"organizations/{conn_org}").strip()
+        try:
+            scope = _resolve_and_authorize_request_scope(user_id, req.scope, allow_unbound_non_scan=True)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
         now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
         if req.session_id and auth_store.get_active_auth_store().is_session_owned_by_other_user(
             req.session_id, user_id=user_id
@@ -3165,7 +3261,7 @@ async function saveClientId() {{
             "id": sess.id,
             "user_id": resolved_user,
             "title": title,
-            "scope": extra.get("scope") or state_dict.get("scope", "organizations/31564119954"),
+            "scope": extra.get("scope") or state_dict.get("scope", ""),
             "created_at": extra.get("created_at") or iso_updated,
             "updated_at": iso_updated,
             "timestamp": float(upd_ts),
@@ -3201,7 +3297,7 @@ async function saveClientId() {{
         prompt: Optional[str] = Form(default=None),
         session_id: Optional[str] = Form(default=None),
         user_id: Optional[str] = Form(default=None),  # optional; must equal the authenticated user when given
-        scope: str = Form(default="organizations/31564119954"),
+        scope: Optional[str] = Form(default=None),
         project_id: Optional[str] = Form(default=None),
         location: str = Form(default="all"),
         model: Optional[str] = Form(default=None),
@@ -3212,14 +3308,13 @@ async function saveClientId() {{
         files: Optional[List[UploadFile]] = File(default=None),
     ) -> JSONResponse:
         """Runs one agent turn on the selected verified Gemini model and returns the answer with model telemetry."""
-        if project_id:
-            scope = project_id
+        requested_scope: Optional[str] = project_id or scope
         if "application/json" in (request.headers.get("content-type") or "").lower():
             body_json = await request.json()
             message = body_json.get("message") or body_json.get("prompt") or message
             session_id = body_json.get("session_id") or session_id
             user_id = body_json.get("user_id") or user_id
-            scope = body_json.get("scope") or body_json.get("project_id") or scope
+            requested_scope = body_json.get("scope") or body_json.get("project_id") or requested_scope
             location = body_json.get("location") or location
             model = body_json.get("model") or body_json.get("model_id") or model
             connection_mode = body_json.get("connection_mode") or connection_mode
@@ -3239,6 +3334,13 @@ async function saveClientId() {{
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             except PermissionError as exc:
                 raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+        try:
+            resolved_scope = _resolve_and_authorize_request_scope(
+                user_id, requested_scope, allow_unbound_non_scan=True
+            )
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
 
         requested_model = model or model_id
         entry = await asyncio.to_thread(registry_obj.resolve, requested_model)
@@ -3274,6 +3376,10 @@ async function saveClientId() {{
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             except PermissionError as exc:
                 raise HTTPException(status_code=403, detail=str(exc)) from exc
+            if not requested_scope:
+                resolved_scope = _resolve_and_authorize_request_scope(user_id, None, allow_unbound_non_scan=True)
+
+        scope = resolved_scope
 
         user_text = (message or prompt or "").strip()
         uploaded_files = [f for f in (files or []) if f and f.filename]

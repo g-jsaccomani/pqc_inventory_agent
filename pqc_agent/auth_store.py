@@ -1276,7 +1276,7 @@ class DistributedAuthStore:
                     user_id=clean_uid,
                     tenant_domain=domain,
                     title=(title or "New PQC Assessment")[:512],
-                    scope=(scope or "organizations/31564119954")[:512],
+                    scope=(scope or "")[:512],
                     model_id=model_id,
                     model_label=model_label,
                     message_count=init_count,

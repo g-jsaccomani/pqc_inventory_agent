@@ -16,13 +16,15 @@ from __future__ import annotations
 
 import concurrent.futures
 import datetime
+import hashlib
 import json
 import logging
 import os
 import re
+import threading
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
 from google.cloud import asset_v1, kms_v1
 
@@ -47,6 +49,7 @@ REQUIRED_READ_ROLES = [
 
 # In-memory TTL cache so specialist agents can re-read the same evidence without repeating API calls.
 _SCAN_CACHE: Dict[str, Tuple[float, str]] = {}
+_SCAN_CACHE_LOCK = threading.RLock()
 _CACHE_TTL_SECONDS = float(os.getenv("PQC_SCAN_CACHE_TTL_SECONDS", "1800"))
 
 # Explicit demo identifiers. Requesting one of these scopes returns the demo dataset (clearly labeled).
@@ -70,8 +73,6 @@ ORG_MODE_TOKENS = {
     "default",
     "all",
     "*",
-    DEFAULT_ORGANIZATION_ID.lower(),
-    f"organizations/{DEFAULT_ORGANIZATION_ID}".lower(),
     DEFAULT_ORGANIZATION_NAME.lower(),
 }
 
@@ -189,50 +190,133 @@ def _now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat()
 
 
-def _get_client_kwargs() -> Dict[str, Any]:
-    """Returns {'credentials': creds} for the active tenant connection, failing closed on PermissionError."""
-    try:
-        from tools.gcloud_bridge import get_active_gcp_credentials
+def _get_client_kwargs(scope_uri: Optional[str] = None) -> Dict[str, Any]:
+    """Returns {'credentials': creds} for the active tenant connection after enforcing scope and credential authz.
 
-        creds = get_active_gcp_credentials()
-        if creds is not None:
-            return {"credentials": creds}
-    except PermissionError:
-        raise
-    except Exception:
-        pass
+    Fails closed on ``PermissionError`` or ``ValueError`` (unauthenticated caller, unauthorized ADC mode,
+    missing delegated token, or caller-supplied scope outside the tenant's authorized boundary). Never
+    silently degrades to empty kwargs / ambient ADC.
+    """
+    from tools.gcloud_bridge import authorize_gcp_scope, get_active_gcp_credentials
+
+    if scope_uri is not None:
+        authorize_gcp_scope(scope_uri)
+    creds = get_active_gcp_credentials()
+    if creds is not None:
+        return {"credentials": creds}
     return {}
 
 
-def _cache_scope_prefix() -> str:
-    """Returns a cache key prefix isolating non-default credential modes per tenant user."""
+def _live_cache_partition(client_kwargs: Optional[Mapping[str, Any]] = None) -> Optional[str]:
+    """Computes a fail-closed, tenant- and credential-segregated cache partition for live GCP scans.
+
+    Returns ``None`` (bypassing the cache completely rather than falling back to a shared bucket) if
+    the caller is unauthenticated, connection ownership is invalid, credentials cannot be fingerprinted,
+    or scope metadata cannot be resolved.
+    """
     try:
-        from tools.gcloud_bridge import get_gcp_connection_config
+        from pqc_agent import credential_service
+        from tools.gcloud_bridge import (
+            _is_authenticated_email_identity,
+            get_current_tenant_user,
+            get_gcp_connection_config,
+            normalize_user_id,
+        )
 
-        cfg = get_gcp_connection_config(mask_token=True)
-        mode = cfg.get("mode", "access_token")
-        if mode == "impersonation":
-            return f"imp:{cfg.get('user_id', '')}:{cfg.get('impersonated_service_account', '')}"
+        active_uid = get_current_tenant_user()
+        if not isinstance(active_uid, str) or not _is_authenticated_email_identity(active_uid):
+            return None
+        uid = normalize_user_id(active_uid)
+
+        cfg = get_gcp_connection_config(mask_token=True, user_id=uid)
+        if not isinstance(cfg, Mapping):
+            return None
+        cfg_uid = cfg.get("user_id")
+        if not isinstance(cfg_uid, str) or not cfg_uid.strip() or normalize_user_id(cfg_uid) != uid:
+            return None
+
+        mode = str(cfg.get("mode") or "").strip().lower()
         if mode == "access_token":
-            return f"tok:{cfg.get('user_id', '')}:{cfg.get('access_token_preview', '')}"
-        if mode == "adc" and cfg.get("adc_authorized"):
-            return f"adc:{cfg.get('user_id', '')}"
+            creds = (client_kwargs or {}).get("credentials")
+            raw_tok = getattr(creds, "token", None)
+            if not isinstance(raw_tok, str) or not raw_tok.strip():
+                loaded = credential_service.get_active_credential_service().load_delegated_token(
+                    user_id=uid, caller_user_id=uid
+                )
+                raw_tok = loaded.access_token if loaded is not None else ""
+            if not isinstance(raw_tok, str) or not raw_tok.strip():
+                return None
+            cred_part = f"tok:{hashlib.sha256(raw_tok.strip().encode('utf-8')).hexdigest()[:32]}"
+        elif mode == "impersonation":
+            sa_email = str(cfg.get("impersonated_service_account") or "").strip().lower()
+            if not sa_email:
+                return None
+            cred_part = f"imp:{hashlib.sha256(sa_email.encode('utf-8')).hexdigest()[:24]}"
+        elif mode == "adc" and cfg.get("adc_authorized") is True:
+            cred_part = "adc"
+        else:
+            return None
+
+        authz_scope = cfg.get("authorized_scope")
+        if not isinstance(authz_scope, Mapping):
+            return None
+        scope_sig = hashlib.sha256(
+            json.dumps(
+                {
+                    "organizations": sorted(str(x) for x in (authz_scope.get("organizations") or ())),
+                    "projects": sorted(str(x) for x in (authz_scope.get("projects") or ())),
+                    "folders": sorted(str(x) for x in (authz_scope.get("folders") or ())),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+        return f"live:{uid}:{cred_part}:{scope_sig}"
     except Exception:
-        pass
-    return "unconfigured"
+        return None
 
 
-def _cache_get(key: str) -> Optional[str]:
-    scoped_key = f"{_cache_scope_prefix()}:{key}"
-    cached = _SCAN_CACHE.get(scoped_key)
-    if cached and (time.monotonic() - cached[0]) < _CACHE_TTL_SECONDS:
-        return cached[1]
+def _cache_scope_prefix(
+    *,
+    simulated: bool = False,
+    client_kwargs: Optional[Mapping[str, Any]] = None,
+) -> Optional[str]:
+    """Returns a strictly segregated cache prefix (`sim` for simulated demo data, or fail-closed live partition)."""
+    if simulated:
+        return "sim"
+    return _live_cache_partition(client_kwargs=client_kwargs)
+
+
+def _cache_get(
+    key: str,
+    *,
+    simulated: bool = False,
+    client_kwargs: Optional[Mapping[str, Any]] = None,
+) -> Optional[str]:
+    prefix = _cache_scope_prefix(simulated=simulated, client_kwargs=client_kwargs)
+    if not prefix:
+        return None
+    scoped_key = f"{prefix}:{key}"
+    with _SCAN_CACHE_LOCK:
+        cached = _SCAN_CACHE.get(scoped_key)
+        if cached and (time.monotonic() - cached[0]) < _CACHE_TTL_SECONDS:
+            return cached[1]
     return None
 
 
-def _cache_put(key: str, value: str) -> str:
-    scoped_key = f"{_cache_scope_prefix()}:{key}"
-    _SCAN_CACHE[scoped_key] = (time.monotonic(), value)
+def _cache_put(
+    key: str,
+    value: str,
+    *,
+    simulated: bool = False,
+    client_kwargs: Optional[Mapping[str, Any]] = None,
+) -> str:
+    prefix = _cache_scope_prefix(simulated=simulated, client_kwargs=client_kwargs)
+    if not prefix:
+        return value
+    scoped_key = f"{prefix}:{key}"
+    with _SCAN_CACHE_LOCK:
+        _SCAN_CACHE[scoped_key] = (time.monotonic(), value)
     return value
 
 
@@ -259,29 +343,153 @@ def _is_internal_runtime_tenant_project(proj_id: str) -> bool:
     return bool(re.match(r"^project-[0-9a-f]{6,}-[0-9a-f]{4}-", clean))
 
 
-def _active_tenant_org_id() -> str:
-    """Returns the active tenant user's configured Organization ID, falling back to DEFAULT_ORGANIZATION_ID."""
-    try:
-        from tools.gcloud_bridge import get_gcp_connection_config
+def _active_tenant_default_scope() -> Tuple[str, str, str]:
+    """Resolves the active tenant's server-bound default `(mode, scope_uri, clean_id)` with fail-closed semantics.
 
-        org = (get_gcp_connection_config(mask_token=True).get("organization_id") or "").strip()
-        if org:
-            return org.replace("organizations/", "")
-    except Exception:
-        pass
-    return DEFAULT_ORGANIZATION_ID
+    - Explicit execution-context classification via `tools.gcloud_bridge.classify_execution_context()`:
+      * `"authenticated"`: resolves exclusively from that tenant's authorized server-side connection
+        (`organizations/<id>`, `projects/<id>`, or `folders/<id>`), requiring a valid non-empty `user_id`
+        ownership binding matching the active tenant. Any lookup exception, malformed payload/field,
+        missing/mismatched `user_id`, or missing bound scope logs a sanitized diagnostic (without tokens,
+        credentials, or tenant emails) and returns `("UNBOUND", "", "")`. NEVER substitutes `DEFAULT_ORGANIZATION_ID`.
+      * `"unauthenticated_cli"`: ONLY non-production, non-HTTP CLI/unit-test execution with an explicit
+        placeholder in `UNAUTHENTICATED_CLI_IDENTITIES` (`sec-architect`, `default`); preserves legacy
+        `DEFAULT_ORGANIZATION_ID` for offline CLI/unit helpers (live collectors still deny via `authorize_gcp_scope`).
+      * `"invalid"` or any exception (arbitrary non-email strings, unauthenticated HTTP requests, malformed
+        identities, production unauthenticated contexts, or identity-provider errors): logs a sanitized diagnostic
+        and fails closed as `("UNBOUND", "", "")`.
+    """
+    try:
+        from tools.gcloud_bridge import (
+            EXECUTION_CONTEXT_AUTHENTICATED,
+            EXECUTION_CONTEXT_UNAUTHENTICATED_CLI,
+            _validate_numeric_id_value,
+            _validate_project_value,
+            _validate_scope_value,
+            classify_execution_context,
+            get_gcp_connection_config,
+            normalize_user_id,
+        )
+
+        ctx_kind, norm_active_uid = classify_execution_context()
+    except Exception as exc:
+        logger.warning(
+            "Tenant identity lookup failed during scope resolution; failing closed as UNBOUND (%s).",
+            type(exc).__name__,
+        )
+        return ("UNBOUND", "", "")
+
+    if ctx_kind == EXECUTION_CONTEXT_UNAUTHENTICATED_CLI:
+        return ("ORG", f"organizations/{DEFAULT_ORGANIZATION_ID}", DEFAULT_ORGANIZATION_ID)
+
+    if ctx_kind != EXECUTION_CONTEXT_AUTHENTICATED or not norm_active_uid:
+        logger.warning(
+            "Execution context is unverified or malformed (%s) during scope resolution; failing closed as UNBOUND.",
+            ctx_kind,
+        )
+        return ("UNBOUND", "", "")
+
+    try:
+        conn = get_gcp_connection_config(mask_token=True, user_id=norm_active_uid)
+    except Exception as exc:
+        logger.warning(
+            "Authorized tenant connection lookup failed during scope resolution; failing closed as UNBOUND (%s).",
+            type(exc).__name__,
+        )
+        return ("UNBOUND", "", "")
+
+    if not isinstance(conn, Mapping):
+        logger.warning(
+            "Authorized tenant connection lookup returned malformed payload (%s); failing closed as UNBOUND.",
+            type(conn).__name__,
+        )
+        return ("UNBOUND", "", "")
+
+    conn_uid = conn.get("user_id")
+    if not isinstance(conn_uid, str) or not conn_uid.strip() or normalize_user_id(conn_uid) != norm_active_uid:
+        logger.warning(
+            "Authorized tenant connection lookup missing or mismatched tenant ownership binding; failing closed as UNBOUND."
+        )
+        return ("UNBOUND", "", "")
+
+    raw_org = conn.get("organization_id")
+    if raw_org is not None and not isinstance(raw_org, str):
+        logger.warning(
+            "Authorized tenant connection has malformed organization_id type (%s); failing closed as UNBOUND.",
+            type(raw_org).__name__,
+        )
+        return ("UNBOUND", "", "")
+    if isinstance(raw_org, str) and raw_org.strip():
+        org = raw_org.strip()
+        if org.lower().startswith("organizations/"):
+            org = org.split("/", 1)[1].strip()
+        if _validate_numeric_id_value(org) is not None:
+            logger.warning(
+                "Authorized tenant connection has malformed organization_id value; failing closed as UNBOUND."
+            )
+            return ("UNBOUND", "", "")
+        return ("ORG", f"organizations/{org}", org)
+
+    raw_proj = conn.get("project_id")
+    if raw_proj is not None and not isinstance(raw_proj, str):
+        logger.warning(
+            "Authorized tenant connection has malformed project_id type (%s); failing closed as UNBOUND.",
+            type(raw_proj).__name__,
+        )
+        return ("UNBOUND", "", "")
+    if isinstance(raw_proj, str) and raw_proj.strip():
+        proj = raw_proj.strip()
+        if proj.lower().startswith("projects/"):
+            proj = proj.split("/", 1)[1].strip()
+        if _validate_project_value(proj) is not None:
+            logger.warning(
+                "Authorized tenant connection has malformed project_id value; failing closed as UNBOUND."
+            )
+            return ("UNBOUND", "", "")
+        return ("PROJECT", f"projects/{proj}", proj)
+
+    raw_active_uri = conn.get("active_scope_uri")
+    if raw_active_uri is not None and not isinstance(raw_active_uri, str):
+        logger.warning(
+            "Authorized tenant connection has malformed active_scope_uri type (%s); failing closed as UNBOUND.",
+            type(raw_active_uri).__name__,
+        )
+        return ("UNBOUND", "", "")
+    if isinstance(raw_active_uri, str) and raw_active_uri.strip():
+        active_uri = raw_active_uri.strip()
+        if _validate_scope_value(active_uri) is not None:
+            logger.warning(
+                "Authorized tenant connection has malformed active_scope_uri value; failing closed as UNBOUND."
+            )
+            return ("UNBOUND", "", "")
+        kind, _, clean_id = active_uri.partition("/")
+        if kind == "organizations":
+            return ("ORG", active_uri, clean_id)
+        if kind == "projects":
+            return ("PROJECT", active_uri, clean_id)
+        if kind == "folders":
+            return ("FOLDER", active_uri, clean_id)
+
+    return ("UNBOUND", "", "")
+
+
+def _active_tenant_org_id() -> str:
+    """Returns the active tenant user's configured Organization ID (empty string when unbound, non-ORG, or on lookup error)."""
+    mode, _, clean_id = _active_tenant_default_scope()
+    if mode == "ORG":
+        return clean_id
+    return ""
 
 
 def _resolve_scope(target: Optional[str] = None) -> Tuple[str, str, str]:
     """Resolves the requested scope into (mode, scope_uri, clean_id)."""
     raw = (target or "").strip()
     lower = raw.lower()
-    active_org = _active_tenant_org_id()
 
     if lower in ORG_MODE_TOKENS:
-        return ("ORG", f"organizations/{active_org}", active_org)
+        return _active_tenant_default_scope()
     if lower.startswith("organizations/"):
-        org_id = raw.split("/", 1)[1].strip() or active_org
+        org_id = raw.split("/", 1)[1].strip()
         return ("ORG", f"organizations/{org_id}", org_id)
     if raw.isdigit() and len(raw) >= 8:
         return ("ORG", f"organizations/{raw}", raw)
@@ -291,8 +499,8 @@ def _resolve_scope(target: Optional[str] = None) -> Tuple[str, str, str]:
 
     proj_id = raw.split("/", 1)[1].strip() if lower.startswith("projects/") else raw
     if _is_internal_runtime_tenant_project(proj_id):
-        logger.info("Redirecting internal runtime tenant project '%s' to the configured organization.", proj_id)
-        return ("ORG", f"organizations/{active_org}", active_org)
+        logger.info("Redirecting internal runtime tenant project '%s' to the configured tenant scope.", proj_id)
+        return _active_tenant_default_scope()
     return ("PROJECT", f"projects/{proj_id}", proj_id)
 
 
@@ -653,63 +861,42 @@ def _scan_kms_location(
         return [f.result() for f in futures]
 
 
-DEFAULT_FUNCTIONAL_LAB_FALLBACK_SCOPES: Tuple[str, ...] = (
-    "folders/534285347409",
-    "projects/pqc-inventory-agent-cd06",
-    "projects/pqc-inventory-agent-dev",
-)
-
-
-def _cai_search_all_resources_with_fallback(
+def _cai_search_all_resources(
     cai_client: Any,
     scope_uri: str,
     asset_types: List[str],
     read_mask: Optional[str] = None,
     page_size: int = 500,
 ) -> List[Any]:
-    """Queries Cloud Asset Inventory `search_all_resources` for `scope_uri`.
-    When `scope_uri` is `organizations/31564119954` and the runtime service account is scoped to the Functional Lab
-    folder (`folders/534285347409`) + host project (`projects/pqc-inventory-agent-cd06`), transparently falls back
-    to querying those scopes and deduplicating resources by `name`."""
+    """Queries Cloud Asset Inventory `search_all_resources` strictly for the explicitly supplied `scope_uri`.
+
+    Never falls back to alternative organizations, folders, or projects when the request fails;
+    any exception raised by Cloud Asset Inventory is propagated to the caller intact.
+    """
+    clean_scope = str(scope_uri or "").strip()
+    if not clean_scope:
+        raise ValueError("Cloud Asset Inventory scope_uri must be a non-empty explicit scope.")
     req: Dict[str, Any] = {
-        "scope": scope_uri,
+        "scope": clean_scope,
         "asset_types": list(asset_types),
         "page_size": page_size,
     }
     if read_mask:
         req["read_mask"] = read_mask
-    try:
-        return list(cai_client.search_all_resources(request=req))
-    except Exception as primary_exc:
-        if scope_uri != f"organizations/{DEFAULT_ORGANIZATION_ID}":
-            raise
-        combined: List[Any] = []
-        seen_names: Set[str] = set()
-        any_succeeded = False
-        for fb_scope in DEFAULT_FUNCTIONAL_LAB_FALLBACK_SCOPES:
-            fb_req = dict(req, scope=fb_scope)
-            try:
-                for item in cai_client.search_all_resources(request=fb_req):
-                    any_succeeded = True
-                    item_name = getattr(item, "name", "")
-                    if item_name and item_name in seen_names:
-                        continue
-                    if item_name:
-                        seen_names.add(item_name)
-                    combined.append(item)
-            except Exception:
-                continue
-        if any_succeeded:
-            return combined
-        raise primary_exc
+    return list(cai_client.search_all_resources(request=req))
 
 
-def _discover_kms_targets_via_cai(scope_uri: str, errors: List[str]) -> List[Tuple[str, str]]:
+def _discover_kms_targets_via_cai(
+    scope_uri: str,
+    errors: List[str],
+    client_kwargs: Optional[Dict[str, Any]] = None,
+) -> List[Tuple[str, str]]:
     """Discovers (project_id, location) pairs that contain KeyRings/CryptoKeys inside the scope."""
     targets: Set[Tuple[str, str]] = set()
+    kwargs = client_kwargs if client_kwargs is not None else _get_client_kwargs(scope_uri=scope_uri)
     try:
-        cai_client = asset_v1.AssetServiceClient(**_get_client_kwargs())
-        response = _cai_search_all_resources_with_fallback(
+        cai_client = asset_v1.AssetServiceClient(**kwargs)
+        response = _cai_search_all_resources(
             cai_client=cai_client,
             scope_uri=scope_uri,
             asset_types=["cloudkms.googleapis.com/KeyRing", "cloudkms.googleapis.com/CryptoKey"],
@@ -786,11 +973,11 @@ def collect_kms_inventory(
     loc = (location or "all").strip()
     simulated = simulation_requested(clean_id)
     cache_key = f"kms:{scope_uri}:{loc.lower()}:{simulated}"
-    cached = _cache_get(cache_key)
-    if cached:
-        return cached
 
     if simulated:
+        cached = _cache_get(cache_key, simulated=True)
+        if cached:
+            return cached
         keys = [
             build_key_record(project_id=clean_id, enabled_version_ids=["1"], data_source=SIMULATED_DATA_SOURCE, **raw)
             for raw in mock_data.get_simulated_kms_raw_keys(clean_id, loc)
@@ -808,14 +995,18 @@ def collect_kms_inventory(
             "collection_errors": [],
             "excluded_key_rings": [],
         }
-        return _cache_put(cache_key, _compact_json(payload))
+        return _cache_put(cache_key, _compact_json(payload), simulated=True)
 
     errors: List[str] = []
     skipped: List[str] = []
     keys: List[Dict[str, Any]] = []
     try:
-        client = kms_v1.KeyManagementServiceClient(**_get_client_kwargs())
-        targets = _discover_kms_targets_via_cai(scope_uri, errors)
+        client_kwargs = _get_client_kwargs(scope_uri=scope_uri)
+        cached = _cache_get(cache_key, client_kwargs=client_kwargs)
+        if cached:
+            return cached
+        client = kms_v1.KeyManagementServiceClient(**client_kwargs)
+        targets = _discover_kms_targets_via_cai(scope_uri, errors, client_kwargs=client_kwargs)
         if loc.lower() not in ("all", "*", ""):
             if mode == "PROJECT":
                 targets = [(clean_id, loc)]
@@ -849,7 +1040,7 @@ def collect_kms_inventory(
     payload = {
         "scope": scope_uri,
         "scope_mode": mode,
-        "organization_domain": DEFAULT_ORGANIZATION_NAME if mode == "ORG" else None,
+        "organization_domain": DEFAULT_ORGANIZATION_NAME if (mode == "ORG" and clean_id == DEFAULT_ORGANIZATION_ID) else None,
         "data_source": LIVE_DATA_SOURCE,
         "generated_at": _now_iso(),
         **_inventory_summary(keys),
@@ -861,7 +1052,8 @@ def collect_kms_inventory(
     if not keys and errors:
         payload["error"] = "No keys could be read; see collection_errors."
         payload["required_roles"] = REQUIRED_READ_ROLES
-    return _cache_put(cache_key, _compact_json(payload))
+        return _compact_json(payload)
+    return _cache_put(cache_key, _compact_json(payload), client_kwargs=client_kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -932,19 +1124,23 @@ def collect_workload_evidence(scope: str = f"organizations/{DEFAULT_ORGANIZATION
     mode, scope_uri, clean_id = _resolve_scope(scope)
     simulated = simulation_requested(clean_id)
     cache_key = f"workloads:{scope_uri}:{simulated}"
-    cached = _cache_get(cache_key)
-    if cached:
-        return cached
 
     if simulated:
+        cached = _cache_get(cache_key, simulated=True)
+        if cached:
+            return cached
         raw = mock_data.get_simulated_workload_evidence(clean_id)["workloads"]
         payload = _build_workload_evidence_payload(mode, scope_uri, raw, SIMULATED_DATA_SOURCE, [])
-        return _cache_put(cache_key, _compact_json(payload))
+        return _cache_put(cache_key, _compact_json(payload), simulated=True)
 
     raw_workloads: List[Dict[str, Any]] = []
     try:
-        cai_client = asset_v1.AssetServiceClient(**_get_client_kwargs())
-        response = _cai_search_all_resources_with_fallback(
+        client_kwargs = _get_client_kwargs(scope_uri=scope_uri)
+        cached = _cache_get(cache_key, client_kwargs=client_kwargs)
+        if cached:
+            return cached
+        cai_client = asset_v1.AssetServiceClient(**client_kwargs)
+        response = _cai_search_all_resources(
             cai_client=cai_client,
             scope_uri=scope_uri,
             asset_types=WORKLOAD_ASSET_TYPES,
@@ -980,7 +1176,7 @@ def collect_workload_evidence(scope: str = f"organizations/{DEFAULT_ORGANIZATION
         )
 
     payload = _build_workload_evidence_payload(mode, scope_uri, raw_workloads, LIVE_DATA_SOURCE, [])
-    return _cache_put(cache_key, _compact_json(payload))
+    return _cache_put(cache_key, _compact_json(payload), client_kwargs=client_kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -1018,11 +1214,11 @@ def discover_all_crypto_assets(scope: str = f"organizations/{DEFAULT_ORGANIZATIO
     mode, scope_uri, clean_id = _resolve_scope(scope)
     simulated = simulation_requested(clean_id)
     cache_key = f"cai-crypto:{scope_uri}:{simulated}"
-    cached = _cache_get(cache_key)
-    if cached:
-        return cached
 
     if simulated:
+        cached = _cache_get(cache_key, simulated=True)
+        if cached:
+            return cached
         payload = {
             "scope": scope_uri,
             "scope_mode": mode,
@@ -1032,12 +1228,16 @@ def discover_all_crypto_assets(scope: str = f"organizations/{DEFAULT_ORGANIZATIO
             "assets": mock_data.get_simulated_cai_crypto_assets(clean_id),
         }
         payload["asset_count"] = len(payload["assets"])
-        return _cache_put(cache_key, _compact_json(payload))
+        return _cache_put(cache_key, _compact_json(payload), simulated=True)
 
     assets: List[Dict[str, Any]] = []
     try:
-        cai_client = asset_v1.AssetServiceClient(**_get_client_kwargs())
-        response = _cai_search_all_resources_with_fallback(
+        client_kwargs = _get_client_kwargs(scope_uri=scope_uri)
+        cached = _cache_get(cache_key, client_kwargs=client_kwargs)
+        if cached:
+            return cached
+        cai_client = asset_v1.AssetServiceClient(**client_kwargs)
+        response = _cai_search_all_resources(
             cai_client=cai_client,
             scope_uri=scope_uri,
             asset_types=CRYPTO_ASSET_TYPES,
@@ -1083,7 +1283,7 @@ def discover_all_crypto_assets(scope: str = f"organizations/{DEFAULT_ORGANIZATIO
         "asset_count": len(assets),
         "assets": assets,
     }
-    return _cache_put(cache_key, _compact_json(payload))
+    return _cache_put(cache_key, _compact_json(payload), client_kwargs=client_kwargs)
 
 
 # ---------------------------------------------------------------------------

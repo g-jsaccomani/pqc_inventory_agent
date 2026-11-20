@@ -23,7 +23,7 @@ from tools.gcp_inventory import (
     SIMULATION_NOTICE,
     _cache_get,
     _cache_put,
-    _cai_search_all_resources_with_fallback,
+    _cai_search_all_resources,
     _compact_json,
     _get_client_kwargs,
     _now_iso,
@@ -99,10 +99,15 @@ def _policy_record(
     }
 
 
-def _fetch_compute_pq_key_exchange(project_id: str, location: str, policy_name: str) -> Optional[str]:
+def _fetch_compute_pq_key_exchange(
+    project_id: str,
+    location: str,
+    policy_name: str,
+    client_kwargs: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
     """Queries Compute Engine SslPolicies API directly when Cloud Asset Inventory omits postQuantumKeyExchange."""
     try:
-        kwargs = _get_client_kwargs()
+        kwargs = client_kwargs if client_kwargs is not None else _get_client_kwargs(scope_uri=f"projects/{project_id}")
         loc = (location or "global").lower()
         if loc == "global":
             client = compute_v1.SslPoliciesClient(**kwargs)
@@ -112,6 +117,8 @@ def _fetch_compute_pq_key_exchange(project_id: str, location: str, policy_name: 
             pol = rclient.get(project=project_id, region=location, ssl_policy=policy_name)
         val = getattr(pol, "post_quantum_key_exchange", None)
         return str(val).strip().upper() if val else "DEFAULT"
+    except PermissionError:
+        raise
     except Exception:
         return None
 
@@ -177,11 +184,11 @@ def collect_tls_policies(scope: str = f"organizations/{DEFAULT_ORGANIZATION_ID}"
     mode, scope_uri, clean_id = _resolve_scope(scope)
     simulated = simulation_requested(clean_id)
     cache_key = f"tls:{scope_uri}:{simulated}"
-    cached = _cache_get(cache_key)
-    if cached:
-        return cached
 
     if simulated:
+        cached = _cache_get(cache_key, simulated=True)
+        if cached:
+            return cached
         demo = mock_data.get_simulated_tls_evidence(clean_id)
         policies = [
             _policy_record(
@@ -206,13 +213,17 @@ def collect_tls_policies(scope: str = f"organizations/{DEFAULT_ORGANIZATION_ID}"
             "target_proxies": _resolve_proxy_records(policies, demo["proxies"]),
             "reference_facts": TLS_REFERENCE_FACTS,
         }
-        return _cache_put(cache_key, _compact_json(payload))
+        return _cache_put(cache_key, _compact_json(payload), simulated=True)
 
     policies: List[Dict[str, Any]] = []
     proxies_raw: List[Dict[str, Any]] = []
     try:
-        cai_client = asset_v1.AssetServiceClient(**_get_client_kwargs())
-        items = _cai_search_all_resources_with_fallback(
+        client_kwargs = _get_client_kwargs(scope_uri=scope_uri)
+        cached = _cache_get(cache_key, client_kwargs=client_kwargs)
+        if cached:
+            return cached
+        cai_client = asset_v1.AssetServiceClient(**client_kwargs)
+        items = _cai_search_all_resources(
             cai_client=cai_client,
             scope_uri=scope_uri,
             asset_types=[
@@ -232,7 +243,7 @@ def collect_tls_policies(scope: str = f"organizations/{DEFAULT_ORGANIZATION_ID}"
                 loc = item.location or "global"
                 raw_pq = attrs.get("postQuantumKeyExchange") or attrs.get("post_quantum_key_exchange")
                 if not raw_pq:
-                    raw_pq = _fetch_compute_pq_key_exchange(proj, loc, name) or "DEFAULT"
+                    raw_pq = _fetch_compute_pq_key_exchange(proj, loc, name, client_kwargs=client_kwargs) or "DEFAULT"
                 policies.append(
                     _policy_record(
                         name,
@@ -275,7 +286,7 @@ def collect_tls_policies(scope: str = f"organizations/{DEFAULT_ORGANIZATION_ID}"
         "target_proxies": _resolve_proxy_records(policies, proxies_raw),
         "reference_facts": TLS_REFERENCE_FACTS,
     }
-    return _cache_put(cache_key, _compact_json(payload))
+    return _cache_put(cache_key, _compact_json(payload), client_kwargs=client_kwargs)
 
 
 def _import_job_record(raw: Dict[str, Any], data_source: str) -> Dict[str, Any]:
@@ -304,11 +315,15 @@ def _import_job_record(raw: Dict[str, Any], data_source: str) -> Dict[str, Any]:
     }
 
 
-def _discover_key_rings_via_cai(scope_uri: str) -> List[Dict[str, str]]:
+def _discover_key_rings_via_cai(
+    scope_uri: str,
+    client_kwargs: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, str]]:
     keyrings: List[Dict[str, str]] = []
     excluded = excluded_key_rings()
-    cai_client = asset_v1.AssetServiceClient(**_get_client_kwargs())
-    for item in _cai_search_all_resources_with_fallback(
+    kwargs = client_kwargs if client_kwargs is not None else _get_client_kwargs(scope_uri=scope_uri)
+    cai_client = asset_v1.AssetServiceClient(**kwargs)
+    for item in _cai_search_all_resources(
         cai_client=cai_client,
         scope_uri=scope_uri,
         asset_types=["cloudkms.googleapis.com/KeyRing"],
@@ -347,11 +362,11 @@ def collect_kms_import_jobs(
     loc = (location or "all").strip()
     simulated = simulation_requested(clean_id)
     cache_key = f"importjobs:{scope_uri}:{loc.lower()}:{simulated}"
-    cached = _cache_get(cache_key)
-    if cached:
-        return cached
 
     if simulated:
+        cached = _cache_get(cache_key, simulated=True)
+        if cached:
+            return cached
         jobs = [_import_job_record(j, SIMULATED_DATA_SOURCE) for j in mock_data.get_simulated_import_jobs(clean_id)]
         if loc.lower() not in ("all", "*", ""):
             jobs = [j for j in jobs if j["location"] == loc]
@@ -365,12 +380,16 @@ def collect_kms_import_jobs(
             "key_rings_inspected": len({(j["project_id"], j["location"], j["key_ring"]) for j in jobs}),
             "collection_notes": [],
         }
-        return _cache_put(cache_key, _compact_json(payload))
+        return _cache_put(cache_key, _compact_json(payload), simulated=True)
 
     notes: List[str] = []
     try:
-        kms_client = kms_v1.KeyManagementServiceClient(**_get_client_kwargs())
-        key_rings = _discover_key_rings_via_cai(scope_uri)
+        client_kwargs = _get_client_kwargs(scope_uri=scope_uri)
+        cached = _cache_get(cache_key, client_kwargs=client_kwargs)
+        if cached:
+            return cached
+        kms_client = kms_v1.KeyManagementServiceClient(**client_kwargs)
+        key_rings = _discover_key_rings_via_cai(scope_uri, client_kwargs=client_kwargs)
         if loc.lower() not in ("all", "*", ""):
             key_rings = [kr for kr in key_rings if kr["location"] == loc]
         if not key_rings and mode == "PROJECT":
@@ -439,4 +458,4 @@ def collect_kms_import_jobs(
         "key_rings_inspected": len(key_rings),
         "collection_notes": notes,
     }
-    return _cache_put(cache_key, _compact_json(payload))
+    return _cache_put(cache_key, _compact_json(payload), client_kwargs=client_kwargs)
