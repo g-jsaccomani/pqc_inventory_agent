@@ -16,10 +16,12 @@ from __future__ import annotations
 
 import concurrent.futures
 import datetime
+import hashlib
 import json
 import logging
 import os
 import re
+import threading
 import time
 import uuid
 from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
@@ -47,6 +49,7 @@ REQUIRED_READ_ROLES = [
 
 # In-memory TTL cache so specialist agents can re-read the same evidence without repeating API calls.
 _SCAN_CACHE: Dict[str, Tuple[float, str]] = {}
+_SCAN_CACHE_LOCK = threading.RLock()
 _CACHE_TTL_SECONDS = float(os.getenv("PQC_SCAN_CACHE_TTL_SECONDS", "1800"))
 
 # Explicit demo identifiers. Requesting one of these scopes returns the demo dataset (clearly labeled).
@@ -204,35 +207,116 @@ def _get_client_kwargs(scope_uri: Optional[str] = None) -> Dict[str, Any]:
     return {}
 
 
-def _cache_scope_prefix() -> str:
-    """Returns a cache key prefix isolating non-default credential modes per tenant user."""
+def _live_cache_partition(client_kwargs: Optional[Mapping[str, Any]] = None) -> Optional[str]:
+    """Computes a fail-closed, tenant- and credential-segregated cache partition for live GCP scans.
+
+    Returns ``None`` (bypassing the cache completely rather than falling back to a shared bucket) if
+    the caller is unauthenticated, connection ownership is invalid, credentials cannot be fingerprinted,
+    or scope metadata cannot be resolved.
+    """
     try:
-        from tools.gcloud_bridge import get_gcp_connection_config
+        from pqc_agent import credential_service
+        from tools.gcloud_bridge import (
+            _is_authenticated_email_identity,
+            get_current_tenant_user,
+            get_gcp_connection_config,
+            normalize_user_id,
+        )
 
-        cfg = get_gcp_connection_config(mask_token=True)
-        mode = cfg.get("mode", "access_token")
-        if mode == "impersonation":
-            return f"imp:{cfg.get('user_id', '')}:{cfg.get('impersonated_service_account', '')}"
+        active_uid = get_current_tenant_user()
+        if not isinstance(active_uid, str) or not _is_authenticated_email_identity(active_uid):
+            return None
+        uid = normalize_user_id(active_uid)
+
+        cfg = get_gcp_connection_config(mask_token=True, user_id=uid)
+        if not isinstance(cfg, Mapping):
+            return None
+        cfg_uid = cfg.get("user_id")
+        if not isinstance(cfg_uid, str) or not cfg_uid.strip() or normalize_user_id(cfg_uid) != uid:
+            return None
+
+        mode = str(cfg.get("mode") or "").strip().lower()
         if mode == "access_token":
-            return f"tok:{cfg.get('user_id', '')}:{cfg.get('access_token_preview', '')}"
-        if mode == "adc" and cfg.get("adc_authorized"):
-            return f"adc:{cfg.get('user_id', '')}"
+            creds = (client_kwargs or {}).get("credentials")
+            raw_tok = getattr(creds, "token", None)
+            if not isinstance(raw_tok, str) or not raw_tok.strip():
+                loaded = credential_service.get_active_credential_service().load_delegated_token(
+                    user_id=uid, caller_user_id=uid
+                )
+                raw_tok = loaded.access_token if loaded is not None else ""
+            if not isinstance(raw_tok, str) or not raw_tok.strip():
+                return None
+            cred_part = f"tok:{hashlib.sha256(raw_tok.strip().encode('utf-8')).hexdigest()[:32]}"
+        elif mode == "impersonation":
+            sa_email = str(cfg.get("impersonated_service_account") or "").strip().lower()
+            if not sa_email:
+                return None
+            cred_part = f"imp:{hashlib.sha256(sa_email.encode('utf-8')).hexdigest()[:24]}"
+        elif mode == "adc" and cfg.get("adc_authorized") is True:
+            cred_part = "adc"
+        else:
+            return None
+
+        authz_scope = cfg.get("authorized_scope")
+        if not isinstance(authz_scope, Mapping):
+            return None
+        scope_sig = hashlib.sha256(
+            json.dumps(
+                {
+                    "organizations": sorted(str(x) for x in (authz_scope.get("organizations") or ())),
+                    "projects": sorted(str(x) for x in (authz_scope.get("projects") or ())),
+                    "folders": sorted(str(x) for x in (authz_scope.get("folders") or ())),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+        return f"live:{uid}:{cred_part}:{scope_sig}"
     except Exception:
-        pass
-    return "unconfigured"
+        return None
 
 
-def _cache_get(key: str) -> Optional[str]:
-    scoped_key = f"{_cache_scope_prefix()}:{key}"
-    cached = _SCAN_CACHE.get(scoped_key)
-    if cached and (time.monotonic() - cached[0]) < _CACHE_TTL_SECONDS:
-        return cached[1]
+def _cache_scope_prefix(
+    *,
+    simulated: bool = False,
+    client_kwargs: Optional[Mapping[str, Any]] = None,
+) -> Optional[str]:
+    """Returns a strictly segregated cache prefix (`sim` for simulated demo data, or fail-closed live partition)."""
+    if simulated:
+        return "sim"
+    return _live_cache_partition(client_kwargs=client_kwargs)
+
+
+def _cache_get(
+    key: str,
+    *,
+    simulated: bool = False,
+    client_kwargs: Optional[Mapping[str, Any]] = None,
+) -> Optional[str]:
+    prefix = _cache_scope_prefix(simulated=simulated, client_kwargs=client_kwargs)
+    if not prefix:
+        return None
+    scoped_key = f"{prefix}:{key}"
+    with _SCAN_CACHE_LOCK:
+        cached = _SCAN_CACHE.get(scoped_key)
+        if cached and (time.monotonic() - cached[0]) < _CACHE_TTL_SECONDS:
+            return cached[1]
     return None
 
 
-def _cache_put(key: str, value: str) -> str:
-    scoped_key = f"{_cache_scope_prefix()}:{key}"
-    _SCAN_CACHE[scoped_key] = (time.monotonic(), value)
+def _cache_put(
+    key: str,
+    value: str,
+    *,
+    simulated: bool = False,
+    client_kwargs: Optional[Mapping[str, Any]] = None,
+) -> str:
+    prefix = _cache_scope_prefix(simulated=simulated, client_kwargs=client_kwargs)
+    if not prefix:
+        return value
+    scoped_key = f"{prefix}:{key}"
+    with _SCAN_CACHE_LOCK:
+        _SCAN_CACHE[scoped_key] = (time.monotonic(), value)
     return value
 
 
@@ -262,36 +346,32 @@ def _is_internal_runtime_tenant_project(proj_id: str) -> bool:
 def _active_tenant_default_scope() -> Tuple[str, str, str]:
     """Resolves the active tenant's server-bound default `(mode, scope_uri, clean_id)` with fail-closed semantics.
 
-    - Identity resolution failure (import/context error, empty/non-string identity, or malformed email identity):
-      logs a sanitized diagnostic and fails closed with `("UNBOUND", "", "")` (never classified as unauthenticated).
-    - Authenticated tenant identity: resolves exclusively from that tenant's authorized server-side connection
-      (`organizations/<id>`, `projects/<id>`, or `folders/<id>`). If the connection lookup raises an exception,
-      returns malformed data, belongs to a different tenant, or has no bound scope, logs a sanitized diagnostic
-      (without tokens, credentials, or sensitive tenant data) and returns `("UNBOUND", "", "")`.
-      NEVER substitutes `DEFAULT_ORGANIZATION_ID`.
-    - Positively established unauthenticated CLI/test context (valid non-email placeholder identity such as
-      `DEFAULT_TENANT_USER_ID` or `"default"`): preserves legacy `DEFAULT_ORGANIZATION_ID` for offline CLI/unit helpers.
+    - Explicit execution-context classification via `tools.gcloud_bridge.classify_execution_context()`:
+      * `"authenticated"`: resolves exclusively from that tenant's authorized server-side connection
+        (`organizations/<id>`, `projects/<id>`, or `folders/<id>`), requiring a valid non-empty `user_id`
+        ownership binding matching the active tenant. Any lookup exception, malformed payload/field,
+        missing/mismatched `user_id`, or missing bound scope logs a sanitized diagnostic (without tokens,
+        credentials, or tenant emails) and returns `("UNBOUND", "", "")`. NEVER substitutes `DEFAULT_ORGANIZATION_ID`.
+      * `"unauthenticated_cli"`: ONLY non-production, non-HTTP CLI/unit-test execution with an explicit
+        placeholder in `UNAUTHENTICATED_CLI_IDENTITIES` (`sec-architect`, `default`); preserves legacy
+        `DEFAULT_ORGANIZATION_ID` for offline CLI/unit helpers (live collectors still deny via `authorize_gcp_scope`).
+      * `"invalid"` or any exception (arbitrary non-email strings, unauthenticated HTTP requests, malformed
+        identities, production unauthenticated contexts, or identity-provider errors): logs a sanitized diagnostic
+        and fails closed as `("UNBOUND", "", "")`.
     """
     try:
         from tools.gcloud_bridge import (
-            _is_authenticated_email_identity,
+            EXECUTION_CONTEXT_AUTHENTICATED,
+            EXECUTION_CONTEXT_UNAUTHENTICATED_CLI,
             _validate_numeric_id_value,
             _validate_project_value,
             _validate_scope_value,
-            get_current_tenant_user,
+            classify_execution_context,
             get_gcp_connection_config,
             normalize_user_id,
         )
 
-        active_uid = get_current_tenant_user()
-        if not isinstance(active_uid, str) or not active_uid.strip():
-            logger.warning(
-                "Tenant identity lookup returned empty or non-string identity (%s) during scope resolution; "
-                "failing closed as UNBOUND.",
-                type(active_uid).__name__,
-            )
-            return ("UNBOUND", "", "")
-        is_authenticated = _is_authenticated_email_identity(active_uid)
+        ctx_kind, norm_active_uid = classify_execution_context()
     except Exception as exc:
         logger.warning(
             "Tenant identity lookup failed during scope resolution; failing closed as UNBOUND (%s).",
@@ -299,16 +379,17 @@ def _active_tenant_default_scope() -> Tuple[str, str, str]:
         )
         return ("UNBOUND", "", "")
 
-    if not is_authenticated:
-        if "@" in active_uid:
-            logger.warning(
-                "Malformed tenant email identity encountered during scope resolution; failing closed as UNBOUND."
-            )
-            return ("UNBOUND", "", "")
+    if ctx_kind == EXECUTION_CONTEXT_UNAUTHENTICATED_CLI:
         return ("ORG", f"organizations/{DEFAULT_ORGANIZATION_ID}", DEFAULT_ORGANIZATION_ID)
 
+    if ctx_kind != EXECUTION_CONTEXT_AUTHENTICATED or not norm_active_uid:
+        logger.warning(
+            "Execution context is unverified or malformed (%s) during scope resolution; failing closed as UNBOUND.",
+            ctx_kind,
+        )
+        return ("UNBOUND", "", "")
+
     try:
-        norm_active_uid = normalize_user_id(active_uid)
         conn = get_gcp_connection_config(mask_token=True, user_id=norm_active_uid)
     except Exception as exc:
         logger.warning(
@@ -325,12 +406,11 @@ def _active_tenant_default_scope() -> Tuple[str, str, str]:
         return ("UNBOUND", "", "")
 
     conn_uid = conn.get("user_id")
-    if conn_uid is not None:
-        if not isinstance(conn_uid, str) or normalize_user_id(conn_uid) != norm_active_uid:
-            logger.warning(
-                "Authorized tenant connection lookup returned mismatched tenant context; failing closed as UNBOUND."
-            )
-            return ("UNBOUND", "", "")
+    if not isinstance(conn_uid, str) or not conn_uid.strip() or normalize_user_id(conn_uid) != norm_active_uid:
+        logger.warning(
+            "Authorized tenant connection lookup missing or mismatched tenant ownership binding; failing closed as UNBOUND."
+        )
+        return ("UNBOUND", "", "")
 
     raw_org = conn.get("organization_id")
     if raw_org is not None and not isinstance(raw_org, str):
@@ -895,7 +975,7 @@ def collect_kms_inventory(
     cache_key = f"kms:{scope_uri}:{loc.lower()}:{simulated}"
 
     if simulated:
-        cached = _cache_get(cache_key)
+        cached = _cache_get(cache_key, simulated=True)
         if cached:
             return cached
         keys = [
@@ -915,14 +995,14 @@ def collect_kms_inventory(
             "collection_errors": [],
             "excluded_key_rings": [],
         }
-        return _cache_put(cache_key, _compact_json(payload))
+        return _cache_put(cache_key, _compact_json(payload), simulated=True)
 
     errors: List[str] = []
     skipped: List[str] = []
     keys: List[Dict[str, Any]] = []
     try:
         client_kwargs = _get_client_kwargs(scope_uri=scope_uri)
-        cached = _cache_get(cache_key)
+        cached = _cache_get(cache_key, client_kwargs=client_kwargs)
         if cached:
             return cached
         client = kms_v1.KeyManagementServiceClient(**client_kwargs)
@@ -973,7 +1053,7 @@ def collect_kms_inventory(
         payload["error"] = "No keys could be read; see collection_errors."
         payload["required_roles"] = REQUIRED_READ_ROLES
         return _compact_json(payload)
-    return _cache_put(cache_key, _compact_json(payload))
+    return _cache_put(cache_key, _compact_json(payload), client_kwargs=client_kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -1046,17 +1126,17 @@ def collect_workload_evidence(scope: str = f"organizations/{DEFAULT_ORGANIZATION
     cache_key = f"workloads:{scope_uri}:{simulated}"
 
     if simulated:
-        cached = _cache_get(cache_key)
+        cached = _cache_get(cache_key, simulated=True)
         if cached:
             return cached
         raw = mock_data.get_simulated_workload_evidence(clean_id)["workloads"]
         payload = _build_workload_evidence_payload(mode, scope_uri, raw, SIMULATED_DATA_SOURCE, [])
-        return _cache_put(cache_key, _compact_json(payload))
+        return _cache_put(cache_key, _compact_json(payload), simulated=True)
 
     raw_workloads: List[Dict[str, Any]] = []
     try:
         client_kwargs = _get_client_kwargs(scope_uri=scope_uri)
-        cached = _cache_get(cache_key)
+        cached = _cache_get(cache_key, client_kwargs=client_kwargs)
         if cached:
             return cached
         cai_client = asset_v1.AssetServiceClient(**client_kwargs)
@@ -1096,7 +1176,7 @@ def collect_workload_evidence(scope: str = f"organizations/{DEFAULT_ORGANIZATION
         )
 
     payload = _build_workload_evidence_payload(mode, scope_uri, raw_workloads, LIVE_DATA_SOURCE, [])
-    return _cache_put(cache_key, _compact_json(payload))
+    return _cache_put(cache_key, _compact_json(payload), client_kwargs=client_kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -1136,7 +1216,7 @@ def discover_all_crypto_assets(scope: str = f"organizations/{DEFAULT_ORGANIZATIO
     cache_key = f"cai-crypto:{scope_uri}:{simulated}"
 
     if simulated:
-        cached = _cache_get(cache_key)
+        cached = _cache_get(cache_key, simulated=True)
         if cached:
             return cached
         payload = {
@@ -1148,12 +1228,12 @@ def discover_all_crypto_assets(scope: str = f"organizations/{DEFAULT_ORGANIZATIO
             "assets": mock_data.get_simulated_cai_crypto_assets(clean_id),
         }
         payload["asset_count"] = len(payload["assets"])
-        return _cache_put(cache_key, _compact_json(payload))
+        return _cache_put(cache_key, _compact_json(payload), simulated=True)
 
     assets: List[Dict[str, Any]] = []
     try:
         client_kwargs = _get_client_kwargs(scope_uri=scope_uri)
-        cached = _cache_get(cache_key)
+        cached = _cache_get(cache_key, client_kwargs=client_kwargs)
         if cached:
             return cached
         cai_client = asset_v1.AssetServiceClient(**client_kwargs)
@@ -1203,7 +1283,7 @@ def discover_all_crypto_assets(scope: str = f"organizations/{DEFAULT_ORGANIZATIO
         "asset_count": len(assets),
         "assets": assets,
     }
-    return _cache_put(cache_key, _compact_json(payload))
+    return _cache_put(cache_key, _compact_json(payload), client_kwargs=client_kwargs)
 
 
 # ---------------------------------------------------------------------------

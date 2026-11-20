@@ -1056,8 +1056,9 @@ def test_10_no_sdk_client_creation_on_any_denied_request(
                 for res in _run_all_collectors(bad_scope).values():
                     assert "UNAUTHORIZED_RESOURCE_SCOPE" in res["error"]
 
-            # 4. Standalone Compute SSL policy helper on unauthorized project -> returns None, 0 SDK clients
-            assert pqc_detectors._fetch_compute_pq_key_exchange("victim-proj-99", "global", "ssl-pol") is None
+            # 4. Standalone Compute SSL policy helper on unauthorized project -> fails closed with PermissionError, 0 SDK clients
+            with pytest.raises(PermissionError, match="UNAUTHORIZED_RESOURCE_SCOPE"):
+                pqc_detectors._fetch_compute_pq_key_exchange("victim-proj-99", "global", "ssl-pol")
 
         assert tripwire_hits == []
     finally:

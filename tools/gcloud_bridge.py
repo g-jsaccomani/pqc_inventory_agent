@@ -42,8 +42,16 @@ from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequ
 logger = logging.getLogger(__name__)
 
 DEFAULT_TENANT_USER_ID = "sec-architect"
+UNAUTHENTICATED_CLI_IDENTITIES: FrozenSet[str] = frozenset({DEFAULT_TENANT_USER_ID, "default"})
+EXECUTION_CONTEXT_UNAUTHENTICATED_CLI = "unauthenticated_cli"
+EXECUTION_CONTEXT_AUTHENTICATED = "authenticated"
+EXECUTION_CONTEXT_UNVERIFIED = "unverified"
+
 _CURRENT_USER_ID: contextvars.ContextVar[str] = contextvars.ContextVar(
     "pqc_current_user_id", default=DEFAULT_TENANT_USER_ID
+)
+_CURRENT_EXECUTION_CONTEXT: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "pqc_execution_context", default=EXECUTION_CONTEXT_UNAUTHENTICATED_CLI
 )
 
 
@@ -61,10 +69,32 @@ def normalize_user_id(user_id: Optional[str]) -> str:
     return cleaned
 
 
+def _is_authenticated_email_identity(user_id: Optional[str]) -> bool:
+    if not isinstance(user_id, str):
+        return False
+    norm = normalize_user_id(user_id)
+    if not norm or norm in UNAUTHENTICATED_CLI_IDENTITIES or norm.count("@") != 1:
+        return False
+    if any(ch.isspace() for ch in norm):
+        return False
+    local_part, _, domain = norm.rpartition("@")
+    return bool(local_part and domain)
+
+
 def set_current_tenant_user(user_id: Optional[str]) -> str:
-    """Sets the active tenant user ID in the current async/thread execution context."""
+    """Sets the active tenant user ID and explicit execution-context classification in the current async/thread context."""
+    if user_id is None or (isinstance(user_id, str) and not user_id.strip()):
+        _CURRENT_USER_ID.set(DEFAULT_TENANT_USER_ID)
+        _CURRENT_EXECUTION_CONTEXT.set(EXECUTION_CONTEXT_UNAUTHENTICATED_CLI)
+        return DEFAULT_TENANT_USER_ID
     norm = normalize_user_id(user_id)
     _CURRENT_USER_ID.set(norm)
+    if _is_authenticated_email_identity(norm):
+        _CURRENT_EXECUTION_CONTEXT.set(EXECUTION_CONTEXT_AUTHENTICATED)
+    elif norm in UNAUTHENTICATED_CLI_IDENTITIES:
+        _CURRENT_EXECUTION_CONTEXT.set(EXECUTION_CONTEXT_UNAUTHENTICATED_CLI)
+    else:
+        _CURRENT_EXECUTION_CONTEXT.set(EXECUTION_CONTEXT_UNVERIFIED)
     return norm
 
 
@@ -73,12 +103,45 @@ def get_current_tenant_user() -> str:
     return normalize_user_id(_CURRENT_USER_ID.get())
 
 
-def _is_authenticated_email_identity(user_id: Optional[str]) -> bool:
-    norm = normalize_user_id(user_id)
-    if not norm or norm == DEFAULT_TENANT_USER_ID or "@" not in norm:
-        return False
-    local_part, _, domain = norm.rpartition("@")
-    return bool(local_part and domain)
+def enter_http_request_tenant_context() -> Tuple[contextvars.Token[str], contextvars.Token[str]]:
+    """Initializes an isolated, unverified HTTP/WebSocket request tenant context (prevents cross-request bleed and
+    prevents unauthenticated HTTP requests from being classified as unauthenticated CLI/test helpers)."""
+    uid_tok = _CURRENT_USER_ID.set(DEFAULT_TENANT_USER_ID)
+    ctx_tok = _CURRENT_EXECUTION_CONTEXT.set(EXECUTION_CONTEXT_UNVERIFIED)
+    return (uid_tok, ctx_tok)
+
+
+def exit_http_request_tenant_context(tokens: Tuple[contextvars.Token[str], contextvars.Token[str]]) -> None:
+    """Restores the outer tenant identity and execution-context tokens when an HTTP/WebSocket request finishes."""
+    uid_tok, ctx_tok = tokens
+    _CURRENT_EXECUTION_CONTEXT.reset(ctx_tok)
+    _CURRENT_USER_ID.reset(uid_tok)
+
+
+def classify_execution_context() -> Tuple[str, str]:
+    """Classifies the current execution context strictly into one of:
+
+    - ``("authenticated", normalized_email)``: verified corporate email identity.
+    - ``("unauthenticated_cli", placeholder_id)``: ONLY in non-production, non-HTTP CLI/test execution where
+      the active identity is explicitly in ``UNAUTHENTICATED_CLI_IDENTITIES`` (``sec-architect`` or ``default``)
+      and the explicit execution context is ``unauthenticated_cli``.
+    - ``("invalid", "")``: arbitrary non-email strings, unauthenticated HTTP requests, malformed identities,
+      production unauthenticated contexts, or any identity lookup failure (all fail closed).
+    """
+    from pqc_agent import auth_guard
+
+    active_uid = get_current_tenant_user()
+    if not isinstance(active_uid, str) or not active_uid.strip():
+        return ("invalid", "")
+    if _is_authenticated_email_identity(active_uid):
+        return (EXECUTION_CONTEXT_AUTHENTICATED, normalize_user_id(active_uid))
+    if (
+        not auth_guard.is_production_environment()
+        and _CURRENT_EXECUTION_CONTEXT.get() == EXECUTION_CONTEXT_UNAUTHENTICATED_CLI
+        and active_uid.strip() in UNAUTHENTICATED_CLI_IDENTITIES
+    ):
+        return (EXECUTION_CONTEXT_UNAUTHENTICATED_CLI, active_uid.strip())
+    return ("invalid", "")
 
 
 def is_adc_authorized_user(user_id: Optional[str]) -> bool:
@@ -1313,6 +1376,7 @@ def get_gcp_connection_config(mask_token: bool = True, user_id: Optional[str] = 
             uid,
             {
                 **state,
+                "user_id": uid,
                 "mode": mode,
                 "organization_id": effective_org,
                 "project_id": effective_proj,
@@ -1748,6 +1812,17 @@ def resolve_authorized_tenant_scope(
     if not _is_authenticated_email_identity(norm_uid):
         raise PermissionError("Unauthenticated identity has no authorized GCP resource scope.")
 
+    if not isinstance(conn_cfg, Mapping):
+        raise PermissionError(
+            "UNAUTHORIZED_RESOURCE_SCOPE (MISSING_AUTHORIZED_SCOPE): "
+            "Authorized tenant connection configuration is unavailable or malformed."
+        )
+    raw_conn_uid = conn_cfg.get("user_id")
+    if not isinstance(raw_conn_uid, str) or not raw_conn_uid.strip() or normalize_user_id(raw_conn_uid) != norm_uid:
+        raise PermissionError(
+            "UNAUTHORIZED_RESOURCE_SCOPE: Tenant connection ownership binding (user_id) is missing or mismatched."
+        )
+
     server_policy = _load_server_scope_policy(norm_uid)
 
     if server_policy.has_any_restriction:
@@ -1819,8 +1894,10 @@ def authorize_gcp_scope(
             "Authorized tenant connection configuration is unavailable or malformed."
         )
     conn_uid = effective_conn.get("user_id")
-    if conn_uid is not None and (not isinstance(conn_uid, str) or normalize_user_id(conn_uid) != uid):
-        raise PermissionError("UNAUTHORIZED_RESOURCE_SCOPE: Tenant connection context mismatch denied.")
+    if not isinstance(conn_uid, str) or not conn_uid.strip() or normalize_user_id(conn_uid) != uid:
+        raise PermissionError(
+            "UNAUTHORIZED_RESOURCE_SCOPE: Tenant connection ownership binding (user_id) is missing or mismatched."
+        )
     if str(effective_conn.get("mode") or "").strip().lower() == "adc":
         authorize_adc_mode(uid)
 

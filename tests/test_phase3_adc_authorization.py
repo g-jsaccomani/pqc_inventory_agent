@@ -379,15 +379,28 @@ def test_06_automatic_adc_activation_through_api_chat_and_auth_paths_is_rejected
             fake_tool_ctx.load_credential = _no_cred
             fake_tool_ctx.save_credential = _no_cred
 
-            gate = asyncio.run(
+            # 4a. Unbound foreign/default org scope fails closed with SCOPE_AUTHORIZATION_DENIED (never switches to ADC)
+            gate_unbound = asyncio.run(
                 plugin.before_tool_callback(
                     tool=fake_tool,
                     tool_args={"scope": "organizations/31564119954"},
                     tool_context=fake_tool_ctx,
                 )
             )
-            assert gate is not None
-            assert gate["status"] == "OAUTH_3LO_CONSENT_REQUIRED"
+            assert gate_unbound is not None
+            assert gate_unbound["status"] == "SCOPE_AUTHORIZATION_DENIED"
+            assert gcloud_bridge.get_gcp_connection_config(user_id="external@google.com")["mode"] == "access_token"
+
+            # 4b. Explicit demo scope with empty 3LO token emits OAUTH_3LO_CONSENT_REQUIRED (never switches to ADC)
+            gate_demo = asyncio.run(
+                plugin.before_tool_callback(
+                    tool=fake_tool,
+                    tool_args={"scope": "demo-pqc-project"},
+                    tool_context=fake_tool_ctx,
+                )
+            )
+            assert gate_demo is not None
+            assert gate_demo["status"] == "OAUTH_3LO_CONSENT_REQUIRED"
             assert gcloud_bridge.get_gcp_connection_config(user_id="external@google.com")["mode"] == "access_token"
     finally:
         credential_service.reset_active_credential_service(tok_cred)

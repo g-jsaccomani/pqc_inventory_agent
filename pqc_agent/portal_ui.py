@@ -1693,7 +1693,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     <!-- Bottom Connection Card (#2c2c2c) -->
     <div class="sidebar-info-card" onclick="openGcloudModal()">
       <strong>GCP / gcloud Connection</strong>
-      <span id="sidebar-conn-summary">Org 31564119954 • <span id="conn-status-dot" style="color:var(--gemini-link);">ADC</span></span>
+      <span id="sidebar-conn-summary">Scope Unbound • <span id="conn-status-dot" style="color:var(--gemini-link);">OAuth 3LO</span></span>
     </div>
 
     <div class="sidebar-bottom-bar">
@@ -1973,13 +1973,13 @@ PORTAL_HTML = r"""<!DOCTYPE html>
           </div>
           <div class="conn-field">
             <label for="conn-org-input">Organization ID</label>
-            <input type="text" id="conn-org-input" value="31564119954" />
+            <input type="text" id="conn-org-input" value="" placeholder="Server-bound or customer organization ID" />
           </div>
         </div>
 
         <div class="conn-field">
           <label for="conn-proj-input">Project ID</label>
-          <input type="text" id="conn-proj-input" value="pqc-inventory-agent-cd06" />
+          <input type="text" id="conn-proj-input" value="" placeholder="Server-bound or customer project ID" />
         </div>
 
         <div class="conn-field" id="conn-sa-group" style="display: none;">
@@ -2006,7 +2006,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
         <div class="conn-field">
           <label for="gcloud-cmd-input">Read-Only gcloud CLI</label>
           <div class="gcloud-input-bar">
-            <input type="text" id="gcloud-cmd-input" value="gcloud kms keys list --location=global --project=pqc-inventory-agent-cd06" />
+            <input type="text" id="gcloud-cmd-input" value="" placeholder="gcloud kms keys list --location=global --project=&lt;your-project-id&gt;" />
             <button class="btn-modal-primary" onclick="runDirectGcloudCommand()">Run</button>
           </div>
         </div>
@@ -3028,8 +3028,19 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       document.getElementById("conn-token-group").style.display = mode === "access_token" ? "flex" : "none";
     }
 
+    let currentActiveScopeUri = "";
+
+    function getActiveTenantScopeUri() {
+      const orgRaw = (document.getElementById("conn-org-input").value || "").trim().replace(/^organizations\//i, "");
+      if (orgRaw) return `organizations/${orgRaw}`;
+      const projRaw = (document.getElementById("conn-proj-input").value || "").trim().replace(/^projects\//i, "");
+      if (projRaw) return `projects/${projRaw}`;
+      return (currentActiveScopeUri || "").trim();
+    }
+
     function applyConnectionConfigToUI(cfg) {
       if (!cfg) return;
+      currentActiveScopeUri = (cfg.active_scope_uri || "").trim();
       document.getElementById("conn-mode-select").value = cfg.mode || "access_token";
       document.getElementById("conn-org-input").value = cfg.organization_id || "";
       document.getElementById("conn-proj-input").value = cfg.project_id || "";
@@ -3053,19 +3064,25 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     }
 
     function updateHeaderConnectionBadge(cfg) {
+      if (cfg && typeof cfg.active_scope_uri === "string") {
+        currentActiveScopeUri = cfg.active_scope_uri.trim();
+      }
       let modeShort = "ADC";
       if (cfg.mode === "impersonation") {
         modeShort = "Impersonated SA";
       } else if (cfg.mode === "access_token") {
         modeShort = cfg.has_access_token ? "OAuth 3LO ✓" : "OAuth 3LO (Consent On-Demand)";
       }
+      const scopeLabel = cfg.organization_id
+        ? `Org ${cfg.organization_id}`
+        : (cfg.project_id ? `Project ${cfg.project_id}` : (currentActiveScopeUri || "Scope Unbound"));
       const headerConnEl = document.getElementById("header-conn-text");
       if (headerConnEl) {
-        headerConnEl.textContent = `Org ${cfg.organization_id} • ${modeShort}`;
+        headerConnEl.textContent = `${scopeLabel} • ${modeShort}`;
       }
       const sidebarSummary = document.getElementById("sidebar-conn-summary");
       if (sidebarSummary) {
-        sidebarSummary.innerHTML = `Org ${escapeHtml(cfg.organization_id)} • <span id="conn-status-dot" style="color:var(--gemini-link);">${escapeHtml(modeShort)}</span>`;
+        sidebarSummary.innerHTML = `${escapeHtml(scopeLabel)} • <span id="conn-status-dot" style="color:var(--gemini-link);">${escapeHtml(modeShort)}</span>`;
       }
     }
 
@@ -3087,7 +3104,7 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       });
       if (res.ok) {
         const updated = await res.json();
-        updateHeaderConnectionBadge(updated);
+        applyConnectionConfigToUI(updated);
         closeGcloudModal();
       }
     }
@@ -3098,8 +3115,9 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     function openOAuth3LOPopup(customAuthUri, cardDomId, resumePrompt) {
       if (cardDomId) activeOAuthConsentCardId = cardDomId;
       if (resumePrompt) activeOAuthResumePrompt = resumePrompt;
-      const orgId = (document.getElementById("conn-org-input").value || "31564119954").trim();
-      const targetUri = customAuthUri || `/api/auth/oauth/authorize?session_id=${encodeURIComponent(currentSessionId || "")}&scope=${encodeURIComponent("organizations/" + orgId.replace("organizations/", ""))}`;
+      const activeScope = getActiveTenantScopeUri();
+      const scopeQuery = activeScope ? `&scope=${encodeURIComponent(activeScope)}` : "";
+      const targetUri = customAuthUri || `/api/auth/oauth/authorize?session_id=${encodeURIComponent(currentSessionId || "")}${scopeQuery}`;
       const w = 520, h = 640;
       const left = Math.max(0, Math.round((window.screen.width - w) / 2));
       const top = Math.max(0, Math.round((window.screen.height - h) / 2));
@@ -3249,10 +3267,11 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     function buildOAuthConsentCardHtml(consentCard, cardDomId) {
       if (!consentCard) return "";
       const toolName = consentCard.tool_name || "collect_kms_inventory";
-      const targetScope = consentCard.target_scope || "organizations/31564119954";
-      const authUri = consentCard.auth_uri || `/api/auth/oauth/authorize?session_id=${encodeURIComponent(currentSessionId || "")}&scope=${encodeURIComponent(targetScope)}`;
+      const targetScope = consentCard.target_scope || getActiveTenantScopeUri();
+      const scopeQuery = targetScope ? `&scope=${encodeURIComponent(targetScope)}` : "";
+      const authUri = consentCard.auth_uri || `/api/auth/oauth/authorize?session_id=${encodeURIComponent(currentSessionId || "")}${scopeQuery}`;
       const scopes = consentCard.scopes || ["openid", "email", "profile", "https://www.googleapis.com/auth/cloud-platform.read-only"];
-      const resumePrompt = consentCard.original_prompt || `Please continue executing ${toolName} on ${targetScope}.`;
+      const resumePrompt = consentCard.original_prompt || `Please continue executing ${toolName} on ${targetScope || "my authorized GCP scope"}.`;
       const isAuthorized = consentCard.status === "AUTHORIZED";
 
       return `
@@ -3352,16 +3371,17 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     }
 
     async function createNewSession(customTitle) {
-      const orgId = document.getElementById("conn-org-input").value.trim() || "31564119954";
+      const activeScope = getActiveTenantScopeUri();
       const sessionTitle = (typeof customTitle === "string" && customTitle.trim()) ? customTitle.trim() : "New PQC Assessment";
+      const bodyPayload = { title: sessionTitle };
+      if (activeScope) {
+        bodyPayload.scope = activeScope;
+      }
       const res = await fetch("/api/sessions", {
         method: "POST",
         credentials: "same-origin",
         headers: getAuthHeaders({ "Content-Type": "application/json" }),
-        body: JSON.stringify({
-          title: sessionTitle,
-          scope: `organizations/${orgId.replace("organizations/", "")}`,
-        }),
+        body: JSON.stringify(bodyPayload),
       });
       if (res.ok) {
         const created = await res.json();
@@ -3567,12 +3587,12 @@ PORTAL_HTML = r"""<!DOCTYPE html>
 
     function downloadMarkdownReport(msgId) {
       const md = assistantResponsesStore[msgId] || "";
-      const orgId = document.getElementById("conn-org-input").value.trim() || "31564119954";
+      const activeScope = (getActiveTenantScopeUri() || "report").replace(/[^a-zA-Z0-9._-]+/g, "_");
       const blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `PQC_Assessment_${orgId}.md`;
+      a.download = `PQC_Assessment_${activeScope}.md`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
@@ -3590,8 +3610,8 @@ PORTAL_HTML = r"""<!DOCTYPE html>
     async function runLabPrompt(index) {
       const template = LAB_PROMPTS[index];
       if (!template) return;
-      const orgId = (document.getElementById("conn-org-input").value.trim() || "31564119954").replace("organizations/", "");
-      const promptText = template.split("{ORG}").join(`organizations/${orgId}`);
+      const activeScope = getActiveTenantScopeUri() || "my authorized GCP scope";
+      const promptText = template.split("{ORG}").join(activeScope);
       await createNewSession(PHASE_TITLES[index] || "New PQC Assessment");
       document.getElementById("chat-input").value = promptText;
       await sendChatMessage({ isPhaseScan: true });
@@ -3622,8 +3642,10 @@ PORTAL_HTML = r"""<!DOCTYPE html>
       if (currentSessionId) {
         formData.append("session_id", currentSessionId);
       }
-      const orgId = document.getElementById("conn-org-input").value.trim() || "31564119954";
-      formData.append("scope", `organizations/${orgId.replace("organizations/", "")}`);
+      const activeScope = getActiveTenantScopeUri();
+      if (activeScope) {
+        formData.append("scope", activeScope);
+      }
       formData.append("connection_mode", document.getElementById("conn-mode-select").value);
       formData.append("impersonated_sa", document.getElementById("conn-sa-input").value.trim());
       const tok = document.getElementById("conn-token-input").value.trim();

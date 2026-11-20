@@ -63,10 +63,13 @@ from pqc_agent.telemetry import LlmCallTelemetryPlugin, capture_llm_calls, summa
 from tools.calibration_engine import register_uploaded_artifact_for_analysis
 from tools.gcloud_bridge import (
     TRUSTED_SUBPROCESS_PATH,
+    _is_authenticated_email_identity,
     authorize_adc_mode,
     authorize_gcp_scope,
     clear_user_access_token,
+    enter_http_request_tenant_context,
     execute_gcloud_command,
+    exit_http_request_tenant_context,
     get_gcp_connection_config,
     get_recent_gcloud_traces,
     normalize_connection_mode,
@@ -932,11 +935,13 @@ def build_oauth_authorize_uri(
     redirect_uri: Optional[str] = None,
 ) -> str:
     """Builds the 3-Legged OAuth (3LO) authorization URI for the user/session."""
-    params = {
+    params: Dict[str, str] = {
         "user_id": normalize_user_id(user_id),
         "session_id": session_id or "",
-        "scope": target_scope or "organizations/31564119954",
     }
+    clean_scope = str(target_scope or "").strip()
+    if clean_scope:
+        params["scope"] = clean_scope
     if redirect_uri:
         params["redirect_uri"] = redirect_uri
     return f"/api/auth/oauth/authorize?{urllib.parse.urlencode(params)}"
@@ -995,6 +1000,8 @@ def _resolve_and_authorize_request_scope(
     active_uri = str(conn.get("active_scope_uri") or "").strip()
     raw = str(requested_scope or "").strip()
     if not raw:
+        if not active_uri and not allow_unbound_non_scan:
+            return authorize_gcp_scope("", user_id=uid)
         return active_uri
 
     _, scope_uri, clean_id = _resolve_scope(raw)
@@ -1045,20 +1052,36 @@ class PqcOAuth3LOPlugin(BasePlugin):
         if tool.name not in PROTECTED_GCP_TOOLS:
             return None
 
+        if not _is_authenticated_email_identity(uid):
+            return {
+                "status": "SCOPE_AUTHORIZATION_DENIED",
+                "scope": str((tool_args or {}).get("scope") or (tool_args or {}).get("project_id") or ""),
+                "error": (
+                    "UNAUTHENTICATED_EXECUTION_CONTEXT: An authenticated tenant user identity is required "
+                    f"before invoking protected tool '{tool.name}'."
+                ),
+            }
+
         conn = get_gcp_connection_config(mask_token=False, user_id=uid)
         raw_tool_scope = (tool_args or {}).get("scope") or (tool_args or {}).get("project_id")
-        if raw_tool_scope and tool.name != "execute_gcloud_command":
+        resolved_tool_scope = ""
+        if tool.name != "execute_gcloud_command":
             try:
-                _resolve_and_authorize_request_scope(uid, str(raw_tool_scope), allow_unbound_non_scan=True)
+                resolved_tool_scope = _resolve_and_authorize_request_scope(
+                    uid,
+                    str(raw_tool_scope) if raw_tool_scope is not None else None,
+                    allow_unbound_non_scan=False,
+                )
             except PermissionError as scope_err:
                 return {
                     "status": "SCOPE_AUTHORIZATION_DENIED",
-                    "scope": str(raw_tool_scope),
+                    "scope": str(raw_tool_scope or ""),
                     "error": str(scope_err),
                 }
 
         target_scope = str(
-            raw_tool_scope
+            resolved_tool_scope
+            or raw_tool_scope
             or (tool_args or {}).get("command")
             or conn.get("active_scope_uri")
             or ""
@@ -1698,9 +1721,11 @@ def create_workspace_app(
                 return
             store_tok = auth_store.set_active_auth_store(self._store)
             cred_tok = credential_service.set_active_credential_service(self._cred_svc)
+            tenant_tokens = enter_http_request_tenant_context()
             try:
                 await self.app(scope, receive, send)
             finally:
+                exit_http_request_tenant_context(tenant_tokens)
                 credential_service.reset_active_credential_service(cred_tok)
                 auth_store.reset_active_auth_store(store_tok)
 
@@ -1727,34 +1752,6 @@ def create_workspace_app(
         verify_models_on_startup = os.getenv("PQC_MODEL_VERIFICATION_ON_STARTUP", "true").strip().lower() == "true"
     if verify_models_on_startup:
         registry_obj.start_background_verification()
-
-        def _warm_inventory_cache() -> None:
-            try:
-                from tools.gcp_inventory import (
-                    DEFAULT_ORGANIZATION_ID,
-                    collect_kms_inventory,
-                    collect_workload_evidence,
-                    compute_pqc_scorecard,
-                    discover_all_crypto_assets,
-                )
-                from tools.pqc_detectors import collect_kms_import_jobs, collect_tls_policies
-
-                default_scope = f"organizations/{DEFAULT_ORGANIZATION_ID}"
-                with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
-                    futs = [
-                        pool.submit(collect_kms_inventory, default_scope),
-                        pool.submit(collect_workload_evidence, default_scope),
-                        pool.submit(collect_tls_policies, default_scope),
-                        pool.submit(collect_kms_import_jobs, default_scope),
-                        pool.submit(discover_all_crypto_assets, default_scope),
-                    ]
-                    concurrent.futures.wait(futs, timeout=45)
-                compute_pqc_scorecard(default_scope)
-                logger.info("Pre-warmed live GCP PQC inventory cache for %s.", default_scope)
-            except Exception as exc:
-                logger.debug("Background inventory cache warm-up skipped: %s", exc)
-
-        threading.Thread(target=_warm_inventory_cache, name="pqc-inventory-warmup", daemon=True).start()
 
     telemetry_plugin = LlmCallTelemetryPlugin()
     oauth_3lo_plugin = PqcOAuth3LOPlugin()
@@ -3264,7 +3261,7 @@ async function saveClientId() {{
             "id": sess.id,
             "user_id": resolved_user,
             "title": title,
-            "scope": extra.get("scope") or state_dict.get("scope", "organizations/31564119954"),
+            "scope": extra.get("scope") or state_dict.get("scope", ""),
             "created_at": extra.get("created_at") or iso_updated,
             "updated_at": iso_updated,
             "timestamp": float(upd_ts),

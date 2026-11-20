@@ -117,6 +117,8 @@ def _fetch_compute_pq_key_exchange(
             pol = rclient.get(project=project_id, region=location, ssl_policy=policy_name)
         val = getattr(pol, "post_quantum_key_exchange", None)
         return str(val).strip().upper() if val else "DEFAULT"
+    except PermissionError:
+        raise
     except Exception:
         return None
 
@@ -184,7 +186,7 @@ def collect_tls_policies(scope: str = f"organizations/{DEFAULT_ORGANIZATION_ID}"
     cache_key = f"tls:{scope_uri}:{simulated}"
 
     if simulated:
-        cached = _cache_get(cache_key)
+        cached = _cache_get(cache_key, simulated=True)
         if cached:
             return cached
         demo = mock_data.get_simulated_tls_evidence(clean_id)
@@ -211,13 +213,13 @@ def collect_tls_policies(scope: str = f"organizations/{DEFAULT_ORGANIZATION_ID}"
             "target_proxies": _resolve_proxy_records(policies, demo["proxies"]),
             "reference_facts": TLS_REFERENCE_FACTS,
         }
-        return _cache_put(cache_key, _compact_json(payload))
+        return _cache_put(cache_key, _compact_json(payload), simulated=True)
 
     policies: List[Dict[str, Any]] = []
     proxies_raw: List[Dict[str, Any]] = []
     try:
         client_kwargs = _get_client_kwargs(scope_uri=scope_uri)
-        cached = _cache_get(cache_key)
+        cached = _cache_get(cache_key, client_kwargs=client_kwargs)
         if cached:
             return cached
         cai_client = asset_v1.AssetServiceClient(**client_kwargs)
@@ -284,7 +286,7 @@ def collect_tls_policies(scope: str = f"organizations/{DEFAULT_ORGANIZATION_ID}"
         "target_proxies": _resolve_proxy_records(policies, proxies_raw),
         "reference_facts": TLS_REFERENCE_FACTS,
     }
-    return _cache_put(cache_key, _compact_json(payload))
+    return _cache_put(cache_key, _compact_json(payload), client_kwargs=client_kwargs)
 
 
 def _import_job_record(raw: Dict[str, Any], data_source: str) -> Dict[str, Any]:
@@ -362,7 +364,7 @@ def collect_kms_import_jobs(
     cache_key = f"importjobs:{scope_uri}:{loc.lower()}:{simulated}"
 
     if simulated:
-        cached = _cache_get(cache_key)
+        cached = _cache_get(cache_key, simulated=True)
         if cached:
             return cached
         jobs = [_import_job_record(j, SIMULATED_DATA_SOURCE) for j in mock_data.get_simulated_import_jobs(clean_id)]
@@ -378,12 +380,12 @@ def collect_kms_import_jobs(
             "key_rings_inspected": len({(j["project_id"], j["location"], j["key_ring"]) for j in jobs}),
             "collection_notes": [],
         }
-        return _cache_put(cache_key, _compact_json(payload))
+        return _cache_put(cache_key, _compact_json(payload), simulated=True)
 
     notes: List[str] = []
     try:
         client_kwargs = _get_client_kwargs(scope_uri=scope_uri)
-        cached = _cache_get(cache_key)
+        cached = _cache_get(cache_key, client_kwargs=client_kwargs)
         if cached:
             return cached
         kms_client = kms_v1.KeyManagementServiceClient(**client_kwargs)
@@ -456,4 +458,4 @@ def collect_kms_import_jobs(
         "key_rings_inspected": len(key_rings),
         "collection_notes": notes,
     }
-    return _cache_put(cache_key, _compact_json(payload))
+    return _cache_put(cache_key, _compact_json(payload), client_kwargs=client_kwargs)
