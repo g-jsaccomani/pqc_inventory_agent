@@ -1813,6 +1813,14 @@ def authorize_gcp_scope(
         authorize_adc_mode(uid)
 
     effective_conn = conn_cfg if conn_cfg is not None else get_gcp_connection_config(mask_token=True, user_id=uid)
+    if not isinstance(effective_conn, Mapping):
+        raise PermissionError(
+            "UNAUTHORIZED_RESOURCE_SCOPE (MISSING_AUTHORIZED_SCOPE): "
+            "Authorized tenant connection configuration is unavailable or malformed."
+        )
+    conn_uid = effective_conn.get("user_id")
+    if conn_uid is not None and (not isinstance(conn_uid, str) or normalize_user_id(conn_uid) != uid):
+        raise PermissionError("UNAUTHORIZED_RESOURCE_SCOPE: Tenant connection context mismatch denied.")
     if str(effective_conn.get("mode") or "").strip().lower() == "adc":
         authorize_adc_mode(uid)
 

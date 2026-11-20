@@ -22,7 +22,7 @@ import os
 import re
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
 from google.cloud import asset_v1, kms_v1
 
@@ -260,50 +260,141 @@ def _is_internal_runtime_tenant_project(proj_id: str) -> bool:
 
 
 def _active_tenant_default_scope() -> Tuple[str, str, str]:
-    """Resolves the active tenant's server-bound default `(mode, scope_uri, clean_id)`.
+    """Resolves the active tenant's server-bound default `(mode, scope_uri, clean_id)` with fail-closed semantics.
 
-    - For an authenticated tenant user: resolves strictly from the tenant's authorized connection (`organizations/<id>`,
-      `projects/<id>`, or `folders/<id>`). Never silently substitutes `DEFAULT_ORGANIZATION_ID` when the tenant has
-      no bound scope (returns `("UNBOUND", "", "")` so `authorize_gcp_scope()` fails closed with `MISSING_AUTHORIZED_SCOPE`).
-    - For unauthenticated unit-test/CLI helper calls (no email identity in context): preserves `DEFAULT_ORGANIZATION_ID`.
+    - Identity resolution failure (import/context error, empty/non-string identity, or malformed email identity):
+      logs a sanitized diagnostic and fails closed with `("UNBOUND", "", "")` (never classified as unauthenticated).
+    - Authenticated tenant identity: resolves exclusively from that tenant's authorized server-side connection
+      (`organizations/<id>`, `projects/<id>`, or `folders/<id>`). If the connection lookup raises an exception,
+      returns malformed data, belongs to a different tenant, or has no bound scope, logs a sanitized diagnostic
+      (without tokens, credentials, or sensitive tenant data) and returns `("UNBOUND", "", "")`.
+      NEVER substitutes `DEFAULT_ORGANIZATION_ID`.
+    - Positively established unauthenticated CLI/test context (valid non-email placeholder identity such as
+      `DEFAULT_TENANT_USER_ID` or `"default"`): preserves legacy `DEFAULT_ORGANIZATION_ID` for offline CLI/unit helpers.
     """
     try:
         from tools.gcloud_bridge import (
             _is_authenticated_email_identity,
+            _validate_numeric_id_value,
+            _validate_project_value,
+            _validate_scope_value,
             get_current_tenant_user,
             get_gcp_connection_config,
+            normalize_user_id,
         )
 
         active_uid = get_current_tenant_user()
-        if _is_authenticated_email_identity(active_uid):
-            conn = get_gcp_connection_config(mask_token=True, user_id=active_uid)
-            org = (conn.get("organization_id") or "").strip().replace("organizations/", "")
-            if org:
-                return ("ORG", f"organizations/{org}", org)
-            proj = (conn.get("project_id") or "").strip().replace("projects/", "")
-            if proj:
-                return ("PROJECT", f"projects/{proj}", proj)
-            active_uri = (conn.get("active_scope_uri") or "").strip()
-            if active_uri.startswith("organizations/"):
-                oid = active_uri.split("/", 1)[1].strip()
-                if oid:
-                    return ("ORG", active_uri, oid)
-            if active_uri.startswith("projects/"):
-                pid = active_uri.split("/", 1)[1].strip()
-                if pid:
-                    return ("PROJECT", active_uri, pid)
-            if active_uri.startswith("folders/"):
-                fid = active_uri.split("/", 1)[1].strip()
-                if fid:
-                    return ("FOLDER", active_uri, fid)
+        if not isinstance(active_uid, str) or not active_uid.strip():
+            logger.warning(
+                "Tenant identity lookup returned empty or non-string identity (%s) during scope resolution; "
+                "failing closed as UNBOUND.",
+                type(active_uid).__name__,
+            )
             return ("UNBOUND", "", "")
-    except Exception:
-        pass
-    return ("ORG", f"organizations/{DEFAULT_ORGANIZATION_ID}", DEFAULT_ORGANIZATION_ID)
+        is_authenticated = _is_authenticated_email_identity(active_uid)
+    except Exception as exc:
+        logger.warning(
+            "Tenant identity lookup failed during scope resolution; failing closed as UNBOUND (%s).",
+            type(exc).__name__,
+        )
+        return ("UNBOUND", "", "")
+
+    if not is_authenticated:
+        if "@" in active_uid:
+            logger.warning(
+                "Malformed tenant email identity encountered during scope resolution; failing closed as UNBOUND."
+            )
+            return ("UNBOUND", "", "")
+        return ("ORG", f"organizations/{DEFAULT_ORGANIZATION_ID}", DEFAULT_ORGANIZATION_ID)
+
+    try:
+        norm_active_uid = normalize_user_id(active_uid)
+        conn = get_gcp_connection_config(mask_token=True, user_id=norm_active_uid)
+    except Exception as exc:
+        logger.warning(
+            "Authorized tenant connection lookup failed during scope resolution; failing closed as UNBOUND (%s).",
+            type(exc).__name__,
+        )
+        return ("UNBOUND", "", "")
+
+    if not isinstance(conn, Mapping):
+        logger.warning(
+            "Authorized tenant connection lookup returned malformed payload (%s); failing closed as UNBOUND.",
+            type(conn).__name__,
+        )
+        return ("UNBOUND", "", "")
+
+    conn_uid = conn.get("user_id")
+    if conn_uid is not None:
+        if not isinstance(conn_uid, str) or normalize_user_id(conn_uid) != norm_active_uid:
+            logger.warning(
+                "Authorized tenant connection lookup returned mismatched tenant context; failing closed as UNBOUND."
+            )
+            return ("UNBOUND", "", "")
+
+    raw_org = conn.get("organization_id")
+    if raw_org is not None and not isinstance(raw_org, str):
+        logger.warning(
+            "Authorized tenant connection has malformed organization_id type (%s); failing closed as UNBOUND.",
+            type(raw_org).__name__,
+        )
+        return ("UNBOUND", "", "")
+    if isinstance(raw_org, str) and raw_org.strip():
+        org = raw_org.strip()
+        if org.lower().startswith("organizations/"):
+            org = org.split("/", 1)[1].strip()
+        if _validate_numeric_id_value(org) is not None:
+            logger.warning(
+                "Authorized tenant connection has malformed organization_id value; failing closed as UNBOUND."
+            )
+            return ("UNBOUND", "", "")
+        return ("ORG", f"organizations/{org}", org)
+
+    raw_proj = conn.get("project_id")
+    if raw_proj is not None and not isinstance(raw_proj, str):
+        logger.warning(
+            "Authorized tenant connection has malformed project_id type (%s); failing closed as UNBOUND.",
+            type(raw_proj).__name__,
+        )
+        return ("UNBOUND", "", "")
+    if isinstance(raw_proj, str) and raw_proj.strip():
+        proj = raw_proj.strip()
+        if proj.lower().startswith("projects/"):
+            proj = proj.split("/", 1)[1].strip()
+        if _validate_project_value(proj) is not None:
+            logger.warning(
+                "Authorized tenant connection has malformed project_id value; failing closed as UNBOUND."
+            )
+            return ("UNBOUND", "", "")
+        return ("PROJECT", f"projects/{proj}", proj)
+
+    raw_active_uri = conn.get("active_scope_uri")
+    if raw_active_uri is not None and not isinstance(raw_active_uri, str):
+        logger.warning(
+            "Authorized tenant connection has malformed active_scope_uri type (%s); failing closed as UNBOUND.",
+            type(raw_active_uri).__name__,
+        )
+        return ("UNBOUND", "", "")
+    if isinstance(raw_active_uri, str) and raw_active_uri.strip():
+        active_uri = raw_active_uri.strip()
+        if _validate_scope_value(active_uri) is not None:
+            logger.warning(
+                "Authorized tenant connection has malformed active_scope_uri value; failing closed as UNBOUND."
+            )
+            return ("UNBOUND", "", "")
+        kind, _, clean_id = active_uri.partition("/")
+        if kind == "organizations":
+            return ("ORG", active_uri, clean_id)
+        if kind == "projects":
+            return ("PROJECT", active_uri, clean_id)
+        if kind == "folders":
+            return ("FOLDER", active_uri, clean_id)
+
+    return ("UNBOUND", "", "")
 
 
 def _active_tenant_org_id() -> str:
-    """Returns the active tenant user's configured Organization ID (empty string if an authenticated tenant has none)."""
+    """Returns the active tenant user's configured Organization ID (empty string when unbound, non-ORG, or on lookup error)."""
     mode, _, clean_id = _active_tenant_default_scope()
     if mode == "ORG":
         return clean_id
